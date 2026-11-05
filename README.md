@@ -31,7 +31,7 @@ Rather than being just an ECS container, SumerState elevates world state into a 
 
 ```toml
 [dependencies]
-sumer_state = { git = "https://github.com/eventide-lab/SumerState" }
+sumer_state = { git = "https://github.com/xumi-lab/SumerState" }
 ```
 
 ```rust

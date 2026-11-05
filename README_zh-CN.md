@@ -31,7 +31,7 @@ SumerState 不局限于单一的 ECS 容器，而是将复杂的世界状态升�
 
 ```toml
 [dependencies]
-sumer_state = { git = "https://github.com/eventide-lab/SumerState" }
+sumer_state = { git = "https://github.com/xumi-lab/SumerState" }
 ```
 
 ```rust
