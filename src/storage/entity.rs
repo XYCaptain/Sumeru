@@ -270,8 +270,8 @@ macro_rules! impl_into_entity_for_tuple {
                                         col_t.push_direct_owned_unchecked($tail);
                                     )*
                                 }
-                                target_arch.bump_columns_version_in_place();
                                 let row = target_arch.push_entity_with_slot(id, local_slot) as u32;
+                                target_arch.mark_all_columns_row_epoch(row as usize, next_epoch);
                                 debug_assert_eq!(row, row_usize as u32);
                                 store.epoch = next_epoch;
                                 poison_guard.disarm();

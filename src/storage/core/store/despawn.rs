@@ -121,6 +121,7 @@ impl Store {
         let id = self.archetypes.len() as u32;
         let arch = Archetype::new(ArchetypeId(id), types.clone());
         self.archetypes.push(arch);
+        self.register_archetype_in_component_index(id, &types);
         self.archetype_index.insert(types, id);
         self.bump_archetype_set_generation()
             .expect("archetype set generation should not overflow");
@@ -275,11 +276,13 @@ impl Store {
         self.archetypes[location.archetype_id as usize].columns()[&component_type_id]
             .validate_erased(location.row_index as usize, &value)?;
         let next_epoch = self.next_epoch()?;
-        let old = self.archetypes[location.archetype_id as usize]
+        let arch = &mut self.archetypes[location.archetype_id as usize];
+        let old = arch
             .columns_mut()
             .get_mut(&component_type_id)
             .expect("validated component column")
             .replace_erased_infallible(location.row_index as usize, value);
+        arch.mark_column_row_epoch(component_type_id, location.row_index as usize, next_epoch);
         self.epoch = next_epoch;
         Ok(old)
     }
@@ -296,11 +299,15 @@ impl Store {
         let location = self
             .resolve_component_location(entity, component_type_id)
             .expect("validate_component_value must precede replace_component_value_infallible");
-        self.archetypes[location.archetype_id as usize]
+        let epoch = self.epoch;
+        let arch = &mut self.archetypes[location.archetype_id as usize];
+        let old = arch
             .columns_mut()
             .get_mut(&component_type_id)
             .expect("validated component column")
-            .replace_erased_infallible(location.row_index as usize, value)
+            .replace_erased_infallible(location.row_index as usize, value);
+        arch.mark_column_row_epoch(component_type_id, location.row_index as usize, epoch);
+        old
     }
 
 

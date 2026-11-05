@@ -35,19 +35,19 @@ pub(crate) fn rebuild_matched_archetypes<Q: QueryMutShape, F: QueryFilter>(
         .unwrap_or_default()
 }
 
-/// 纯函数：根据给定的查询形态 Q 和过滤器 F，从原型头切片中筛选匹配的 ArchetypeId 列表并预绑定物理列槽位。
-pub(crate) fn match_bindings_for_query<
+/// 纯函数：向已有匹配切片追加扫描新增原型切片（用于 `QueryCache` 的 $O(\Delta A)$ 增量刷新）。
+pub(crate) fn append_bindings_from_slice<
     Q: QueryMutShape,
     F: QueryFilter,
     H: ArchetypeHeader,
 >(
     archetypes: &[H],
     filter: &F,
-) -> Result<(Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>), StateError> {
+    matched: &mut Vec<ArchetypeId>,
+    bindings: &mut Vec<crate::storage::query::handle::MatchedTableBinding>,
+) -> Result<(), StateError> {
     Q::validate_shape()?;
     let descriptors = Q::access_descriptors();
-    let mut matched = Vec::new();
-    let mut bindings = Vec::new();
     for arch in archetypes {
         if !filter.matches_archetype(arch) {
             continue;
@@ -71,6 +71,105 @@ pub(crate) fn match_bindings_for_query<
             });
         }
     }
+    Ok(())
+}
+
+/// 纯函数：根据给定的查询形态 Q 和过滤器 F，从原型头切片中筛选匹配的 ArchetypeId 列表并预绑定物理列槽位。
+pub(crate) fn match_bindings_for_query<
+    Q: QueryMutShape,
+    F: QueryFilter,
+    H: ArchetypeHeader,
+>(
+    archetypes: &[H],
+    filter: &F,
+) -> Result<(Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>), StateError> {
+    let mut matched = Vec::new();
+    let mut bindings = Vec::new();
+    append_bindings_from_slice::<Q, F, H>(archetypes, filter, &mut matched, &mut bindings)?;
+    Ok((matched, bindings))
+}
+
+/// 利用 `Store::component_archetypes` 倒排位图索引对查询形态 `Q` 与过滤器 `F` 进行 64-bit word 位图求交，
+/// 杜绝全量遍历无关 Archetype，并预绑定物理列下标。
+pub(crate) fn match_bindings_for_store<Q: QueryMutShape, F: QueryFilter>(
+    store: &Store,
+    filter: &F,
+) -> Result<(Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>), StateError> {
+    Q::validate_shape()?;
+    if store.archetypes.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let descriptors = Q::access_descriptors();
+    let mut reqs = Vec::with_capacity(descriptors.len() + 4);
+    for &(cid, _, _) in &descriptors {
+        reqs.push((cid, true));
+    }
+    filter.archetype_requirements(&mut reqs);
+
+    let comp_index = store.component_archetypes();
+    let mut candidate_bits: Option<crate::storage::store::ArchetypeBitSet> = None;
+    let mut has_positive_req = false;
+
+    for &(cid, must_have) in &reqs {
+        if must_have {
+            has_positive_req = true;
+            let Some(bits) = comp_index.get(&cid) else {
+                return Ok((Vec::new(), Vec::new()));
+            };
+            if let Some(acc) = &mut candidate_bits {
+                acc.intersect_with(bits);
+                if acc.is_all_zero() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            } else {
+                candidate_bits = Some(bits.clone());
+            }
+        }
+    }
+
+    if !has_positive_req {
+        return match_bindings_for_query::<Q, F, Archetype>(&store.archetypes, filter);
+    }
+
+    let Some(mut acc) = candidate_bits else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    for &(cid, must_have) in &reqs {
+        if !must_have {
+            if let Some(bits) = comp_index.get(&cid) {
+                acc.difference_with(bits);
+                if acc.is_all_zero() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            }
+        }
+    }
+
+    let mut matched = Vec::new();
+    let mut bindings = Vec::new();
+    acc.for_each_set_bit(|arch_idx| {
+        let Some(arch) = store.archetypes.get(arch_idx as usize) else {
+            return;
+        };
+        if !filter.matches_archetype(arch) {
+            return;
+        }
+        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(descriptors.len());
+        for &(cid, _, _) in &descriptors {
+            let Some(idx) = arch.component_column_index(cid) else {
+                return;
+            };
+            flat_col_indices.push(idx);
+        }
+        let archetype_id = arch.archetype_id();
+        matched.push(archetype_id);
+        bindings.push(crate::storage::query::handle::MatchedTableBinding {
+            archetype_id,
+            flat_col_indices,
+        });
+    });
+
     Ok((matched, bindings))
 }
 
@@ -79,8 +178,7 @@ pub(crate) fn rebuild_matched_bindings<Q: QueryMutShape, F: QueryFilter>(
     store: &Store,
     filter: &F,
 ) -> (Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>) {
-    match_bindings_for_query::<Q, F, Archetype>(&store.archetypes, filter)
-        .unwrap_or_default()
+    match_bindings_for_store::<Q, F>(store, filter).unwrap_or_default()
 }
 
 /// 合并查询形状 `Q` 的读写列与过滤器 `F` 读取列的前置权限描述符列表。
@@ -731,16 +829,29 @@ impl<'a, Q: QueryMutData<'a>> sealed::FetchMut<'a> for (EntityId, Q) {
         Q::fast_prepare_archetype(archetype)
     }
 
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        Q::fast_prepare_bound(archetype, col_slots)
+    }
+
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
         Q::next(state, entity)
     }
 
     #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        Q::skip_rows(state, count);
+    }
+
+    #[inline]
     fn chunk(
         entities: &'a [EntityId],
         columns: &[(ComponentTypeId, ColumnDescriptor)],
-            range: Range<usize>,
+        range: Range<usize>,
     ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
         Q::chunk(entities, columns, range)
     }
@@ -752,9 +863,31 @@ impl<'a, Q: QueryMutData<'a>> sealed::FetchMut<'a> for (EntityId, Q) {
         Q::fast_chunk_archetype(archetype)
     }
 
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        Q::fast_chunk_bound(archetype, col_slots)
+    }
+
+    #[inline(always)]
+    fn mark_written_columns(
+        archetype: &mut Archetype,
+        masked: Option<&crate::storage::archetype::RowBitMask>,
+        epoch: u64,
+    ) {
+        Q::mark_written_columns(archetype, masked, epoch);
+    }
+
     #[inline]
     fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]> {
         Q::access_descriptors()
+    }
+
+    #[inline]
+    fn required_mask() -> u16 {
+        Q::required_mask()
     }
 }
 
@@ -769,32 +902,55 @@ impl<'a, Q: QueryData<'a>> sealed::Fetch<'a> for (EntityId, Q) {
     fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
         Q::prepare(archetype, start)
     }
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(Self::State, usize)> {
+        Q::fast_prepare_bound(archetype, col_slots, start)
+    }
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item {
         Q::next(state, entity)
     }
     #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        Q::skip_rows(state, count);
+    }
+    #[inline]
     fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
         Q::chunk(archetype, start)
+    }
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
+        Q::fast_chunk_bound(archetype, col_slots, start)
     }
 }
 
 pub(crate) fn for_each_matched_chunk_ro<'store, Q>(
     store: &'store Store,
-    matched_archetypes: &[ArchetypeId],
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
     mut f: impl FnMut(Q::Chunk<'store>),
 ) where
     Q: QueryMutShape,
     for<'a> Q::View<'a>: QueryData<'a, Chunk = Q::Chunk<'a>>,
 {
-    for &arch_id in matched_archetypes {
-        let Some(arch) = store.archetypes.get(arch_id.0 as usize) else {
+    for binding in matched_bindings {
+        let Some(arch) = store.archetypes.get(binding.archetype_id.0 as usize) else {
             continue;
         };
         let mut row = 0;
         while row < arch.len() {
-            let Some((chunk, end)) = <Q::View<'store> as sealed::Fetch<'store>>::chunk(arch, row)
-            else {
+            let Some((chunk, end)) = <Q::View<'store> as sealed::Fetch<'store>>::fast_chunk_bound(
+                arch,
+                &binding.flat_col_indices,
+                row,
+            ) else {
                 break;
             };
             f(chunk);
@@ -805,30 +961,37 @@ pub(crate) fn for_each_matched_chunk_ro<'store, Q>(
 
 pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
     store: &'store mut Store,
-    matched_archetypes: &[ArchetypeId],
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
     mut f: impl FnMut(Q::Chunk<'store>),
 ) where
     Q: QueryMutShape,
 {
+    let write_epoch = store.epoch();
     let archetypes_ptr = store.archetypes.as_mut_ptr();
     let archetypes_len = store.archetypes.len();
-    for &arch_id in matched_archetypes {
-        let idx = arch_id.0 as usize;
+    for binding in matched_bindings {
+        let idx = binding.archetype_id.0 as usize;
         if idx >= archetypes_len {
             continue;
         }
-        // SAFETY: `matched_archetypes` contains distinct ArchetypeIds; we borrow each matched
+        // SAFETY: `matched_bindings` contains distinct ArchetypeIds; we borrow each matched
         // archetype exclusively for the duration of its chunk callback.
         let arch = unsafe { &mut *archetypes_ptr.add(idx) };
         if arch.is_empty() {
             continue;
         }
+        <Q::View<'store> as sealed::FetchMut<'store>>::mark_written_columns(
+            arch,
+            None,
+            write_epoch,
+        );
         if !arch.may_be_segmented_or_unaligned()
             && arch.flat_columns().len() == arch.component_types_slice().len()
         {
-            if let Some(chunk) =
-                <Q::View<'store> as sealed::FetchMut<'store>>::fast_chunk_archetype(arch)
-            {
+            if let Some(chunk) = <Q::View<'store> as sealed::FetchMut<'store>>::fast_chunk_bound(
+                arch,
+                &binding.flat_col_indices,
+            ) {
                 f(chunk);
             }
             continue;
@@ -881,7 +1044,7 @@ pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
 
 pub(crate) fn for_each_matched_ro<'store, Q, F>(
     store: &'store Store,
-    matched_archetypes: &[ArchetypeId],
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
     filter: &F,
     mut f: impl FnMut(Q::Item<'store>),
 ) where
@@ -889,30 +1052,70 @@ pub(crate) fn for_each_matched_ro<'store, Q, F>(
     F: QueryFilter,
     for<'a> Q::View<'a>: QueryData<'a, Item = Q::Item<'a>>,
 {
-    for &arch_id in matched_archetypes {
-        let Some(arch) = store.archetypes.get(arch_id.0 as usize) else {
+    for binding in matched_bindings {
+        let Some(arch) = store.archetypes.get(binding.archetype_id.0 as usize) else {
             continue;
         };
         if arch.is_empty() {
+            continue;
+        }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter.collect_matched_row_mask(arch)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
             continue;
         }
         let entities = arch.entities();
         let mut row = 0;
         while row < arch.len() {
             let Some((mut state, end)) =
-                <Q::View<'store> as sealed::Fetch<'store>>::prepare(arch, row)
+                <Q::View<'store> as sealed::Fetch<'store>>::fast_prepare_bound(
+                    arch,
+                    &binding.flat_col_indices,
+                    row,
+                )
             else {
                 break;
             };
-            for current_row in row..end {
-                let item = <Q::View<'store> as sealed::Fetch<'store>>::next(
-                    &mut state,
-                    entities[current_row],
-                );
-                if F::IS_ROW_FILTERED && !filter.matches_row(arch, current_row) {
-                    continue;
+            if let Some(mask) = &filtered_mask {
+                let mut cursor_row = row;
+                let start_word = row >> 6;
+                let end_word = (end + 63) >> 6;
+                let words = mask.words();
+                for w_idx in start_word..end_word.min(words.len()) {
+                    let mut w = words[w_idx];
+                    if w_idx == start_word && (row & 63) != 0 {
+                        w &= !((1u64 << (row & 63)) - 1);
+                    }
+                    while w != 0 {
+                        let bit = w.trailing_zeros() as usize;
+                        let target_row = w_idx * 64 + bit;
+                        if target_row >= end {
+                            break;
+                        }
+                        if target_row > cursor_row {
+                            <Q::View<'store> as sealed::Fetch<'store>>::skip_rows(
+                                &mut state,
+                                target_row - cursor_row,
+                            );
+                        }
+                        let item = <Q::View<'store> as sealed::Fetch<'store>>::next(
+                            &mut state,
+                            entities[target_row],
+                        );
+                        cursor_row = target_row + 1;
+                        f(item);
+                        w &= w - 1;
+                    }
                 }
-                f(item);
+            } else {
+                for &entity in &entities[row..end] {
+                    let item =
+                        <Q::View<'store> as sealed::Fetch<'store>>::next(&mut state, entity);
+                    f(item);
+                }
             }
             row = end;
         }
@@ -921,49 +1124,75 @@ pub(crate) fn for_each_matched_ro<'store, Q, F>(
 
 pub(crate) fn for_each_matched_mut<'store, Q, F>(
     store: &'store mut Store,
-    matched_archetypes: &[ArchetypeId],
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
     filter: &F,
     mut f: impl FnMut(Q::Item<'store>),
 ) where
     Q: QueryMutShape,
     F: QueryFilter,
 {
+    let write_epoch = store.epoch();
     let archetypes_ptr = store.archetypes.as_mut_ptr();
     let archetypes_len = store.archetypes.len();
-    for &arch_id in matched_archetypes {
-        let idx = arch_id.0 as usize;
+    for binding in matched_bindings {
+        let idx = binding.archetype_id.0 as usize;
         if idx >= archetypes_len {
             continue;
         }
-        // SAFETY: `matched_archetypes` contains distinct ArchetypeIds; we borrow each matched
+        // SAFETY: `matched_bindings` contains distinct ArchetypeIds; we borrow each matched
         // archetype exclusively for the duration of its row callbacks.
         let arch = unsafe { &mut *archetypes_ptr.add(idx) };
         if arch.is_empty() {
             continue;
         }
-        let filtered_rows = if F::IS_ROW_FILTERED {
-            filter.collect_matched_rows(&*arch)
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter.collect_matched_row_mask(&*arch)
         } else {
             None
         };
-        if filtered_rows.as_ref().is_some_and(|r| r.is_empty()) {
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
             continue;
         }
+        <Q::View<'store> as sealed::FetchMut<'store>>::mark_written_columns(
+            arch,
+            filtered_mask.as_ref(),
+            write_epoch,
+        );
         if !arch.may_be_segmented_or_unaligned()
             && arch.flat_columns().len() == arch.component_types_slice().len()
         {
             if let Some((mut state, entities)) =
-                <Q::View<'store> as sealed::FetchMut<'store>>::fast_prepare_archetype(arch)
+                <Q::View<'store> as sealed::FetchMut<'store>>::fast_prepare_bound(
+                    arch,
+                    &binding.flat_col_indices,
+                )
             {
-                for (current_row, &entity) in entities.iter().enumerate() {
-                    let item =
-                        <Q::View<'store> as sealed::FetchMut<'store>>::next(&mut state, entity);
-                    if let Some(matched) = &filtered_rows {
-                        if matched.binary_search(&current_row).is_err() {
-                            continue;
+                if let Some(mask) = &filtered_mask {
+                    let mut cursor_row = 0usize;
+                    mask.for_each_set_row(|target_row| {
+                        if target_row < entities.len() {
+                            if target_row > cursor_row {
+                                <Q::View<'store> as sealed::FetchMut<'store>>::skip_rows(
+                                    &mut state,
+                                    target_row - cursor_row,
+                                );
+                            }
+                            let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
+                                &mut state,
+                                entities[target_row],
+                            );
+                            cursor_row = target_row + 1;
+                            f(item);
                         }
+                    });
+                } else {
+                    for &entity in entities {
+                        let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
+                            &mut state,
+                            entity,
+                        );
+                        f(item);
                     }
-                    f(item);
                 }
             }
             continue;
@@ -1005,17 +1234,45 @@ pub(crate) fn for_each_matched_mut<'store, Q, F>(
             if let Some(mut state) =
                 <Q::View<'store> as sealed::FetchMut<'store>>::prepare(&columns, range.clone())
             {
-                for current_row in range {
-                    let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
-                        &mut state,
-                        entities[current_row],
-                    );
-                    if let Some(matched) = &filtered_rows {
-                        if matched.binary_search(&current_row).is_err() {
-                            continue;
+                if let Some(mask) = &filtered_mask {
+                    let mut cursor_row = row;
+                    let start_word = row >> 6;
+                    let end_word = (end + 63) >> 6;
+                    let words = mask.words();
+                    for w_idx in start_word..end_word.min(words.len()) {
+                        let mut w = words[w_idx];
+                        if w_idx == start_word && (row & 63) != 0 {
+                            w &= !((1u64 << (row & 63)) - 1);
+                        }
+                        while w != 0 {
+                            let bit = w.trailing_zeros() as usize;
+                            let target_row = w_idx * 64 + bit;
+                            if target_row >= end {
+                                break;
+                            }
+                            if target_row > cursor_row {
+                                <Q::View<'store> as sealed::FetchMut<'store>>::skip_rows(
+                                    &mut state,
+                                    target_row - cursor_row,
+                                );
+                            }
+                            let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
+                                &mut state,
+                                entities[target_row],
+                            );
+                            cursor_row = target_row + 1;
+                            f(item);
+                            w &= w - 1;
                         }
                     }
-                    f(item);
+                } else {
+                    for &entity in &entities[range] {
+                        let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
+                            &mut state,
+                            entity,
+                        );
+                        f(item);
+                    }
                 }
             }
             row = end;

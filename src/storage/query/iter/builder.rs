@@ -4,6 +4,7 @@ use super::*;
 pub struct QueryMutBuilder<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
     archetypes: &'a mut [Archetype],
     row_upper_bound: usize,
+    write_epoch: u64,
     filter: F,
     marker: PhantomData<Q>,
 }
@@ -19,9 +20,11 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> std::fmt::Debug for QueryMutBuilde
 impl<'a, Q: QueryMutData<'a>> QueryMutBuilder<'a, Q> {
     pub(crate) fn new(store: &'a mut crate::storage::store::Store) -> Self {
         let row_upper_bound = store.len();
+        let write_epoch = store.epoch();
         Self {
             archetypes: &mut store.archetypes,
             row_upper_bound,
+            write_epoch,
             filter: All,
             marker: PhantomData,
         }
@@ -35,6 +38,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         QueryMutBuilder {
             archetypes: self.archetypes,
             row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
             filter: With {
                 previous: self.filter,
                 type_id: ComponentTypeId::of::<T>(),
@@ -50,6 +54,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         QueryMutBuilder {
             archetypes: self.archetypes,
             row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
             filter: Without {
                 previous: self.filter,
                 type_id: ComponentTypeId::of::<T>(),
@@ -59,13 +64,19 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         }
     }
 
-    /// Require relationship pair `(R, target)` on the entity.
+    /// Require relationship pair `(R, target)` on the entity (accelerated via per-table `PairTargetIndex`).
     #[inline]
     pub fn with_pair<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
         self,
         target: EntityId,
-    ) -> QueryMutBuilder<'a, Q, BusinessFilter<F, crate::al::Pair<R>>> {
-        self.filter::<crate::al::Pair<R>>(move |pair| pair.target == target)
+    ) -> QueryMutBuilder<'a, Q, WithPairTarget<R, F>> {
+        QueryMutBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
+            filter: WithPairTarget::new(self.filter, target),
+            marker: PhantomData,
+        }
     }
 
     /// Skip entire tables containing relationship pair `Pair<R>`.
@@ -90,6 +101,47 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         self.without::<crate::al::Tag<N>>()
     }
 
+    /// Require non-migrating row status bit `FLAG` (`0..8`) to be set (`1`).
+    #[inline]
+    pub fn with_flag<const FLAG: u8>(self) -> QueryMutBuilder<'a, Q, WithFlag<FLAG, F>> {
+        const { assert!(FLAG < 8, "RowFlag index must be in 0..8") };
+        QueryMutBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
+            filter: WithFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// Require non-migrating row status bit `FLAG` (`0..8`) to be unset (`0`).
+    #[inline]
+    pub fn without_flag<const FLAG: u8>(self) -> QueryMutBuilder<'a, Q, WithoutFlag<FLAG, F>> {
+        const { assert!(FLAG < 8, "RowFlag index must be in 0..8") };
+        QueryMutBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
+            filter: WithoutFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// Filter to 64-row chunks of component `T` modified strictly after `since_epoch`.
+    #[inline]
+    pub fn changed_since<T: 'static>(
+        self,
+        since_epoch: u64,
+    ) -> QueryMutBuilder<'a, Q, ChangedSince<T, F>> {
+        QueryMutBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
+            filter: ChangedSince::new(self.filter, since_epoch),
+            marker: PhantomData,
+        }
+    }
+
     /// Add a row-level component predicate filter.
     #[inline]
     pub fn filter<C: ModelComponent + Serialize + DeserializeOwned>(
@@ -99,6 +151,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         QueryMutBuilder {
             archetypes: self.archetypes,
             row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
             filter: BusinessFilter::new(self.filter, predicate),
             marker: PhantomData,
         }
@@ -113,6 +166,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         QueryMutBuilder {
             archetypes: self.archetypes,
             row_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
             filter: FilterEq::new(self.filter, expected),
             marker: PhantomData,
         }
@@ -126,10 +180,11 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
             entities: [].iter(),
             segment_start_row: 0,
             segment_offset: 0,
-            filtered_rows: None,
+            filtered_mask: None,
             state: None,
             current: None,
             remaining_upper_bound: self.row_upper_bound,
+            write_epoch: self.write_epoch,
             filter: self.filter,
         }
     }
@@ -146,6 +201,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
         QueryMutChunksIter {
             archetypes: self.archetypes.iter_mut(),
             current: None,
+            write_epoch: self.write_epoch,
             filter: self.filter,
             marker: PhantomData,
         }
@@ -242,10 +298,11 @@ pub struct QueryMutIter<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
     entities: std::slice::Iter<'a, EntityId>,
     segment_start_row: usize,
     segment_offset: usize,
-    filtered_rows: Option<Vec<usize>>,
+    filtered_mask: Option<crate::storage::archetype::RowBitMask>,
     state: Option<Q::State>,
     current: Option<MutableTable<'a>>,
     remaining_upper_bound: usize,
+    write_epoch: u64,
     filter: F,
 }
 
@@ -255,20 +312,46 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutIter<'a, Q, F
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(&entity) = self.entities.next() {
-                let current_row = self.segment_start_row + self.segment_offset;
-                self.segment_offset += 1;
-                self.remaining_upper_bound -= 1;
-                let item = Q::next(
-                    self.state.as_mut().expect("prepared component slices"),
-                    entity,
-                );
-                if let Some(matched) = &self.filtered_rows {
-                    if matched.binary_search(&current_row).is_err() {
-                        continue;
+            if !self.entities.as_slice().is_empty() {
+                if let Some(mask) = &self.filtered_mask {
+                    let rem_len = self.entities.len();
+                    let start_row = self.segment_start_row + self.segment_offset;
+                    let seg_end = start_row + rem_len;
+                    let mut cur = start_row;
+                    while cur < seg_end {
+                        let w_idx = cur >> 6;
+                        let bit_idx = cur & 63;
+                        let word = mask.words().get(w_idx).copied().unwrap_or(0) >> bit_idx;
+                        if word != 0 {
+                            cur += word.trailing_zeros() as usize;
+                            break;
+                        }
+                        cur = (w_idx + 1) << 6;
+                    }
+                    let skip = cur.min(seg_end) - start_row;
+                    if skip > 0 {
+                        self.segment_offset += skip;
+                        self.remaining_upper_bound -= skip;
+                        if skip >= rem_len {
+                            self.entities = [].iter();
+                            continue;
+                        }
+                        self.entities = self.entities.as_slice()[skip..].iter();
+                        Q::skip_rows(
+                            self.state.as_mut().expect("prepared component slices"),
+                            skip,
+                        );
                     }
                 }
-                return Some(item);
+                if let Some(&entity) = self.entities.next() {
+                    self.segment_offset += 1;
+                    self.remaining_upper_bound -= 1;
+                    let item = Q::next(
+                        self.state.as_mut().expect("prepared component slices"),
+                        entity,
+                    );
+                    return Some(item);
+                }
             }
             self.state = None;
             if let Some(table) = &mut self.current {
@@ -281,18 +364,23 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutIter<'a, Q, F
                 }
             }
             self.current = None;
-            self.filtered_rows = None;
+            self.filtered_mask = None;
             let archetype = self.archetypes.next()?;
             let arch_len = archetype.len();
             if arch_len != 0 && self.filter.matches_archetype(archetype) {
                 if F::IS_ROW_FILTERED {
-                    let matched = self.filter.collect_matched_rows(archetype);
-                    if matched.as_ref().is_some_and(|rows| rows.is_empty()) {
+                    let mask = self.filter.collect_matched_row_mask(archetype);
+                    if mask.as_ref().is_some_and(|m| m.is_all_zero()) {
                         self.remaining_upper_bound -= arch_len;
                         continue;
                     }
-                    self.filtered_rows = matched;
+                    self.filtered_mask = mask;
                 }
+                Q::mark_written_columns(
+                    archetype,
+                    self.filtered_mask.as_ref(),
+                    self.write_epoch,
+                );
                 if !archetype.may_be_segmented_or_unaligned()
                     && archetype.flat_columns().len() == archetype.component_types_slice().len()
                 {
@@ -315,7 +403,12 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutIter<'a, Q, F
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.entities.len(), Some(self.remaining_upper_bound))
+        let lower = if self.filtered_mask.is_some() {
+            0
+        } else {
+            self.entities.len()
+        };
+        (lower, Some(self.remaining_upper_bound))
     }
 }
 
@@ -325,6 +418,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> std::iter::FusedIterator for Query
 pub struct QueryMutChunksIter<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
     archetypes: std::slice::IterMut<'a, Archetype>,
     current: Option<MutableTable<'a>>,
+    write_epoch: u64,
     filter: F,
     marker: PhantomData<Q>,
 }
@@ -343,6 +437,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutChunksIter<'a
             self.current = None;
             let archetype = self.archetypes.next()?;
             if !archetype.is_empty() && self.filter.matches_archetype(archetype) {
+                Q::mark_written_columns(archetype, None, self.write_epoch);
                 if !archetype.may_be_segmented_or_unaligned()
                     && archetype.flat_columns().len() == archetype.component_types_slice().len()
                 {

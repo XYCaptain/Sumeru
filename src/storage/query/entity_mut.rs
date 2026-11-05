@@ -242,6 +242,33 @@ impl<'a> EntityMut<'a> {
             .map_or(false, |arch| arch.component_types_slice().contains(&type_id))
     }
 
+    /// 检查实体在当前原型行上的非迁移状态位（`0..=255`）是否已置位（0 次全局查找）。
+    #[inline]
+    pub fn has_flag<const FLAG: u8>(&self) -> bool {
+        self.store
+            .archetypes
+            .get(self.location.archetype_id as usize)
+            .map_or(false, |arch| {
+                arch.get_row_flag(self.location.row_index as usize, FLAG)
+            })
+    }
+
+    /// 设置实体在当前原型行上的非迁移状态位（`0..=255`），不触发跨表迁移，返回修改前的旧状态值。
+    #[inline]
+    pub fn set_flag<const FLAG: u8>(&mut self, enabled: bool) -> Result<bool, StateError> {
+        self.store.check_poisoned()?;
+        let arch = self
+            .store
+            .archetypes
+            .get_mut(self.location.archetype_id as usize)
+            .ok_or(StateError::EntityNotFound(self.id))?;
+        let row = self.location.row_index as usize;
+        if arch.entities().get(row) != Some(&self.id) {
+            return Err(StateError::EntityNotFound(self.id));
+        }
+        Ok(arch.set_row_flag(row, FLAG, enabled))
+    }
+
     /// 获取强类型组件不可变引用（缺失或类型不匹配时返回 `None`，零堆分配、零拷贝、直通访问）。
     #[inline]
     pub fn get<T: ModelComponent + Serialize + DeserializeOwned + 'static>(
@@ -275,6 +302,7 @@ impl<'a> EntityMut<'a> {
         if arch.entities().get(row) != Some(&self.id) {
             return None;
         }
+        arch.mark_column_row_epoch(type_id, row, next_epoch);
         let typed = arch.get_typed_column_mut::<T>(type_id, self.id).ok()?;
         let val_ref = typed.get_mut(row)?;
         self.store.epoch = next_epoch;
@@ -298,6 +326,7 @@ impl<'a> EntityMut<'a> {
         if arch.entities().get(row) != Some(&self.id) {
             return Err(StateError::EntityNotFound(self.id));
         }
+        arch.mark_column_row_epoch(type_id, row, next_epoch);
         let typed = arch.get_typed_column_mut::<T>(type_id, self.id)?;
         let val_ref = typed.get_mut(row).ok_or_else(|| {
             StateError::AccessDenied(format!(

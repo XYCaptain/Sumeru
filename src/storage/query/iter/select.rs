@@ -58,13 +58,18 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectBuilder<'a, Q, F> {
         }
     }
 
-    /// Require relationship pair `(R, target)` on the entity.
+    /// Require relationship pair `(R, target)` on the entity (accelerated via per-table `PairTargetIndex`).
     #[inline]
     pub fn with_pair<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
         self,
         target: EntityId,
-    ) -> SelectBuilder<'a, Q, BusinessFilter<F, crate::al::Pair<R>>> {
-        self.filter::<crate::al::Pair<R>>(move |pair| pair.target == target)
+    ) -> SelectBuilder<'a, Q, WithPairTarget<R, F>> {
+        SelectBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            filter: WithPairTarget::new(self.filter, target),
+            marker: PhantomData,
+        }
     }
 
     /// Skip entire tables containing relationship pair `Pair<R>`.
@@ -83,6 +88,44 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectBuilder<'a, Q, F> {
     #[inline]
     pub fn without_tag<const N: u8>(self) -> SelectBuilder<'a, Q, Without<crate::al::Tag<N>, F>> {
         self.without::<crate::al::Tag<N>>()
+    }
+
+    /// Require non-migrating row status bit `FLAG` (`0..8`) to be set (`1`).
+    #[inline]
+    pub fn with_flag<const FLAG: u8>(self) -> SelectBuilder<'a, Q, WithFlag<FLAG, F>> {
+        const { assert!(FLAG < 8, "RowFlag index must be in 0..8") };
+        SelectBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            filter: WithFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// Require non-migrating row status bit `FLAG` (`0..8`) to be unset (`0`).
+    #[inline]
+    pub fn without_flag<const FLAG: u8>(self) -> SelectBuilder<'a, Q, WithoutFlag<FLAG, F>> {
+        const { assert!(FLAG < 8, "RowFlag index must be in 0..8") };
+        SelectBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            filter: WithoutFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// Filter to 64-row chunks of component `T` modified strictly after `since_epoch`.
+    #[inline]
+    pub fn changed_since<T: 'static>(
+        self,
+        since_epoch: u64,
+    ) -> SelectBuilder<'a, Q, ChangedSince<T, F>> {
+        SelectBuilder {
+            archetypes: self.archetypes,
+            row_upper_bound: self.row_upper_bound,
+            filter: ChangedSince::new(self.filter, since_epoch),
+            marker: PhantomData,
+        }
     }
 
     /// Add a row-level component predicate filter.
@@ -123,6 +166,7 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectBuilder<'a, Q, F> {
             segment_start_row: 0,
             segment_offset: 0,
             entities: [].iter(),
+            filtered_mask: None,
             state: None,
             remaining_upper_bound: self.row_upper_bound,
             filter: self.filter,
@@ -166,6 +210,7 @@ pub struct QueryIter<'a, Q: QueryData<'a>, F: QueryFilter = All> {
     segment_start_row: usize,
     segment_offset: usize,
     entities: std::slice::Iter<'a, EntityId>,
+    filtered_mask: Option<crate::storage::archetype::RowBitMask>,
     state: Option<Q::State>,
     remaining_upper_bound: usize,
     filter: F,
@@ -177,22 +222,46 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> Iterator for QueryIter<'a, Q, F> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(&entity) = self.entities.next() {
-                let current_row = self.segment_start_row + self.segment_offset;
-                self.segment_offset += 1;
-                self.remaining_upper_bound -= 1;
-                let item = Q::next(
-                    self.state.as_mut().expect("prepared component slices"),
-                    entity,
-                );
-                if F::IS_ROW_FILTERED {
-                    if let Some(arch) = self.current {
-                        if !self.filter.matches_row(arch, current_row) {
+            if !self.entities.as_slice().is_empty() {
+                if let Some(mask) = &self.filtered_mask {
+                    let rem_len = self.entities.len();
+                    let start_row = self.segment_start_row + self.segment_offset;
+                    let seg_end = start_row + rem_len;
+                    let mut cur = start_row;
+                    while cur < seg_end {
+                        let w_idx = cur >> 6;
+                        let bit_idx = cur & 63;
+                        let word = mask.words().get(w_idx).copied().unwrap_or(0) >> bit_idx;
+                        if word != 0 {
+                            cur += word.trailing_zeros() as usize;
+                            break;
+                        }
+                        cur = (w_idx + 1) << 6;
+                    }
+                    let skip = cur.min(seg_end) - start_row;
+                    if skip > 0 {
+                        self.segment_offset += skip;
+                        self.remaining_upper_bound -= skip;
+                        if skip >= rem_len {
+                            self.entities = [].iter();
                             continue;
                         }
+                        self.entities = self.entities.as_slice()[skip..].iter();
+                        Q::skip_rows(
+                            self.state.as_mut().expect("prepared component slices"),
+                            skip,
+                        );
                     }
                 }
-                return Some(item);
+                if let Some(&entity) = self.entities.next() {
+                    self.segment_offset += 1;
+                    self.remaining_upper_bound -= 1;
+                    let item = Q::next(
+                        self.state.as_mut().expect("prepared component slices"),
+                        entity,
+                    );
+                    return Some(item);
+                }
             }
             self.state = None;
             if let Some(archetype) = self.current {
@@ -209,12 +278,21 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> Iterator for QueryIter<'a, Q, F> {
                     self.remaining_upper_bound -= archetype.len() - self.row;
                 }
                 self.current = None;
+                self.filtered_mask = None;
             }
             let archetype = self.archetypes.next()?;
             if archetype.is_empty() {
                 continue;
             }
             if self.filter.matches_archetype(archetype) {
+                if F::IS_ROW_FILTERED {
+                    let mask = self.filter.collect_matched_row_mask(archetype);
+                    if mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+                        self.remaining_upper_bound -= archetype.len();
+                        continue;
+                    }
+                    self.filtered_mask = mask;
+                }
                 self.current = Some(archetype);
                 self.row = 0;
                 continue;
@@ -225,7 +303,12 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> Iterator for QueryIter<'a, Q, F> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.entities.len(), Some(self.remaining_upper_bound))
+        let lower = if self.filtered_mask.is_some() {
+            0
+        } else {
+            self.entities.len()
+        };
+        (lower, Some(self.remaining_upper_bound))
     }
 }
 

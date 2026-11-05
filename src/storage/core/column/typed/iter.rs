@@ -39,7 +39,21 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> ExactSizeIterator for
     }
 }
 
+impl<'a, T: ModelComponent + Serialize + DeserializeOwned> ColumnIter<'a, T> {
+    #[inline(always)]
+    pub(crate) fn skip_rows(&mut self, n: usize) {
+        if n > 0 {
+            match self {
+                Self::Direct(iter) => {
+                    let _ = iter.nth(n - 1);
+                }
+            }
+        }
+    }
+}
+
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> std::iter::FusedIterator
     for ColumnIter<'a, T>
 {
 }
+

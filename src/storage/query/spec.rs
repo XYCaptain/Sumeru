@@ -1,6 +1,6 @@
 //! Borrowed, allocation-free queries over archetype-local component columns.
 
-use crate::storage::archetype::Archetype;
+use crate::storage::archetype::{Archetype, RowBitMask};
 use crate::id::ArchetypeId;
 #[allow(unused_imports)]
 use crate::storage::column::{ColumnDescriptor, TypedColumn, ColumnIter};
@@ -107,6 +107,33 @@ pub trait QueryMutParam<'a>: sealed::ParamFetch<'a> {
 pub(crate) trait RowColumnAccessor {
     fn get_column_descriptor(&self, cid: ComponentTypeId) -> Option<ColumnDescriptor>;
     fn len(&self) -> usize;
+
+    #[inline]
+    fn flag_plane_words(&self, flag: u8) -> Option<&[u64]> {
+        let _ = flag;
+        None
+    }
+
+    #[inline]
+    fn row_has_flag(&self, row: usize, flag: u8) -> bool {
+        let _ = (row, flag);
+        false
+    }
+
+    #[inline]
+    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<&[u64]> {
+        let _ = cid;
+        None
+    }
+
+    #[inline]
+    fn pair_target_row_mask<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
+        &self,
+        target: EntityId,
+    ) -> Option<RowBitMask> {
+        let _ = target;
+        None
+    }
 }
 
 impl RowColumnAccessor for Archetype {
@@ -125,6 +152,29 @@ impl RowColumnAccessor for Archetype {
     #[inline]
     fn len(&self) -> usize {
         self.len()
+    }
+
+    #[inline]
+    fn flag_plane_words(&self, flag: u8) -> Option<&[u64]> {
+        self.flag_plane_words(flag)
+    }
+
+    #[inline]
+    fn row_has_flag(&self, row: usize, flag: u8) -> bool {
+        self.get_row_flag(row, flag)
+    }
+
+    #[inline]
+    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<&[u64]> {
+        self.column_chunk_epochs(cid)
+    }
+
+    #[inline]
+    fn pair_target_row_mask<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
+        &self,
+        target: EntityId,
+    ) -> Option<RowBitMask> {
+        self.pair_target_row_mask::<R>(target)
     }
 }
 
@@ -192,6 +242,28 @@ pub trait QueryFilter: sealed::Filter + Send + Sync + 'static {
     #[allow(private_interfaces)]
     fn is_row_filtered(&self) -> bool {
         Self::IS_ROW_FILTERED
+    }
+
+    /// 批量收集匹配行位图掩码：基于 64-bit word 位图与分块代际实现 O(N/64) 极速过滤与跳步
+    #[inline]
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    fn collect_matched_row_mask<A: RowColumnAccessor + ?Sized>(
+        &self,
+        accessor: &A,
+    ) -> Option<RowBitMask> {
+        if !Self::IS_ROW_FILTERED {
+            return None;
+        }
+        let total = accessor.len();
+        if total == 0 {
+            return Some(RowBitMask::new_empty(0));
+        }
+        let mut mask = RowBitMask::new_all_set(total);
+        if !<Self as sealed::Filter>::apply_row_mask(self, accessor, &mut mask) {
+            return Some(RowBitMask::new_empty(total));
+        }
+        Some(mask)
     }
 
     /// 批量收集匹配行索引：整张表仅解析一次列描述符后连续判断
@@ -379,6 +451,70 @@ impl<T: 'static, F: Default> Default for Without<T, F> {
     }
 }
 
+/// 非迁移位图状态标记包含过滤节点（O(1) 64-bit word 按位与）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WithFlag<const FLAG: u8, F = All> {
+    pub(crate) previous: F,
+}
+
+impl<const FLAG: u8, F> WithFlag<FLAG, F> {
+    #[inline]
+    pub const fn new(previous: F) -> Self {
+        Self { previous }
+    }
+}
+
+/// 非迁移位图状态标记排除过滤节点（O(1) 64-bit word 按位差）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WithoutFlag<const FLAG: u8, F = All> {
+    pub(crate) previous: F,
+}
+
+impl<const FLAG: u8, F> WithoutFlag<FLAG, F> {
+    #[inline]
+    pub const fn new(previous: F) -> Self {
+        Self { previous }
+    }
+}
+
+/// 基于 64 行分块写代际（Chunk Write Epoch）的增量脏数据过滤节点。
+#[derive(Clone, Copy, Debug)]
+pub struct ChangedSince<T, F = All> {
+    pub(crate) previous: F,
+    pub(crate) since_epoch: u64,
+    pub(crate) marker: PhantomData<fn() -> T>,
+}
+
+impl<T: 'static, F> ChangedSince<T, F> {
+    #[inline]
+    pub const fn new(previous: F, since_epoch: u64) -> Self {
+        Self {
+            previous,
+            since_epoch,
+            marker: PhantomData,
+        }
+    }
+}
+
+/// 基于原型内嵌目标二级位图索引的关系对 `(R, target)` 过滤节点。
+#[derive(Clone, Copy, Debug)]
+pub struct WithPairTarget<R, F = All> {
+    pub(crate) previous: F,
+    pub(crate) target: EntityId,
+    pub(crate) marker: PhantomData<fn() -> R>,
+}
+
+impl<R: 'static, F> WithPairTarget<R, F> {
+    #[inline]
+    pub const fn new(previous: F, target: EntityId) -> Self {
+        Self {
+            previous,
+            target,
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<F: sealed::Filter + Send + Sync + 'static> QueryFilter for F {}
 
 pub(crate) mod sealed {
@@ -387,12 +523,34 @@ pub(crate) mod sealed {
     pub(crate) trait Fetch<'a> {
         type State;
         fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)>;
+        #[inline(always)]
+        fn fast_prepare_bound(
+            archetype: &'a Archetype,
+            col_slots: &[u16],
+            start: usize,
+        ) -> Option<(Self::State, usize)> {
+            let _ = col_slots;
+            Self::prepare(archetype, start)
+        }
         fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item
         where
             Self: QueryData<'a>;
+        fn skip_rows(state: &mut Self::State, count: usize);
         fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)>
         where
             Self: QueryData<'a>;
+        #[inline(always)]
+        fn fast_chunk_bound(
+            archetype: &'a Archetype,
+            col_slots: &[u16],
+            start: usize,
+        ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)>
+        where
+            Self: QueryData<'a>,
+        {
+            let _ = col_slots;
+            Self::chunk(archetype, start)
+        }
     }
 
     pub(crate) trait FetchMut<'a> {
@@ -404,9 +562,18 @@ pub(crate) mod sealed {
         fn fast_prepare_archetype(
             archetype: &'a mut Archetype,
         ) -> Option<(Self::State, &'a [EntityId])>;
+        #[inline(always)]
+        fn fast_prepare_bound(
+            archetype: &'a mut Archetype,
+            col_slots: &[u16],
+        ) -> Option<(Self::State, &'a [EntityId])> {
+            let _ = col_slots;
+            Self::fast_prepare_archetype(archetype)
+        }
         fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item
         where
             Self: QueryMutData<'a>;
+        fn skip_rows(state: &mut Self::State, count: usize);
         fn chunk(
             entities: &'a [EntityId],
             columns: &[(ComponentTypeId, ColumnDescriptor)],
@@ -419,6 +586,36 @@ pub(crate) mod sealed {
         ) -> Option<<Self as QueryMutData<'a>>::Chunk>
         where
             Self: QueryMutData<'a>;
+        #[inline(always)]
+        fn fast_chunk_bound(
+            archetype: &'a mut Archetype,
+            col_slots: &[u16],
+        ) -> Option<<Self as QueryMutData<'a>>::Chunk>
+        where
+            Self: QueryMutData<'a>,
+        {
+            let _ = col_slots;
+            Self::fast_chunk_archetype(archetype)
+        }
+        #[inline(always)]
+        fn mark_written_columns(
+            archetype: &mut Archetype,
+            masked: Option<&RowBitMask>,
+            epoch: u64,
+        ) {
+            if epoch == 0 {
+                return;
+            }
+            for (cid, _, is_write) in Self::access_descriptors() {
+                if is_write {
+                    if let Some(mask) = masked {
+                        archetype.mark_column_masked_chunks_epoch(cid, mask, epoch);
+                    } else {
+                        archetype.mark_column_all_chunks_epoch(cid, epoch);
+                    }
+                }
+            }
+        }
         #[allow(dead_code)]
         fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]>;
         #[inline]
@@ -430,11 +627,30 @@ pub(crate) mod sealed {
     pub(crate) trait ReadParam<'a>: QueryMutParam<'a> {
         type ReadState: 'a;
         fn prepare_read(archetype: &'a Archetype, start: usize) -> Option<(Self::ReadState, usize)>;
+        #[inline(always)]
+        fn fast_prepare_read_slot(
+            archetype: &'a Archetype,
+            slot: u16,
+            start: usize,
+        ) -> Option<(Self::ReadState, usize)> {
+            let _ = slot;
+            Self::prepare_read(archetype, start)
+        }
         fn next_read(state: &mut Self::ReadState) -> <Self as QueryMutParam<'a>>::Item;
+        fn skip_read(state: &mut Self::ReadState, count: usize);
         fn chunk_read(
             archetype: &'a Archetype,
             start: usize,
         ) -> Option<(<Self as QueryMutParam<'a>>::Chunk, usize)>;
+        #[inline(always)]
+        fn fast_chunk_read_slot(
+            archetype: &'a Archetype,
+            slot: u16,
+            start: usize,
+        ) -> Option<(<Self as QueryMutParam<'a>>::Chunk, usize)> {
+            let _ = slot;
+            Self::chunk_read(archetype, start)
+        }
         fn truncate_chunk(
             chunk: <Self as QueryMutParam<'a>>::Chunk,
             len: usize,
@@ -457,6 +673,12 @@ pub(crate) mod sealed {
             flat_cols: &[crate::storage::archetype::FlatColumnEntry],
             len: usize,
         ) -> Option<Self::State>;
+        unsafe fn fast_prepare_slot(
+            comp_slice: &[ComponentTypeId],
+            flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+            slot: u16,
+            len: usize,
+        ) -> Option<Self::State>;
         unsafe fn chunk(
             desc: Option<&ColumnDescriptor>,
             range: Range<usize>,
@@ -470,9 +692,18 @@ pub(crate) mod sealed {
         ) -> Option<<Self as QueryMutParam<'a>>::Chunk>
         where
             Self: QueryMutParam<'a>;
+        unsafe fn fast_chunk_slot(
+            comp_slice: &[ComponentTypeId],
+            flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+            slot: u16,
+            len: usize,
+        ) -> Option<<Self as QueryMutParam<'a>>::Chunk>
+        where
+            Self: QueryMutParam<'a>;
         fn next_item(state: &mut Self::State) -> <Self as QueryMutParam<'a>>::Item
         where
             Self: QueryMutParam<'a>;
+        fn skip_items(state: &mut Self::State, count: usize);
     }
 
     pub(crate) trait QueryMutShapeInternal<B> {
@@ -549,6 +780,39 @@ pub(crate) mod sealed {
                 false
             }
         }
+
+        /// 将当前过滤器的行级结果与 `mask` 进行原地按位与求交；若交集全为 0 则返回 `false` 立即短路。
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(
+            &self,
+            accessor: &A,
+            mask: &mut RowBitMask,
+        ) -> bool {
+            if !Self::IS_ROW_FILTERED_INTERNAL {
+                return !mask.is_all_zero();
+            }
+            let Some(state) = self.prepare_table(accessor) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            let row_len = mask.row_len();
+            let mut any_non_zero = false;
+            for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    let row = w_idx * 64 + bit;
+                    if row < row_len && !self.matches_row_prepared(&state, row) {
+                        *word &= !(1u64 << bit);
+                    }
+                    w &= w - 1;
+                }
+                if *word != 0 {
+                    any_non_zero = true;
+                }
+            }
+            any_non_zero
+        }
     }
 
     impl Filter for All {
@@ -577,6 +841,11 @@ pub(crate) mod sealed {
         #[inline]
         fn matches_row_internal<A: RowColumnAccessor + ?Sized>(&self, _: &A, _: usize) -> bool {
             true
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, _: &A, mask: &mut RowBitMask) -> bool {
+            !mask.is_all_zero()
         }
     }
 
@@ -622,6 +891,11 @@ pub(crate) mod sealed {
         fn matches_row_internal<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, row: usize) -> bool {
             self.previous.matches_row_internal(accessor, row)
         }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            self.previous.apply_row_mask(accessor, mask)
+        }
     }
 
     impl<T: 'static, F: Filter> Filter for Without<T, F> {
@@ -666,6 +940,11 @@ pub(crate) mod sealed {
         fn matches_row_internal<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, row: usize) -> bool {
             self.previous.matches_row_internal(accessor, row)
         }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            self.previous.apply_row_mask(accessor, mask)
+        }
     }
 
     impl<F1: Filter, F2: Filter> Filter for (F1, F2) {
@@ -706,6 +985,11 @@ pub(crate) mod sealed {
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
             self.0.collect_read_components(out);
             self.1.collect_read_components(out);
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            self.0.apply_row_mask(accessor, mask) && self.1.apply_row_mask(accessor, mask)
         }
     }
 
@@ -758,6 +1042,13 @@ pub(crate) mod sealed {
             self.1.collect_read_components(out);
             self.2.collect_read_components(out);
         }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            self.0.apply_row_mask(accessor, mask)
+                && self.1.apply_row_mask(accessor, mask)
+                && self.2.apply_row_mask(accessor, mask)
+        }
     }
 
     impl<F: Filter, C: ModelComponent + Serialize + DeserializeOwned, Field: ComponentField<C>> Filter
@@ -806,6 +1097,39 @@ pub(crate) mod sealed {
             self.previous.collect_read_components(out);
             out.insert(ComponentTypeId::of::<C>(), std::any::type_name::<C>());
         }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            let Some(desc) = accessor.get_column_descriptor(ComponentTypeId::of::<C>()) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            let row_len = mask.row_len().min(desc.len);
+            let mut any_non_zero = false;
+            for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    let row = w_idx * 64 + bit;
+                    if row >= row_len {
+                        *word &= !(1u64 << bit);
+                    } else {
+                        let comp: &C = unsafe { desc.get_unchecked(row) };
+                        if Field::extract(comp) != &self.expected {
+                            *word &= !(1u64 << bit);
+                        }
+                    }
+                    w &= w - 1;
+                }
+                if *word != 0 {
+                    any_non_zero = true;
+                }
+            }
+            any_non_zero
+        }
     }
 
     impl<F: Filter, C: ModelComponent + Serialize + DeserializeOwned> Filter for BusinessFilter<F, C> {
@@ -852,6 +1176,296 @@ pub(crate) mod sealed {
             self.previous.collect_read_components(out);
             out.insert(ComponentTypeId::of::<C>(), std::any::type_name::<C>());
         }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            let Some(desc) = accessor.get_column_descriptor(ComponentTypeId::of::<C>()) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            let row_len = mask.row_len().min(desc.len);
+            let mut any_non_zero = false;
+            for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    let row = w_idx * 64 + bit;
+                    if row >= row_len {
+                        *word &= !(1u64 << bit);
+                    } else {
+                        let comp: &C = unsafe { desc.get_unchecked(row) };
+                        if !(self.predicate)(comp) {
+                            *word &= !(1u64 << bit);
+                        }
+                    }
+                    w &= w - 1;
+                }
+                if *word != 0 {
+                    any_non_zero = true;
+                }
+            }
+            any_non_zero
+        }
+    }
+
+    impl<const FLAG: u8, F: Filter> Filter for WithFlag<FLAG, F> {
+        fn collect_archetype_requirements(&self, out: &mut Vec<(ComponentTypeId, bool)>) {
+            self.previous.collect_archetype_requirements(out);
+        }
+        const IS_ROW_FILTERED_INTERNAL: bool = true;
+        type TableState<'a> = (F::TableState<'a>, Option<&'a [u64]>);
+
+        #[inline]
+        fn prepare_table<'a, A: RowColumnAccessor + ?Sized>(&self, accessor: &'a A) -> Option<Self::TableState<'a>> {
+            let prev = self.previous.prepare_table(accessor)?;
+            let plane = accessor.flag_plane_words(FLAG);
+            Some((prev, plane))
+        }
+
+        #[inline]
+        fn matches_row_prepared<'a>(&self, state: &Self::TableState<'a>, row: usize) -> bool {
+            if !self.previous.matches_row_prepared(&state.0, row) {
+                return false;
+            }
+            let Some(words) = state.1 else {
+                return false;
+            };
+            let w_idx = row >> 6;
+            if w_idx >= words.len() {
+                return false;
+            }
+            (words[w_idx] & (1u64 << (row & 63))) != 0
+        }
+
+        #[inline]
+        fn matches_archetype_internal<H: ArchetypeHeader + ?Sized>(&self, archetype: &H) -> bool {
+            self.previous.matches_archetype_internal(archetype)
+        }
+
+        #[inline]
+        fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
+            self.previous.collect_read_components(out);
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            let Some(plane_words) = accessor.flag_plane_words(FLAG) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            mask.intersect_words(plane_words);
+            !mask.is_all_zero()
+        }
+    }
+
+    impl<const FLAG: u8, F: Filter> Filter for WithoutFlag<FLAG, F> {
+        fn collect_archetype_requirements(&self, out: &mut Vec<(ComponentTypeId, bool)>) {
+            self.previous.collect_archetype_requirements(out);
+        }
+        const IS_ROW_FILTERED_INTERNAL: bool = true;
+        type TableState<'a> = (F::TableState<'a>, Option<&'a [u64]>);
+
+        #[inline]
+        fn prepare_table<'a, A: RowColumnAccessor + ?Sized>(&self, accessor: &'a A) -> Option<Self::TableState<'a>> {
+            let prev = self.previous.prepare_table(accessor)?;
+            let plane = accessor.flag_plane_words(FLAG);
+            Some((prev, plane))
+        }
+
+        #[inline]
+        fn matches_row_prepared<'a>(&self, state: &Self::TableState<'a>, row: usize) -> bool {
+            if !self.previous.matches_row_prepared(&state.0, row) {
+                return false;
+            }
+            let Some(words) = state.1 else {
+                return true;
+            };
+            let w_idx = row >> 6;
+            if w_idx >= words.len() {
+                return true;
+            }
+            (words[w_idx] & (1u64 << (row & 63))) == 0
+        }
+
+        #[inline]
+        fn matches_archetype_internal<H: ArchetypeHeader + ?Sized>(&self, archetype: &H) -> bool {
+            self.previous.matches_archetype_internal(archetype)
+        }
+
+        #[inline]
+        fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
+            self.previous.collect_read_components(out);
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            if let Some(plane_words) = accessor.flag_plane_words(FLAG) {
+                mask.difference_words(plane_words);
+            }
+            !mask.is_all_zero()
+        }
+    }
+
+    impl<T: 'static, F: Filter> Filter for ChangedSince<T, F> {
+        fn collect_archetype_requirements(&self, out: &mut Vec<(ComponentTypeId, bool)>) {
+            self.previous.collect_archetype_requirements(out);
+            out.push((ComponentTypeId::of::<T>(), true));
+        }
+        const IS_ROW_FILTERED_INTERNAL: bool = true;
+        type TableState<'a> = (F::TableState<'a>, (&'a [u64], u64));
+
+        #[inline]
+        fn prepare_table<'a, A: RowColumnAccessor + ?Sized>(&self, accessor: &'a A) -> Option<Self::TableState<'a>> {
+            let prev = self.previous.prepare_table(accessor)?;
+            let epochs = accessor.column_chunk_epochs(ComponentTypeId::of::<T>())?;
+            Some((prev, epochs))
+        }
+
+        #[inline]
+        fn matches_row_prepared<'a>(&self, state: &Self::TableState<'a>, row: usize) -> bool {
+            if !self.previous.matches_row_prepared(&state.0, row) {
+                return false;
+            }
+            let chunk_idx = row >> 6;
+            let (epochs, def_ep) = state.1;
+            let ep = epochs.get(chunk_idx).copied().unwrap_or(def_ep);
+            ep > self.since_epoch
+        }
+
+        #[inline]
+        fn matches_archetype_internal<H: ArchetypeHeader + ?Sized>(&self, archetype: &H) -> bool {
+            self.previous.matches_archetype_internal(archetype)
+                && archetype.contains_component(ComponentTypeId::of::<T>())
+        }
+
+        #[inline]
+        fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
+            self.previous.collect_read_components(out);
+            out.insert(ComponentTypeId::of::<T>(), std::any::type_name::<T>());
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            let Some((epochs, def_ep)) = accessor.column_chunk_epochs(ComponentTypeId::of::<T>()) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            let mut any_non_zero = false;
+            for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
+                if *word == 0 {
+                    continue;
+                }
+                let ep = epochs.get(w_idx).copied().unwrap_or(def_ep);
+                if ep <= self.since_epoch {
+                    *word = 0;
+                } else {
+                    any_non_zero = true;
+                }
+            }
+            any_non_zero
+        }
+    }
+
+    impl<R: ModelComponent + Serialize + DeserializeOwned + 'static, F: Filter> Filter
+        for WithPairTarget<R, F>
+    {
+        fn collect_archetype_requirements(&self, out: &mut Vec<(ComponentTypeId, bool)>) {
+            self.previous.collect_archetype_requirements(out);
+            out.push((ComponentTypeId::of::<crate::al::Pair<R>>(), true));
+        }
+        const IS_ROW_FILTERED_INTERNAL: bool = true;
+        type TableState<'a> = (F::TableState<'a>, RowBitMask);
+
+        #[inline]
+        fn prepare_table<'a, A: RowColumnAccessor + ?Sized>(&self, accessor: &'a A) -> Option<Self::TableState<'a>> {
+            let prev = self.previous.prepare_table(accessor)?;
+            let mask = if let Some(m) = accessor.pair_target_row_mask::<R>(self.target) {
+                m
+            } else {
+                let desc = accessor.get_column_descriptor(ComponentTypeId::of::<crate::al::Pair<R>>())?;
+                let mut m = RowBitMask::new_empty(desc.len);
+                for r in 0..desc.len {
+                    let pair: &crate::al::Pair<R> = unsafe { desc.get_unchecked(r) };
+                    if pair.target == self.target {
+                        m.set(r);
+                    }
+                }
+                m
+            };
+            if mask.is_all_zero() {
+                return None;
+            }
+            Some((prev, mask))
+        }
+
+        #[inline]
+        fn matches_row_prepared<'a>(&self, state: &Self::TableState<'a>, row: usize) -> bool {
+            self.previous.matches_row_prepared(&state.0, row) && state.1.test(row)
+        }
+
+        #[inline]
+        fn matches_archetype_internal<H: ArchetypeHeader + ?Sized>(&self, archetype: &H) -> bool {
+            self.previous.matches_archetype_internal(archetype)
+                && archetype.contains_component(ComponentTypeId::of::<crate::al::Pair<R>>())
+        }
+
+        #[inline]
+        fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
+            self.previous.collect_read_components(out);
+            out.insert(
+                ComponentTypeId::of::<crate::al::Pair<R>>(),
+                std::any::type_name::<crate::al::Pair<R>>(),
+            );
+        }
+
+        #[inline]
+        fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
+            if !self.previous.apply_row_mask(accessor, mask) {
+                return false;
+            }
+            if let Some(pair_mask) = accessor.pair_target_row_mask::<R>(self.target) {
+                mask.intersect_with(&pair_mask);
+                return !mask.is_all_zero();
+            }
+            let Some(desc) = accessor.get_column_descriptor(ComponentTypeId::of::<crate::al::Pair<R>>()) else {
+                mask.words_mut().fill(0);
+                return false;
+            };
+            let row_len = mask.row_len().min(desc.len);
+            let mut any_non_zero = false;
+            for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
+                let mut w = *word;
+                while w != 0 {
+                    let bit = w.trailing_zeros() as usize;
+                    let row = w_idx * 64 + bit;
+                    if row >= row_len {
+                        *word &= !(1u64 << bit);
+                    } else {
+                        let pair: &crate::al::Pair<R> = unsafe { desc.get_unchecked(row) };
+                        if pair.target != self.target {
+                            *word &= !(1u64 << bit);
+                        }
+                    }
+                    w &= w - 1;
+                }
+                if *word != 0 {
+                    any_non_zero = true;
+                }
+            }
+            any_non_zero
+        }
     }
 }
 
@@ -891,6 +1505,30 @@ pub(crate) fn column_suffix<T: ModelComponent + Serialize + DeserializeOwned>(
     column.backing().slice_from(start)
 }
 
+#[inline(always)]
+pub(crate) fn column_suffix_at_slot<T: ModelComponent + Serialize + DeserializeOwned>(
+    archetype: &Archetype,
+    slot: u16,
+    start: usize,
+) -> Option<&[T]> {
+    let slot_idx = slot as usize;
+    if start == 0
+        && !archetype.may_be_segmented_or_unaligned()
+        && slot_idx < archetype.flat_columns().len()
+        && archetype.flat_columns().len() == archetype.component_types_slice().len()
+    {
+        let entry = unsafe { *archetype.flat_columns().get_unchecked(slot_idx) };
+        if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+            let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+            let slice = col.as_slice();
+            if slice.len() == archetype.len() {
+                return Some(slice);
+            }
+        }
+    }
+    column_suffix::<T>(archetype, start)
+}
+
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a> for &'a T {
     type ReadState = ColumnIter<'a, T>;
 
@@ -903,6 +1541,28 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
         Some((col.iter_from(start), archetype.len()))
     }
 
+    #[inline(always)]
+    fn fast_prepare_read_slot(
+        archetype: &'a Archetype,
+        slot: u16,
+        start: usize,
+    ) -> Option<(Self::ReadState, usize)> {
+        let slot_idx = slot as usize;
+        if !archetype.may_be_segmented_or_unaligned()
+            && slot_idx < archetype.flat_columns().len()
+            && archetype.flat_columns().len() == archetype.component_types_slice().len()
+        {
+            let entry = unsafe { *archetype.flat_columns().get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                if col.len() == archetype.len() {
+                    return Some((col.iter_from(start), archetype.len()));
+                }
+            }
+        }
+        Self::prepare_read(archetype, start)
+    }
+
     #[inline]
     fn next_read(state: &mut Self::ReadState) -> &'a T {
         state
@@ -911,8 +1571,23 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
     }
 
     #[inline]
+    fn skip_read(state: &mut Self::ReadState, count: usize) {
+        state.skip_rows(count);
+    }
+
+    #[inline]
     fn chunk_read(archetype: &'a Archetype, start: usize) -> Option<(&'a [T], usize)> {
         let slice = column_suffix::<T>(archetype, start)?;
+        Some((slice, slice.len()))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_read_slot(
+        archetype: &'a Archetype,
+        slot: u16,
+        start: usize,
+    ) -> Option<(&'a [T], usize)> {
+        let slice = column_suffix_at_slot::<T>(archetype, slot, start)?;
         Some((slice, slice.len()))
     }
 
@@ -938,11 +1613,43 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
         Some((Some(col.iter_from(start)), archetype.len()))
     }
 
+    #[inline(always)]
+    fn fast_prepare_read_slot(
+        archetype: &'a Archetype,
+        slot: u16,
+        start: usize,
+    ) -> Option<(Self::ReadState, usize)> {
+        if slot == u16::MAX {
+            return Some((None, archetype.len()));
+        }
+        let slot_idx = slot as usize;
+        if !archetype.may_be_segmented_or_unaligned()
+            && slot_idx < archetype.flat_columns().len()
+            && archetype.flat_columns().len() == archetype.component_types_slice().len()
+        {
+            let entry = unsafe { *archetype.flat_columns().get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                if col.len() == archetype.len() {
+                    return Some((Some(col.iter_from(start)), archetype.len()));
+                }
+            }
+        }
+        Self::prepare_read(archetype, start)
+    }
+
     #[inline]
     fn next_read(state: &mut Self::ReadState) -> Option<&'a T> {
         state
             .as_mut()
             .map(|it| it.next().expect("validated equal-length component and entity slices"))
+    }
+
+    #[inline]
+    fn skip_read(state: &mut Self::ReadState, count: usize) {
+        if let Some(it) = state.as_mut() {
+            it.skip_rows(count);
+        }
     }
 
     #[inline]
@@ -952,6 +1659,19 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
             return Some((None, archetype.len().saturating_sub(start)));
         }
         let slice = column_suffix::<T>(archetype, start)?;
+        Some((Some(slice), slice.len()))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_read_slot(
+        archetype: &'a Archetype,
+        slot: u16,
+        start: usize,
+    ) -> Option<(Option<&'a [T]>, usize)> {
+        if slot == u16::MAX {
+            return Some((None, archetype.len().saturating_sub(start)));
+        }
+        let slice = column_suffix_at_slot::<T>(archetype, slot, start)?;
         Some((Some(slice), slice.len()))
     }
 
@@ -972,15 +1692,43 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for
     fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
         <&'a T as sealed::ReadParam<'a>>::prepare_read(archetype, start)
     }
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(Self::State, usize)> {
+        if let Some(&slot) = col_slots.first() {
+            return <&'a T as sealed::ReadParam<'a>>::fast_prepare_read_slot(archetype, slot, start);
+        }
+        Self::prepare(archetype, start)
+    }
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item {
         (entity, <&'a T as sealed::ReadParam<'a>>::next_read(state))
+    }
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <&'a T as sealed::ReadParam<'a>>::skip_read(state, count);
     }
     #[inline]
     fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
         let slice = column_suffix::<T>(archetype, start)?;
         let end = start + slice.len();
         Some(((&archetype.entities()[start..end], slice), end))
+    }
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
+        if let Some(&slot) = col_slots.first() {
+            let slice = column_suffix_at_slot::<T>(archetype, slot, start)?;
+            let end = start + slice.len();
+            return Some(((&archetype.entities()[start..end], slice), end));
+        }
+        Self::chunk(archetype, start)
     }
 }
 
@@ -995,15 +1743,43 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for
     fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
         <Option<&'a T> as sealed::ReadParam<'a>>::prepare_read(archetype, start)
     }
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(Self::State, usize)> {
+        if let Some(&slot) = col_slots.first() {
+            return <Option<&'a T> as sealed::ReadParam<'a>>::fast_prepare_read_slot(archetype, slot, start);
+        }
+        Self::prepare(archetype, start)
+    }
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item {
         (entity, <Option<&'a T> as sealed::ReadParam<'a>>::next_read(state))
+    }
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <Option<&'a T> as sealed::ReadParam<'a>>::skip_read(state, count);
     }
     #[inline]
     fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
         let (opt_slice, avail) = <Option<&'a T> as sealed::ReadParam<'a>>::chunk_read(archetype, start)?;
         let end = start + avail;
         Some(((&archetype.entities()[start..end], opt_slice), end))
+    }
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a Archetype,
+        col_slots: &[u16],
+        start: usize,
+    ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
+        if let Some(&slot) = col_slots.first() {
+            let (opt_slice, avail) = <Option<&'a T> as sealed::ReadParam<'a>>::fast_chunk_read_slot(archetype, slot, start)?;
+            let end = start + avail;
+            return Some(((&archetype.entities()[start..end], opt_slice), end));
+        }
+        Self::chunk(archetype, start)
     }
 }
 
@@ -1065,6 +1841,27 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         Some(unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len).iter_mut() })
     }
 
+    #[inline(always)]
+    unsafe fn fast_prepare_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<Self::State> {
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &mut *(entry.col_ptr as *mut () as *mut TypedColumn<T>) };
+                let slice = col.as_mut_slice();
+                if slice.len() == len {
+                    return Some(unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len).iter_mut() });
+                }
+            }
+        }
+        unsafe { Self::fast_prepare(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     unsafe fn chunk(
         desc: Option<&ColumnDescriptor>,
@@ -1097,11 +1894,39 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         Some(unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len) })
     }
 
+    #[inline(always)]
+    unsafe fn fast_chunk_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<<Self as QueryMutParam<'a>>::Chunk> {
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &mut *(entry.col_ptr as *mut () as *mut TypedColumn<T>) };
+                let slice = col.as_mut_slice();
+                if slice.len() == len {
+                    return Some(unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len) });
+                }
+            }
+        }
+        unsafe { Self::fast_chunk(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     fn next_item(state: &mut Self::State) -> <Self as QueryMutParam<'a>>::Item {
         state
             .next()
             .expect("validated equal-length component slice")
+    }
+
+    #[inline]
+    fn skip_items(state: &mut Self::State, count: usize) {
+        if count > 0 {
+            let _ = state.nth(count - 1);
+        }
     }
 }
 
@@ -1163,6 +1988,27 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         Some(unsafe { std::slice::from_raw_parts(slice.as_ptr(), len).iter() })
     }
 
+    #[inline(always)]
+    unsafe fn fast_prepare_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<Self::State> {
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                let slice = col.as_slice();
+                if slice.len() == len {
+                    return Some(unsafe { std::slice::from_raw_parts(slice.as_ptr(), len).iter() });
+                }
+            }
+        }
+        unsafe { Self::fast_prepare(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     unsafe fn chunk(
         desc: Option<&ColumnDescriptor>,
@@ -1195,11 +2041,39 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         Some(unsafe { std::slice::from_raw_parts(slice.as_ptr(), len) })
     }
 
+    #[inline(always)]
+    unsafe fn fast_chunk_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<<Self as QueryMutParam<'a>>::Chunk> {
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                let slice = col.as_slice();
+                if slice.len() == len {
+                    return Some(unsafe { std::slice::from_raw_parts(slice.as_ptr(), len) });
+                }
+            }
+        }
+        unsafe { Self::fast_chunk(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     fn next_item(state: &mut Self::State) -> <Self as QueryMutParam<'a>>::Item {
         state
             .next()
             .expect("validated equal-length component slice")
+    }
+
+    #[inline]
+    fn skip_items(state: &mut Self::State, count: usize) {
+        if count > 0 {
+            let _ = state.nth(count - 1);
+        }
     }
 }
 
@@ -1269,6 +2143,32 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         }))
     }
 
+    #[inline(always)]
+    unsafe fn fast_prepare_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<Self::State> {
+        if slot == u16::MAX {
+            return Some(None);
+        }
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                let slice = col.as_slice();
+                if slice.len() == len {
+                    return Some(Some(unsafe {
+                        std::slice::from_raw_parts(slice.as_ptr(), len).iter()
+                    }));
+                }
+            }
+        }
+        unsafe { Self::fast_prepare(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     unsafe fn chunk(
         desc: Option<&ColumnDescriptor>,
@@ -1311,11 +2211,46 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         }))
     }
 
+    #[inline(always)]
+    unsafe fn fast_chunk_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<<Self as QueryMutParam<'a>>::Chunk> {
+        if slot == u16::MAX {
+            return Some(None);
+        }
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &*(entry.col_ptr as *const () as *const TypedColumn<T>) };
+                let slice = col.as_slice();
+                if slice.len() == len {
+                    return Some(Some(unsafe {
+                        std::slice::from_raw_parts(slice.as_ptr(), len)
+                    }));
+                }
+            }
+        }
+        unsafe { Self::fast_chunk(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     fn next_item(state: &mut Self::State) -> <Self as QueryMutParam<'a>>::Item {
         state
             .as_mut()
             .map(|it| it.next().expect("validated equal-length component slice"))
+    }
+
+    #[inline]
+    fn skip_items(state: &mut Self::State, count: usize) {
+        if count > 0 {
+            if let Some(it) = state.as_mut() {
+                let _ = it.nth(count - 1);
+            }
+        }
     }
 }
 
@@ -1387,6 +2322,32 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         }))
     }
 
+    #[inline(always)]
+    unsafe fn fast_prepare_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<Self::State> {
+        if slot == u16::MAX {
+            return Some(None);
+        }
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &mut *(entry.col_ptr as *mut () as *mut TypedColumn<T>) };
+                let slice = col.as_mut_slice();
+                if slice.len() == len {
+                    return Some(Some(unsafe {
+                        std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len).iter_mut()
+                    }));
+                }
+            }
+        }
+        unsafe { Self::fast_prepare(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     unsafe fn chunk(
         desc: Option<&ColumnDescriptor>,
@@ -1429,11 +2390,46 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
         }))
     }
 
+    #[inline(always)]
+    unsafe fn fast_chunk_slot(
+        comp_slice: &[ComponentTypeId],
+        flat_cols: &[crate::storage::archetype::FlatColumnEntry],
+        slot: u16,
+        len: usize,
+    ) -> Option<<Self as QueryMutParam<'a>>::Chunk> {
+        if slot == u16::MAX {
+            return Some(None);
+        }
+        let slot_idx = slot as usize;
+        if slot_idx < flat_cols.len() {
+            let entry = unsafe { *flat_cols.get_unchecked(slot_idx) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let col = unsafe { &mut *(entry.col_ptr as *mut () as *mut TypedColumn<T>) };
+                let slice = col.as_mut_slice();
+                if slice.len() == len {
+                    return Some(Some(unsafe {
+                        std::slice::from_raw_parts_mut(slice.as_mut_ptr(), len)
+                    }));
+                }
+            }
+        }
+        unsafe { Self::fast_chunk(comp_slice, flat_cols, len) }
+    }
+
     #[inline]
     fn next_item(state: &mut Self::State) -> <Self as QueryMutParam<'a>>::Item {
         state
             .as_mut()
             .map(|it| it.next().expect("validated equal-length component slice"))
+    }
+
+    #[inline]
+    fn skip_items(state: &mut Self::State, count: usize) {
+        if count > 0 {
+            if let Some(it) = state.as_mut() {
+                let _ = it.nth(count - 1);
+            }
+        }
     }
 }
 
@@ -1476,6 +2472,28 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
         Some((state, entities))
     }
 
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        if let Some(&slot) = col_slots.first() {
+            let len = archetype.len();
+            let state = unsafe {
+                <Self as sealed::ParamFetch<'a>>::fast_prepare_slot(
+                    archetype.component_types_slice(),
+                    archetype.flat_columns(),
+                    slot,
+                    len,
+                )?
+            };
+            let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+            archetype.bump_columns_version_in_place();
+            return Some((state, entities));
+        }
+        Self::fast_prepare_archetype(archetype)
+    }
+
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
         (
@@ -1484,6 +2502,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
                 .next()
                 .expect("validated equal-length component and entity slices"),
         )
+    }
+
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <Self as sealed::ParamFetch<'a>>::skip_items(state, count);
     }
 
     #[inline]
@@ -1516,6 +2539,28 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
         let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
         archetype.bump_columns_version_in_place();
         Some((entities, chunk))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        if let Some(&slot) = col_slots.first() {
+            let len = archetype.len();
+            let chunk = unsafe {
+                <Self as sealed::ParamFetch<'a>>::fast_chunk_slot(
+                    archetype.component_types_slice(),
+                    archetype.flat_columns(),
+                    slot,
+                    len,
+                )?
+            };
+            let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+            archetype.bump_columns_version_in_place();
+            return Some((entities, chunk));
+        }
+        Self::fast_chunk_archetype(archetype)
     }
 
     #[inline]
@@ -1562,12 +2607,38 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
         Some((state, entities))
     }
 
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        if let Some(&slot) = col_slots.first() {
+            let len = archetype.len();
+            let state = unsafe {
+                <Self as sealed::ParamFetch<'a>>::fast_prepare_slot(
+                    archetype.component_types_slice(),
+                    archetype.flat_columns(),
+                    slot,
+                    len,
+                )?
+            };
+            let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+            return Some((state, entities));
+        }
+        Self::fast_prepare_archetype(archetype)
+    }
+
     #[inline]
     fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
         (
             entity,
             state.next().expect("validated equal-length component slice"),
         )
+    }
+
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <Self as sealed::ParamFetch<'a>>::skip_items(state, count);
     }
 
     #[inline]
@@ -1601,6 +2672,35 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
         Some((entities, chunk))
     }
 
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        if let Some(&slot) = col_slots.first() {
+            let len = archetype.len();
+            let chunk = unsafe {
+                <Self as sealed::ParamFetch<'a>>::fast_chunk_slot(
+                    archetype.component_types_slice(),
+                    archetype.flat_columns(),
+                    slot,
+                    len,
+                )?
+            };
+            let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+            return Some((entities, chunk));
+        }
+        Self::fast_chunk_archetype(archetype)
+    }
+
+    #[inline(always)]
+    fn mark_written_columns(
+        _archetype: &mut Archetype,
+        _masked: Option<&RowBitMask>,
+        _epoch: u64,
+    ) {
+    }
+
     #[inline]
     fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]> {
         smallvec::smallvec![(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false)]
@@ -1632,13 +2732,59 @@ macro_rules! tuple_query {
                 )+
                 Some((($(cols.$index.0,)+), end))
             }
+            #[inline(always)]
+            fn fast_prepare_bound(
+                archetype: &'a Archetype,
+                col_slots: &[u16],
+                start: usize,
+            ) -> Option<(Self::State, usize)> {
+                let cols = ($(
+                    $name::fast_prepare_read_slot(
+                        archetype,
+                        col_slots.get($index).copied().unwrap_or(u16::MAX),
+                        start,
+                    )?,
+                )+);
+                let mut end = archetype.len();
+                $(
+                    end = end.min(cols.$index.1);
+                )+
+                Some((($(cols.$index.0,)+), end))
+            }
             #[inline]
             fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item {
                 (entity, ($($name::next_read(&mut state.$index),)+))
             }
             #[inline]
+            fn skip_rows(state: &mut Self::State, count: usize) {
+                $(
+                    $name::skip_read(&mut state.$index, count);
+                )+
+            }
+            #[inline]
             fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
                 let slices = ($($name::chunk_read(archetype, start)?,)+);
+                let len = archetype.len() - start;
+                $(let len = len.min(slices.$index.1);)+
+                let end = start + len;
+                Some((
+                    (&archetype.entities()[start..end], ($($name::truncate_chunk(slices.$index.0, len),)+)),
+                    end,
+                ))
+            }
+            #[inline(always)]
+            fn fast_chunk_bound(
+                archetype: &'a Archetype,
+                col_slots: &[u16],
+                start: usize,
+            ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
+                let slices = ($(
+                    $name::fast_chunk_read_slot(
+                        archetype,
+                        col_slots.get($index).copied().unwrap_or(u16::MAX),
+                        start,
+                    )?,
+                )+);
                 let len = archetype.len() - start;
                 $(let len = len.min(slices.$index.1);)+
                 let end = start + len;
@@ -1712,9 +2858,42 @@ macro_rules! tuple_query_mut {
                 Some((state, entities))
             }
 
+            #[inline(always)]
+            fn fast_prepare_bound(
+                archetype: &'a mut Archetype,
+                col_slots: &[u16],
+            ) -> Option<(Self::State, &'a [EntityId])> {
+                let len = archetype.len();
+                let comp_slice = archetype.component_types_slice();
+                let flat_cols = archetype.flat_columns();
+                let state = ($(
+                    unsafe {
+                        $P::fast_prepare_slot(
+                            comp_slice,
+                            flat_cols,
+                            col_slots.get($idx).copied().unwrap_or(u16::MAX),
+                            len,
+                        )?
+                    },
+                )+);
+                let entities =
+                    unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+                if $($P::is_write())||+ {
+                    archetype.bump_columns_version_in_place();
+                }
+                Some((state, entities))
+            }
+
             #[inline]
             fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
                 (entity, ($($P::next_item(&mut state.$idx),)+))
+            }
+
+            #[inline]
+            fn skip_rows(state: &mut Self::State, count: usize) {
+                $(
+                    $P::skip_items(&mut state.$idx, count);
+                )+
             }
 
             #[inline]
@@ -1746,6 +2925,32 @@ macro_rules! tuple_query_mut {
                 let flat_cols = archetype.flat_columns();
                 let chunks = ($(
                     unsafe { $P::fast_chunk(comp_slice, flat_cols, len)? },
+                )+);
+                let entities =
+                    unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+                if $($P::is_write())||+ {
+                    archetype.bump_columns_version_in_place();
+                }
+                Some((entities, chunks))
+            }
+
+            #[inline(always)]
+            fn fast_chunk_bound(
+                archetype: &'a mut Archetype,
+                col_slots: &[u16],
+            ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+                let len = archetype.len();
+                let comp_slice = archetype.component_types_slice();
+                let flat_cols = archetype.flat_columns();
+                let chunks = ($(
+                    unsafe {
+                        $P::fast_chunk_slot(
+                            comp_slice,
+                            flat_cols,
+                            col_slots.get($idx).copied().unwrap_or(u16::MAX),
+                            len,
+                        )?
+                    },
                 )+);
                 let entities =
                     unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };

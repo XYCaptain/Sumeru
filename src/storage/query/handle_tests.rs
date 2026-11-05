@@ -412,3 +412,184 @@ fn test_level2_matched_table_bindings_and_store_chunk_fast_path() {
     assert_eq!(sum_x, 119);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ChildOf;
+
+#[test]
+fn test_non_migrating_row_flags_and_structural_preservation() {
+    let mut store = Store::new();
+    let e1 = EntityId::from_u128(1001);
+    let e2 = EntityId::from_u128(1002);
+    let e3 = EntityId::from_u128(1003);
+
+    store
+        .insert((e1, (Pos { x: 1, y: 1 }, Vel { dx: 10, dy: 10 })))
+        .unwrap();
+    store
+        .insert((e2, (Pos { x: 2, y: 2 }, Vel { dx: 20, dy: 20 })))
+        .unwrap();
+    store
+        .insert((e3, (Pos { x: 3, y: 3 }, Vel { dx: 30, dy: 30 })))
+        .unwrap();
+
+    // Initially all flags are false
+    assert!(!store.has_flag::<0>(e1).unwrap());
+    assert!(!store.has_flag::<0>(e2).unwrap());
+
+    // Set flag 0 on e1 and e3 (in-place without archetype migration!)
+    let gen_before = store.archetype_set_generation();
+    store.set_flag::<0>(e1, true).unwrap();
+    store.set_flag::<0>(e3, true).unwrap();
+    assert_eq!(store.archetype_set_generation(), gen_before);
+    assert!(store.has_flag::<0>(e1).unwrap());
+    assert!(!store.has_flag::<0>(e2).unwrap());
+    assert!(store.has_flag::<0>(e3).unwrap());
+
+    // Query with_flag::<0> and without_flag::<0>
+    let q_flagged = QueryBuilder::<&Pos>::new()
+        .with_flag::<0>()
+        .build(&store)
+        .unwrap();
+    let q_unflagged = QueryBuilder::<&Pos>::new()
+        .without_flag::<0>()
+        .build(&store)
+        .unwrap();
+
+    let mut flagged_xs = Vec::new();
+    q_flagged
+        .for_each(&store, |pos| flagged_xs.push(pos.x))
+        .unwrap();
+    assert_eq!(flagged_xs, vec![1, 3]);
+
+    let mut unflagged_xs = Vec::new();
+    q_unflagged
+        .for_each(&store, |pos| unflagged_xs.push(pos.x))
+        .unwrap();
+    assert_eq!(unflagged_xs, vec![2]);
+
+    // Structural migration: add TagActive to e1 -> e1 moves to a new archetype,
+    // and e3 swap-removes into e1's old row 0! Both e1 and e3 must preserve their flags!
+    store.add_component_typed(e1, TagActive).unwrap();
+    assert!(store.has_flag::<0>(e1).unwrap());
+    assert!(!store.has_flag::<0>(e2).unwrap());
+    assert!(store.has_flag::<0>(e3).unwrap());
+
+    let mut iter_flagged: Vec<i32> = store
+        .query::<&Pos>()
+        .with_flag::<0>()
+        .into_iter()
+        .map(|p| p.x)
+        .collect();
+    iter_flagged.sort_unstable();
+    assert_eq!(iter_flagged, vec![1, 3]);
+}
+
+#[test]
+fn test_changed_since_chunk_epoch_dirty_tracking() {
+    let mut store = Store::new();
+    // Create 130 entities (spanning 3 64-row chunks: 0..64, 64..128, 128..130)
+    for i in 0..130u128 {
+        store
+            .insert((
+                EntityId::from_u128(2000 + i),
+                (
+                    Pos {
+                        x: i as i32,
+                        y: 0,
+                    },
+                    Vel { dx: 1, dy: 1 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    let baseline_epoch = store.epoch();
+
+    // No writes after baseline_epoch -> changed_since returns 0 rows
+    let q_changed = QueryBuilder::<(EntityId, &Pos)>::new()
+        .changed_since::<Pos>(baseline_epoch)
+        .build(&store)
+        .unwrap();
+    let mut count = 0usize;
+    q_changed
+        .for_each(&store, |(_id, _pos)| count += 1)
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Modify entity at index 70 (in chunk 1: rows 64..128)
+    let e70 = EntityId::from_u128(2000 + 70);
+    store
+        .modify_component_typed::<Pos, _>(e70, |p| p.y += 10)
+        .unwrap();
+
+    // Now only chunk 1 (64 rows: 64..128) should be visited by changed_since::<Pos>(baseline_epoch)!
+    let mut visited_xs = Vec::new();
+    q_changed
+        .for_each(&store, |(_id, pos)| visited_xs.push(pos.x))
+        .unwrap();
+    assert_eq!(visited_xs.len(), 64);
+    assert_eq!(visited_xs[0], 64);
+    assert_eq!(visited_xs[63], 127);
+
+    // Vel was NOT modified after baseline_epoch, so changed_since::<Vel> yields 0 rows
+    let visited_vel: usize = store
+        .query::<&Vel>()
+        .changed_since::<Vel>(baseline_epoch)
+        .into_iter()
+        .count();
+    assert_eq!(visited_vel, 0);
+}
+
+#[test]
+fn test_pair_target_index_and_with_pair_query() {
+    let mut store = Store::new();
+    let parent_a = EntityId::from_u128(9001);
+    let parent_b = EntityId::from_u128(9002);
+
+    for i in 0..50u128 {
+        let target = if i % 5 == 0 { parent_a } else { parent_b };
+        store
+            .insert((
+                EntityId::from_u128(3000 + i),
+                (
+                    Pos {
+                        x: i as i32,
+                        y: 0,
+                    },
+                    crate::al::Pair::<ChildOf>::new(ChildOf, target),
+                ),
+            ))
+            .unwrap();
+    }
+
+    // Query via persistent Query with_pair
+    let q_children_a = QueryBuilder::<(EntityId, &Pos)>::new()
+        .with_pair::<ChildOf>(parent_a)
+        .build(&store)
+        .unwrap();
+    let mut xs_a = Vec::new();
+    q_children_a
+        .for_each(&store, |(_id, pos)| xs_a.push(pos.x))
+        .unwrap();
+    assert_eq!(xs_a, vec![0, 5, 10, 15, 20, 25, 30, 35, 40, 45]);
+
+    // Query via Store::sources_with_pair
+    let sources_a = store.sources_with_pair::<ChildOf>(parent_a);
+    assert_eq!(sources_a.len(), 10);
+
+    // Mutate via Store::query_mut().with_pair
+    for (_id, pos) in store
+        .query_mut::<&mut Pos>()
+        .unwrap()
+        .with_pair::<ChildOf>(parent_a)
+    {
+        pos.y = 999;
+    }
+    let mut ys_a = Vec::new();
+    q_children_a
+        .for_each(&store, |(_id, pos)| ys_a.push(pos.y))
+        .unwrap();
+    assert!(ys_a.iter().all(|&y| y == 999));
+}
+
+

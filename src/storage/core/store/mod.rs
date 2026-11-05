@@ -41,6 +41,29 @@ pub(crate) fn next_store_instance_id() -> u64 {
         .expect("Store instance identity exhausted")
 }
 
+/// 组件所属 Archetype 的倒排位图索引（每 64 个 Archetype 1 个 `u64` 字）
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ArchetypeBitSet {
+    words: smallvec::SmallVec<[u64; 2]>,
+}
+
+impl ArchetypeBitSet {
+    #[inline]
+    pub(crate) fn insert(&mut self, arch_id: u32) {
+        let idx = (arch_id as usize) >> 6;
+        let bit = (arch_id as usize) & 63;
+        if idx >= self.words.len() {
+            self.words.resize(idx + 1, 0);
+        }
+        self.words[idx] |= 1u64 << bit;
+    }
+
+    #[inline(always)]
+    pub(crate) fn words(&self) -> &[u64] {
+        &self.words
+    }
+}
+
 /// 统一列式状态存储核心 (Store)。
 ///
 /// 具备代际防 ABA、Archetype 动态组件布局、严格单所有者写控制与只读 Query 访问能力。
@@ -48,9 +71,11 @@ pub struct Store {
     pub(crate) store_id: u64,
     pub(crate) epoch: u64,
     pub(crate) archetype_set_generation: u64,
+    pub(crate) archetype_topology_epoch: u64,
     pub(crate) allocator: EntityAllocator,
     pub(crate) archetypes: Vec<Archetype>,
     pub(crate) archetype_index: BTreeMap<BTreeSet<ComponentTypeId>, u32>,
+    pub(crate) component_archetypes: BTreeMap<ComponentTypeId, ArchetypeBitSet>,
     pub(crate) last_created_archetype: Option<u32>,
     pub(crate) component_registry: crate::storage::registry::ComponentRegistry,
     pub(crate) poisoned: Arc<AtomicBool>,
@@ -268,6 +293,79 @@ impl Store {
         self.archetype_set_generation
     }
 
+    /// 原型拓扑时代纪元（仅在快照还原、清空重建等只增不减假设被打破时递增）
+    #[inline]
+    pub(crate) fn archetype_topology_epoch(&self) -> u64 {
+        self.archetype_topology_epoch
+    }
+
+    /// 组件类型到包含该组件的 Archetype 位图倒排索引
+    #[inline]
+    pub(crate) fn component_archetypes(&self) -> &BTreeMap<ComponentTypeId, ArchetypeBitSet> {
+        &self.component_archetypes
+    }
+
+    /// 将新创建的 Archetype 注册到组件倒排位图索引中
+    #[inline]
+    pub(crate) fn register_archetype_in_component_index(
+        &mut self,
+        arch_id: u32,
+        component_types: &BTreeSet<ComponentTypeId>,
+    ) {
+        for &cid in component_types {
+            self.component_archetypes
+                .entry(cid)
+                .or_default()
+                .insert(arch_id);
+        }
+    }
+
+    /// 在快照恢复或拓扑重置后全量重建组件倒排位图索引并递增拓扑纪元
+    pub(crate) fn rebuild_component_archetypes_on_topology_reset(&mut self) {
+        self.component_archetypes.clear();
+        for arch in &self.archetypes {
+            let arch_id = arch.id().0;
+            for &cid in arch.component_types() {
+                self.component_archetypes
+                    .entry(cid)
+                    .or_default()
+                    .insert(arch_id);
+            }
+        }
+        self.archetype_topology_epoch = self.archetype_topology_epoch.wrapping_add(1);
+    }
+
+    /// 设置实体在当前原型行上的非迁移状态位（`0..=255`），不触发跨表迁移，返回修改前的旧状态值
+    #[inline]
+    pub fn set_flag<const FLAG: u8>(
+        &mut self,
+        entity: EntityId,
+        enabled: bool,
+    ) -> Result<bool, StateError> {
+        self.check_poisoned()?;
+        let loc = self
+            .allocator
+            .get_location(entity)
+            .ok_or(StateError::EntityNotFound(entity))?;
+        let arch = self
+            .archetypes
+            .get_mut(loc.archetype_id as usize)
+            .ok_or(StateError::EntityNotFound(entity))?;
+        Ok(arch.set_row_flag(loc.row_index as usize, FLAG, enabled))
+    }
+
+    /// 查询实体在当前原型行上的非迁移状态位（`0..=255`）是否已置位
+    #[inline]
+    pub fn has_flag<const FLAG: u8>(&self, entity: EntityId) -> bool {
+        let Some(loc) = self.allocator.get_location(entity) else {
+            return false;
+        };
+        let Some(arch) = self.archetypes.get(loc.archetype_id as usize) else {
+            return false;
+        };
+        arch.get_row_flag(loc.row_index as usize, FLAG)
+    }
+
     #[inline]
     pub(crate) fn check_archetype_set_generation_capacity(&self) -> Result<(), StateError> {
         self.archetype_set_generation
@@ -346,9 +444,11 @@ impl Store {
             store_id,
             epoch: 1,
             archetype_set_generation: 1,
+            archetype_topology_epoch: 1,
             allocator: EntityAllocator::new(),
             archetypes: Vec::new(),
             archetype_index: BTreeMap::new(),
+            component_archetypes: BTreeMap::new(),
             last_created_archetype: None,
             component_registry: crate::storage::registry::ComponentRegistry::new(),
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -555,9 +655,11 @@ impl Store {
         if self.archetype_index.len() != self.archetypes.len() || self.archetypes.is_empty() {
             self.archetypes.clear();
             self.archetype_index.clear();
+            self.component_archetypes.clear();
             self.last_created_archetype = None;
             let _ = self.bump_archetype_set_generation();
             self.get_or_create_archetype(BTreeSet::new());
+            self.rebuild_component_archetypes_on_topology_reset();
         } else {
             for arch in &mut self.archetypes {
                 arch.clear_rows();
@@ -577,9 +679,11 @@ impl Store {
             store_id,
             epoch: 1,
             archetype_set_generation: self.archetype_set_generation,
+            archetype_topology_epoch: self.archetype_topology_epoch,
             allocator: EntityAllocator::new(),
             archetypes,
             archetype_index: self.archetype_index.clone(),
+            component_archetypes: self.component_archetypes.clone(),
             last_created_archetype: None,
             component_registry: self.component_registry.clone(),
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -708,6 +812,7 @@ impl Store {
             self.archetypes = other.archetypes;
             self.archetype_index = other.archetype_index;
             self.last_created_archetype = None;
+            self.rebuild_component_archetypes_on_topology_reset();
             self.bump_epoch();
             self.bump_archetype_set_generation()?;
             poison_guard.disarm();
@@ -774,6 +879,7 @@ impl Store {
                 *new_arch.entities_mut() = std::mem::take(other_arch.entities_mut());
                 *new_arch.columns_mut() = std::mem::take(other_arch.columns_mut());
                 self.archetypes.push(new_arch);
+                self.register_archetype_in_component_index(new_arch_id, &comp_types);
                 self.archetype_index.insert(comp_types, new_arch_id);
                 added_archetypes = true;
             }
@@ -799,9 +905,11 @@ impl Clone for Store {
             store_id,
             epoch: 1,
             archetype_set_generation: self.archetype_set_generation,
+            archetype_topology_epoch: self.archetype_topology_epoch,
             allocator: self.allocator.clone(),
             archetypes: self.archetypes.clone(),
             archetype_index: self.archetype_index.clone(),
+            component_archetypes: self.component_archetypes.clone(),
             component_registry: self.component_registry.clone(),
             last_created_archetype: None,
             poisoned: Arc::new(AtomicBool::new(self.poisoned.load(Ordering::Relaxed))),

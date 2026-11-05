@@ -92,7 +92,9 @@ impl Store {
         })?;
 
         self.epoch = next_epoch;
-        Ok(modify_fn(val_ref))
+        let res = modify_fn(val_ref);
+        arch.mark_column_row_epoch(type_id, row, next_epoch);
+        Ok(res)
     }
 
     pub fn modify<T: ModelComponent + Serialize + DeserializeOwned + 'static, R>(
@@ -132,7 +134,9 @@ impl Store {
 
         let view = <T as crate::storage::modify::sealed::ModifyFetch<'_>>::fetch_mut(arch, row, entity)?;
         self.epoch = next_epoch;
-        Ok(modify_fn(view))
+        let res = modify_fn(view);
+        arch.mark_all_columns_row_epoch(row, next_epoch);
+        Ok(res)
     }
 
     /// 原位多组件元组联合借用与修改（支持 1..16 元组宏，如 (A, B) 或 (A, B, C)）。
@@ -333,6 +337,8 @@ impl Store {
                 })?;
                 let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
                 let old = std::mem::replace(val_mut, component);
+                arch.bump_columns_version_in_place();
+                arch.mark_col_pos_row_epoch(pos, row, next_epoch);
                 self.epoch = next_epoch;
                 poison_guard.disarm();
                 return Ok(ReplaceInPlaceResult::Replaced(old));
@@ -384,6 +390,7 @@ impl Store {
 
         let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         let old = std::mem::replace(val_mut, component);
+        arch.mark_column_row_epoch(type_id, row, next_epoch);
         self.epoch = next_epoch;
         poison_guard.disarm();
         Ok(ReplaceInPlaceResult::Replaced(old))
@@ -618,13 +625,15 @@ impl Store {
             }
         }
 
-        src_arch.swap_remove_entity_only(src_row);
         let resolved_slot = local_slot.or_else(|| self.allocator.local_slot(entity));
         let dst_row = if let Some(slot) = resolved_slot {
             dst_arch.push_entity_with_slot(entity, slot) as u32
         } else {
             dst_arch.push_entity(entity) as u32
         };
+        src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
+        dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
+        src_arch.swap_remove_entity_only(src_row);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -679,6 +688,8 @@ impl Store {
                                 };
                                 if let Some(val_mut) = typed.get_mut(src_row) {
                                     let old = std::mem::replace(val_mut, component);
+                                    src_arch.bump_columns_version_in_place();
+                                    src_arch.mark_col_pos_row_epoch(pos, src_row, next_epoch);
                                     self.epoch = next_epoch;
                                     return Ok((Some(old), location));
                                 }
@@ -776,6 +787,7 @@ impl Store {
 
                 let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
                 let old = std::mem::replace(val_mut, component);
+                src_arch.mark_column_row_epoch(type_id, src_row, next_epoch);
                 self.epoch = next_epoch;
                 poison_guard.disarm();
                 return Ok((Some(old), location));
@@ -965,13 +977,15 @@ impl Store {
             }
         }
 
-        src_arch.swap_remove_entity_only(src_row);
         let resolved_slot = local_slot.or_else(|| self.allocator.local_slot(entity));
         let dst_row = if let Some(slot) = resolved_slot {
             dst_arch.push_entity_with_slot(entity, slot) as u32
         } else {
             dst_arch.push_entity(entity) as u32
         };
+        src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
+        dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
+        src_arch.swap_remove_entity_only(src_row);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -1234,13 +1248,15 @@ impl Store {
             extracted.expect("removed component extracted")
         };
 
-        src_arch.swap_remove_entity_only(src_row);
         let resolved_slot = local_slot.or_else(|| self.allocator.local_slot(entity));
         let dst_row = if let Some(slot) = resolved_slot {
             dst_arch.push_entity_with_slot(entity, slot) as u32
         } else {
             dst_arch.push_entity(entity) as u32
         };
+        src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
+        dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
+        src_arch.swap_remove_entity_only(src_row);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -1406,6 +1422,7 @@ impl Store {
         if arch.entities().get(row) != Some(&entity) {
             return Err(StateError::EntityNotFound(entity));
         }
+        arch.mark_column_row_epoch(cid, row, next_epoch);
         let typed = arch.get_typed_column_mut::<T>(cid, entity)?;
         let val = typed
             .get_mut(row)
@@ -1442,6 +1459,7 @@ impl Store {
         if arch.entities().get(row) != Some(&entity) {
             return None;
         }
+        arch.mark_column_row_epoch(cid, row, next_epoch);
         let typed = arch.get_typed_column_mut::<T>(cid, entity).ok()?;
         let val = typed.get_mut(row)?;
         self.epoch = next_epoch;
@@ -1628,7 +1646,7 @@ impl Store {
         }
     }
 
-    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表
+    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表（自动利用原型表内 `PairTargetIndex` 二级位图索引）
     pub fn sources_with_pair<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
         &self,
         target: EntityId,
@@ -1643,13 +1661,13 @@ impl Store {
             if len == 0 || !arch.component_types_slice().contains(&cid) {
                 continue;
             }
-            if let Some(col) = arch.get_column::<crate::al::Pair<R, EntityId>>() {
+            if let Some(mask) = arch.pair_target_row_mask::<R>(target) {
                 let entities = arch.entities();
-                for (i, pair) in col.as_slice()[..len].iter().enumerate() {
-                    if pair.target == target {
-                        out.push(entities[i]);
+                mask.for_each_set_row(|row| {
+                    if let Some(&e) = entities.get(row) {
+                        out.push(e);
                     }
-                }
+                });
             }
         }
         out
@@ -1754,10 +1772,12 @@ impl Store {
         let new_entities: Vec<EntityId> = order.iter().map(|&row| original[row]).collect();
         self.allocator
             .align_archetype_slots(arch_id, &original, &new_entities);
+        let next_epoch = self.epoch.saturating_add(1);
         let arch = &mut self.archetypes[arch_id as usize];
         *arch.entities_mut() = new_entities;
+        arch.reorder_row_metadata(&order, next_epoch);
         arch.rebuild_flat_columns();
-        self.epoch = self.epoch.saturating_add(1);
+        self.epoch = next_epoch;
 
         Ok(moved_entities)
     }

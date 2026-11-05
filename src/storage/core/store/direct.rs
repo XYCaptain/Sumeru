@@ -322,6 +322,10 @@ macro_rules! impl_typed_direct_batch {
                                         $crate::id::ComponentTypeId::of::<$T>(),
                                         entity,
                                     )?;
+                                    arch.mark_column_all_chunks_epoch(
+                                        $crate::id::ComponentTypeId::of::<$T>(),
+                                        next_epoch,
+                                    );
                                     let col_slice = unsafe { (*typed_col).as_mut_slice() };
                                     if col_slice.len() != entities_len {
                                         return Err($crate::error::StateError::AccessDenied(format!(

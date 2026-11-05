@@ -11,9 +11,11 @@ pub use spec::iter;
 
 pub use entity_mut::EntityMut;
 pub use entity_ref::{ComponentRef, EntityData, EntityRef};
-pub use handle::{Query, QueryBuilder, QueryEntityRequest};
+pub use handle::{MatchedTableBinding, Query, QueryBuilder, QueryEntityRequest};
 pub use spec::{
-    merged_access_descriptors, All, BusinessFilter, ColumnChunkProbe, ComponentField, FilterEq,
-    QueryChunks, QueryChunksIter, QueryData, QueryFilter, QueryIter, QueryMutBuilder, QueryMutData,
-    QueryMutParamShape, QueryMutShape, SelectBuilder, With, Without,
+    merged_access_descriptors, All, BusinessFilter, ChangedSince, ColumnChunkProbe, ComponentField,
+    FilterEq, QueryChunks, QueryChunksIter, QueryData, QueryFilter, QueryIter, QueryMutBuilder,
+    QueryMutData, QueryMutParamShape, QueryMutShape, SelectBuilder, With, WithFlag, WithPairTarget,
+    Without, WithoutFlag,
 };
+pub use crate::storage::archetype::RowBitMask;

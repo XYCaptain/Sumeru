@@ -89,6 +89,7 @@ impl Store {
         // Direct assignment may execute user Drop. Invalidate previously
         // prepared plans even if a destructor unwinds after a partial write.
         self.bump_epoch();
+        let commit_epoch = self.epoch;
 
         let PreparedBatch {
             mut plan_scratch,
@@ -115,8 +116,10 @@ impl Store {
             self.component_registry.extend(new_definitions);
         }
         for arch in detached {
-            self.archetype_index
-                .insert(arch.component_types().clone(), arch.id().0);
+            let arch_id = arch.id().0;
+            let comp_types = arch.component_types().clone();
+            self.register_archetype_in_component_index(arch_id, &comp_types);
+            self.archetype_index.insert(comp_types, arch_id);
             self.archetypes.push(arch);
         }
         if has_new_archetypes {
@@ -152,11 +155,19 @@ impl Store {
                         }
                         break;
                     }
-                    let col = self.archetypes[arch_id]
+                    let arch = &mut self.archetypes[arch_id];
+                    let col = arch
                         .columns_mut()
                         .get_mut(&current_type_id)
                         .expect("validated component column");
                     col.discard_in_place_single_chunk(&mut in_place_plans[start..end]);
+                    for p in &in_place_plans[start..end] {
+                        arch.mark_column_row_epoch(
+                            current_type_id,
+                            p.location.row_index as usize,
+                            commit_epoch,
+                        );
+                    }
                     idx = end;
                 }
                 InPlaceReplacements::Multiple(_) => {
@@ -174,6 +185,7 @@ impl Store {
                                     .expect("validated component column")
                                     .assign_exclusive_unchecked(row, value);
                             }
+                            arch.mark_column_row_epoch(type_id, row, commit_epoch);
                         });
                     }
                     idx += 1;
@@ -202,9 +214,10 @@ impl Store {
                         {
                             let row = plan.location.row_index as usize;
                             let arch = &mut self.archetypes[arch_id];
-                            for (_, reference) in &native_references[range] {
+                            for (cid, reference) in &native_references[range] {
                                 native_plans[reference.lane()]
                                     .assign_linked(reference.row(), row, arch);
+                                arch.mark_column_row_epoch(*cid, row, commit_epoch);
                             }
                         }
                     } else {
@@ -234,6 +247,8 @@ impl Store {
                         {
                             let arch = &mut self.archetypes[arch_id];
                             for &lane_idx in &bound_lanes {
+                                let cid = native_plans[lane_idx].metadata().type_id;
+                                arch.mark_column_all_chunks_epoch(cid, commit_epoch);
                                 native_plans[lane_idx].bind_linked_column(arch);
                             }
                         }
@@ -283,6 +298,12 @@ impl Store {
         // Linked targets have already executed in the entity-major loop above.
         // Run before any migration can invalidate their prepared locations.
         for lane in native_plans.iter_mut() {
+            let cid = lane.metadata().type_id;
+            for &arch_id in lane.planned_archetypes() {
+                if let Some(arch) = self.archetypes.get_mut(arch_id as usize) {
+                    arch.mark_column_all_chunks_epoch(cid, commit_epoch);
+                }
+            }
             lane.commit_discard(&mut self.archetypes);
         }
         // Recycle while the poison guard is still armed, including user Drop.
@@ -317,6 +338,7 @@ impl Store {
                         )
                         .expect("validated allocation");
                     target_arch.push_entity_with_slot(entity, local_slot);
+                    target_arch.mark_all_columns_row_epoch(row as usize, commit_epoch);
                 }
                 PlannedOp::CreatePooled {
                     entity,
@@ -354,6 +376,7 @@ impl Store {
                         )
                         .expect("validated allocation");
                     target_arch.push_entity_with_slot(entity, local_slot);
+                    target_arch.mark_all_columns_row_epoch(row as usize, commit_epoch);
                 }
                 PlannedOp::StructuralPatch {
                     entity,
@@ -403,6 +426,15 @@ impl Store {
                         }
                     }
 
+                    let entity_slot = self.allocator.local_slot(entity);
+                    let dst_row = if let Some(slot) = entity_slot {
+                        dst_arch.push_entity_with_slot(entity, slot) as u32
+                    } else {
+                        dst_arch.push_entity(entity) as u32
+                    };
+                    src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
+                    dst_arch.mark_all_columns_row_epoch(dst_row as usize, commit_epoch);
+
                     let is_last = src_row == src_arch.entities().len() - 1;
                     src_arch.swap_remove_entity_only(src_row);
                     if !is_last {
@@ -413,12 +445,6 @@ impl Store {
                         );
                     }
 
-                    let entity_slot = self.allocator.local_slot(entity);
-                    let dst_row = if let Some(slot) = entity_slot {
-                        dst_arch.push_entity_with_slot(entity, slot) as u32
-                    } else {
-                        dst_arch.push_entity(entity) as u32
-                    };
                     if let Some(slot) = entity_slot {
                         self.allocator.set_location_by_slot_infallible(
                             slot,

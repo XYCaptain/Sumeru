@@ -68,6 +68,13 @@ impl<'a> EntityRef<'a> {
         self.archetype().component_types_slice().contains(&type_id)
     }
 
+    /// 检查实体在当前原型行上的非迁移状态位（`0..=255`）是否已置位
+    #[inline]
+    pub fn has_flag<const FLAG: u8>(&self) -> bool {
+        self.archetype()
+            .get_row_flag(self.location.row_index as usize, FLAG)
+    }
+
     /// 获取实体所有组件类型列表（零分配借用内部连续切片）
     #[inline]
     pub fn component_types(&self) -> &[ComponentTypeId] {

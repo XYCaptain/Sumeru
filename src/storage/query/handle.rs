@@ -14,7 +14,8 @@ use crate::id::ArchetypeId;
 use crate::id::ComponentTypeId;
 use super::spec::ComponentField;
 use super::spec::{
-    All, BusinessFilter, FilterEq, QueryFilter, QueryMutShape, With, Without,
+    All, BusinessFilter, ChangedSince, FilterEq, QueryFilter, QueryMutShape, With, WithFlag,
+    WithPairTarget, Without, WithoutFlag,
 };
 use crate::storage::store::Store;
 use crate::binding::EntityId;
@@ -32,16 +33,87 @@ pub struct MatchedTableBinding {
 /// 长期可复用查询句柄 (Query)。
 ///
 /// 保存查询类型签名 `Q`（组件读写形态）、过滤器 `F` 以及基于 `archetype_set_generation` 缓存的物理原型表列表。
-/// 杜绝在每次查询构建时全表重新扫描，并在底层存储发生结构修改（Archetype 增删）时支持自适应增量刷新。
+/// 杜绝在每次查询构建时全表重新扫描，并在底层存储发生结构修改（Archetype 增删）时支持 $O(\Delta A)$ 自适应增量刷新。
 #[derive(Debug, Clone)]
 pub(crate) struct QueryCache {
     pub(crate) archetype_set_generation: u64,
+    pub(crate) topology_epoch: u64,
+    pub(crate) validated_archetype_len: usize,
     pub(crate) matched_archetypes: std::sync::Arc<[ArchetypeId]>,
     pub(crate) matched_bindings: std::sync::Arc<[MatchedTableBinding]>,
     pub(crate) shared_template: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) template_limit_bytes: usize,
     #[cfg(feature = "test-internals")]
     pub(crate) template_rebuilds: u64,
+}
+
+impl QueryCache {
+    #[inline]
+    pub(crate) fn is_up_to_date(&self, store: &Store) -> bool {
+        self.archetype_set_generation == store.archetype_set_generation()
+            && self.topology_epoch == store.archetype_topology_epoch()
+            && self.validated_archetype_len == store.archetypes.len()
+            && self.matched_bindings.len() == self.matched_archetypes.len()
+    }
+
+    pub(crate) fn refresh_for_store<Q: QueryMutShape, F: QueryFilter>(
+        &mut self,
+        store: &Store,
+        filter: &F,
+    ) {
+        if self.is_up_to_date(store) {
+            return;
+        }
+        let current_gen = store.archetype_set_generation();
+        let current_topo = store.archetype_topology_epoch();
+        let current_len = store.archetypes.len();
+
+        if self.topology_epoch == current_topo
+            && self.validated_archetype_len <= current_len
+            && self.matched_bindings.len() == self.matched_archetypes.len()
+        {
+            if self.validated_archetype_len < current_len {
+                let mut delta_matched = Vec::new();
+                let mut delta_bindings = Vec::new();
+                if super::spec::append_bindings_from_slice::<
+                    Q,
+                    F,
+                    crate::storage::archetype::Archetype,
+                >(
+                    &store.archetypes[self.validated_archetype_len..current_len],
+                    filter,
+                    &mut delta_matched,
+                    &mut delta_bindings,
+                )
+                .is_ok()
+                    && !delta_matched.is_empty()
+                {
+                    let mut all_matched =
+                        Vec::with_capacity(self.matched_archetypes.len() + delta_matched.len());
+                    all_matched.extend_from_slice(&self.matched_archetypes);
+                    all_matched.extend(delta_matched);
+
+                    let mut all_bindings =
+                        Vec::with_capacity(self.matched_bindings.len() + delta_bindings.len());
+                    all_bindings.extend_from_slice(&self.matched_bindings);
+                    all_bindings.extend(delta_bindings);
+
+                    self.matched_archetypes = std::sync::Arc::from(all_matched.into_boxed_slice());
+                    self.matched_bindings = std::sync::Arc::from(all_bindings.into_boxed_slice());
+                }
+            }
+            self.validated_archetype_len = current_len;
+            self.archetype_set_generation = current_gen;
+            return;
+        }
+
+        let (matched, bindings) = super::spec::rebuild_matched_bindings::<Q, F>(store, filter);
+        self.matched_archetypes = std::sync::Arc::from(matched.into_boxed_slice());
+        self.matched_bindings = std::sync::Arc::from(bindings.into_boxed_slice());
+        self.archetype_set_generation = current_gen;
+        self.topology_epoch = current_topo;
+        self.validated_archetype_len = current_len;
+    }
 }
 
 /// 长期可复用查询句柄 (Query)。
@@ -111,6 +183,8 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         Self::new_with_bindings(
             store_id,
             archetype_set_generation,
+            0,
+            0,
             matched_archetypes,
             std::sync::Arc::from([]),
             descriptors,
@@ -123,6 +197,8 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
     pub(crate) fn new_with_bindings(
         store_id: u64,
         archetype_set_generation: u64,
+        topology_epoch: u64,
+        validated_archetype_len: usize,
         matched_archetypes: std::sync::Arc<[ArchetypeId]>,
         matched_bindings: std::sync::Arc<[MatchedTableBinding]>,
         descriptors: std::sync::Arc<[(ComponentTypeId, &'static str, bool)]>,
@@ -133,6 +209,8 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
             session_closed: None,
             cache: std::sync::RwLock::new(QueryCache {
                 archetype_set_generation,
+                topology_epoch,
+                validated_archetype_len,
                 matched_archetypes,
                 matched_bindings,
                 shared_template: None,
@@ -236,17 +314,8 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
             });
         }
 
-        let current_gen = store.archetype_set_generation();
         let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
-        if cache.archetype_set_generation != current_gen
-            || cache.matched_bindings.len() != cache.matched_archetypes.len()
-        {
-            let (matched, bindings) =
-                super::spec::rebuild_matched_bindings::<Q, F>(store, &self.filter);
-            cache.matched_archetypes = std::sync::Arc::from(matched.into_boxed_slice());
-            cache.matched_bindings = std::sync::Arc::from(bindings.into_boxed_slice());
-            cache.archetype_set_generation = current_gen;
-        }
+        cache.refresh_for_store::<Q, F>(store, &self.filter);
         Ok(())
     }
 
@@ -265,28 +334,42 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
                 actual_store: store.store_id(),
             });
         }
-        let current_gen = store.archetype_set_generation();
         {
             let guard = self.cache.read().map_err(|_| StateError::SessionPoisoned)?;
-            if guard.archetype_set_generation == current_gen {
+            if guard.is_up_to_date(store) {
                 let matched = std::sync::Arc::clone(&guard.matched_archetypes);
                 drop(guard);
                 return f(&matched, &self.descriptors);
             }
         }
         let mut guard = self.cache.write().map_err(|_| StateError::SessionPoisoned)?;
-        if guard.archetype_set_generation != current_gen
-            || guard.matched_bindings.len() != guard.matched_archetypes.len()
-        {
-            let (matched, bindings) =
-                super::spec::rebuild_matched_bindings::<Q, F>(store, &self.filter);
-            guard.matched_archetypes = std::sync::Arc::from(matched.into_boxed_slice());
-            guard.matched_bindings = std::sync::Arc::from(bindings.into_boxed_slice());
-            guard.archetype_set_generation = current_gen;
-        }
+        guard.refresh_for_store::<Q, F>(store, &self.filter);
         let matched = std::sync::Arc::clone(&guard.matched_archetypes);
         drop(guard);
         f(&matched, &self.descriptors)
+    }
+
+    /// 刷新并获取预绑定物理列槽位 `Arc<[MatchedTableBinding]>` 快照（缓存命中时零堆分配）。
+    pub(crate) fn resolved_bindings_arc(
+        &self,
+        store: &Store,
+    ) -> Result<std::sync::Arc<[MatchedTableBinding]>, StateError> {
+        self.check_session()?;
+        if store.store_id() != self.store_id {
+            return Err(StateError::StoreMismatch {
+                expected_store: self.store_id,
+                actual_store: store.store_id(),
+            });
+        }
+        {
+            let guard = self.cache.read().map_err(|_| StateError::SessionPoisoned)?;
+            if guard.is_up_to_date(store) {
+                return Ok(std::sync::Arc::clone(&guard.matched_bindings));
+            }
+        }
+        let mut guard = self.cache.write().map_err(|_| StateError::SessionPoisoned)?;
+        guard.refresh_for_store::<Q, F>(store, &self.filter);
+        Ok(std::sync::Arc::clone(&guard.matched_bindings))
     }
 
     /// 匹配的原型表与预绑定物理列槽位快照（克隆 Arc<[MatchedTableBinding]>，零切片元素深拷贝）。
@@ -407,13 +490,16 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
         }
     }
 
-    /// 增加包含特定目标实体关系对 `(R, target)` 的行级硬边界过滤条件。
+    /// 增加包含特定目标实体关系对 `(R, target)` 的行级硬边界过滤条件（基于原型内嵌二级位图索引加速）。
     #[inline]
     pub fn with_pair<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
         self,
         target: EntityId,
-    ) -> QueryBuilder<Q, BusinessFilter<F, crate::al::Pair<R>>> {
-        self.filter::<crate::al::Pair<R>>(move |pair| pair.target == target)
+    ) -> QueryBuilder<Q, WithPairTarget<R, F>> {
+        QueryBuilder {
+            filter: WithPairTarget::new(self.filter, target),
+            marker: PhantomData,
+        }
     }
 
     /// 增加排除关系对 `Pair<R>` 的表级硬边界过滤条件。
@@ -432,6 +518,36 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
     #[inline]
     pub fn without_tag<const N: u8>(self) -> QueryBuilder<Q, Without<crate::al::Tag<N>, F>> {
         self.without::<crate::al::Tag<N>>()
+    }
+
+    /// 增加包含非迁移行级位平面状态标记 `FLAG` 的过滤条件（O(1) 64-bit word 位与）。
+    #[inline]
+    pub fn with_flag<const FLAG: u8>(self) -> QueryBuilder<Q, WithFlag<FLAG, F>> {
+        QueryBuilder {
+            filter: WithFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// 增加排除非迁移行级位平面状态标记 `FLAG` 的过滤条件（O(1) 64-bit word 位差）。
+    #[inline]
+    pub fn without_flag<const FLAG: u8>(self) -> QueryBuilder<Q, WithoutFlag<FLAG, F>> {
+        QueryBuilder {
+            filter: WithoutFlag::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// 增加基于 64 行分块写代际（Chunk Write Epoch）的增量脏数据过滤条件。
+    #[inline]
+    pub fn changed_since<T: 'static>(
+        self,
+        since_epoch: u64,
+    ) -> QueryBuilder<Q, ChangedSince<T, F>> {
+        QueryBuilder {
+            filter: ChangedSince::new(self.filter, since_epoch),
+            marker: PhantomData,
+        }
     }
 
     /// 增加基于组件特定字段相等性的硬边界过滤条件。
@@ -458,19 +574,17 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
         }
     }
 
-    /// 构建长期可复用的查询句柄，预计算匹配成功的 ArchetypeId 集合及物理列槽位偏移并绑定当前存储内核代际。
+    /// 构建长期可复用的查询句柄，利用组件倒排位图索引预计算匹配成功的 ArchetypeId 集合及物理列槽位偏移。
     pub fn build(self, store: &Store) -> Result<Query<Q, F>, StateError> {
-        let (matched, bindings) = super::spec::match_bindings_for_query::<
-            Q,
-            F,
-            crate::storage::archetype::Archetype,
-        >(&store.archetypes, &self.filter)?;
+        let (matched, bindings) = super::spec::match_bindings_for_store::<Q, F>(store, &self.filter)?;
         let descriptors = std::sync::Arc::from(
             super::spec::merged_access_descriptors::<Q, F>(&self.filter).into_boxed_slice(),
         );
         Ok(Query::new_with_bindings(
             store.store_id(),
             store.archetype_set_generation(),
+            store.archetype_topology_epoch(),
+            store.archetypes.len(),
             std::sync::Arc::from(matched.into_boxed_slice()),
             std::sync::Arc::from(bindings.into_boxed_slice()),
             descriptors,
@@ -494,7 +608,7 @@ impl Store {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
-    /// 基于预编译的匹配原型表缓存与行级过滤器遍历只读元素。
+    /// 基于预编译的匹配原型表与 Level-2 槽位绑定缓存遍历只读元素。
     pub fn for_each<'store>(
         &self,
         store: &'store Store,
@@ -503,13 +617,12 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
     where
         for<'a> Q::View<'a>: super::spec::QueryData<'a, Item = Q::Item<'a>>,
     {
-        self.with_matched_slice(store, |matched, _| {
-            super::spec::iter::for_each_matched_ro::<Q, F>(store, matched, &self.filter, f);
-            Ok(())
-        })
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::for_each_matched_ro::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
     }
 
-    /// 基于预编译的匹配原型表缓存与行级过滤器遍历可变元素。
+    /// 基于预编译的匹配原型表与 Level-2 槽位绑定缓存遍历可变元素（零堆分配 Arc 快照）。
     pub fn for_each_mut<'store>(
         &self,
         store: &'store mut Store,
@@ -518,9 +631,9 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         store.check_poisoned()?;
         Q::validate_shape()?;
         store.next_epoch()?;
-        let matched = self.with_matched_slice(store, |m, _| Ok(m.to_vec()))?;
+        let bindings = self.resolved_bindings_arc(store)?;
         store.bump_epoch();
-        super::spec::iter::for_each_matched_mut::<Q, F>(store, &matched, &self.filter, f);
+        super::spec::iter::for_each_matched_mut::<Q, F>(store, &bindings, &self.filter, f);
         Ok(())
     }
 
@@ -533,13 +646,12 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
     where
         for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
     {
-        self.with_matched_slice(store, |matched, _| {
-            super::spec::iter::for_each_matched_chunk_ro::<Q>(store, matched, f);
-            Ok(())
-        })
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::for_each_matched_chunk_ro::<Q>(store, &bindings, f);
+        Ok(())
     }
 
-    /// 基于预编译的匹配原型表缓存遍历可变连续切片块（Level-2 预绑定极速路径）。
+    /// 基于预编译的匹配原型表缓存遍历可变连续切片块（Level-2 预绑定极速路径，零堆分配 Arc 快照）。
     pub fn for_each_chunk_mut<'store>(
         &self,
         store: &'store mut Store,
@@ -548,9 +660,9 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         store.check_poisoned()?;
         Q::validate_shape()?;
         store.next_epoch()?;
-        let matched = self.with_matched_slice(store, |m, _| Ok(m.to_vec()))?;
+        let bindings = self.resolved_bindings_arc(store)?;
         store.bump_epoch();
-        super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &matched, f);
+        super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &bindings, f);
         Ok(())
     }
 }

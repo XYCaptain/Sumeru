@@ -323,6 +323,7 @@ impl Store {
         self.allocator = snapshot.allocator.clone();
         self.archetypes = restored_archetypes;
         self.archetype_index = restored_index;
+        self.rebuild_component_archetypes_on_topology_reset();
         self.bump_epoch();
         self.bump_archetype_set_generation()?;
         poison_guard.disarm();
@@ -447,6 +448,7 @@ impl Store {
         self.allocator = snapshot.allocator;
         self.archetypes = restored_archetypes;
         self.archetype_index = restored_index;
+        self.rebuild_component_archetypes_on_topology_reset();
         self.bump_epoch();
         self.bump_archetype_set_generation()?;
         poison_guard.disarm();
