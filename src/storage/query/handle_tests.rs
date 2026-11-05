@@ -1,0 +1,414 @@
+use super::*;
+use crate::id::ComponentTypeId;
+use crate::storage::query::merged_access_descriptors;
+use crate::{EntityBundle, Store};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Pos {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Vel {
+    dx: i32,
+    dy: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TagActive;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TagDisabled;
+
+#[derive(Clone, Copy, Debug)]
+struct PosX;
+impl ComponentField<Pos> for PosX {
+    type Value = i32;
+    fn extract(component: &Pos) -> &Self::Value {
+        &component.x
+    }
+    fn field_name() -> &'static str {
+        "x"
+    }
+}
+
+#[test]
+fn test_query_builder_with_all_filters() {
+    let mut store = Store::new();
+    // Entity 1: Pos { x: 10, y: 20 }, Vel { dx: 1, dy: 2 }, TagActive
+    store
+        .create_entity(
+            EntityId::from_u128(1),
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 20 })
+                .unwrap()
+                .with(Vel { dx: 1, dy: 2 })
+                .unwrap()
+                .with(TagActive)
+                .unwrap(),
+        )
+        .unwrap();
+
+    // Entity 2: Pos { x: 10, y: 30 }, Vel { dx: 3, dy: 4 }, TagDisabled
+    store
+        .create_entity(
+            EntityId::from_u128(2),
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 30 })
+                .unwrap()
+                .with(Vel { dx: 3, dy: 4 })
+                .unwrap()
+                .with(TagDisabled)
+                .unwrap(),
+        )
+        .unwrap();
+
+    // Entity 3: Pos { x: 20, y: 50 }, Vel { dx: 5, dy: 6 }, TagActive
+    store
+        .create_entity(
+            EntityId::from_u128(3),
+            EntityBundle::new()
+                .with(Pos { x: 20, y: 50 })
+                .unwrap()
+                .with(Vel { dx: 5, dy: 6 })
+                .unwrap()
+                .with(TagActive)
+                .unwrap(),
+        )
+        .unwrap();
+
+    // Build query requiring Pos, Vel, TagActive, without TagDisabled, Pos.x == 10, Vel.dx > 0
+    let query = QueryBuilder::<(&mut Pos, &Vel)>::new()
+        .with::<TagActive>()
+        .without::<TagDisabled>()
+        .filter_eq::<Pos, PosX>(10)
+        .filter::<Vel>(|v| v.dx > 0)
+        .build(&store)
+        .unwrap();
+
+    assert_eq!(query.store_id(), store.store_id());
+    assert_eq!(
+        query.archetype_set_generation(),
+        store.archetype_set_generation()
+    );
+    // Entity 1's archetype matches; Entity 2 has TagDisabled; Entity 3 shares archetype with 1
+    assert_eq!(query.matched_count(), 1);
+    let arch_id = query.matched_archetypes()[0];
+    let arch = store.archetypes.iter().find(|a| a.id() == arch_id).unwrap();
+    assert!(arch.component_types().contains(&ComponentTypeId::of::<Pos>()));
+    assert!(arch.component_types().contains(&ComponentTypeId::of::<Vel>()));
+    assert!(arch.component_types().contains(&ComponentTypeId::of::<TagActive>()));
+    assert!(!arch.component_types().contains(&ComponentTypeId::of::<TagDisabled>()));
+
+    // Check QueryEntityRequest
+    let ids = [EntityId::from_u128(1), EntityId::from_u128(3)];
+    let req = query.entity_request(&ids);
+    assert_eq!(req.query().store_id(), store.store_id());
+    assert_eq!(req.ids(), &ids);
+}
+
+#[test]
+fn test_merged_access_descriptors_permission_semantics() {
+    // Query shape has (&mut Pos, &Vel): Pos is write (true), Vel is read (false)
+    let builder = QueryBuilder::<(&mut Pos, &Vel)>::new()
+        .with::<TagActive>() // with does NOT add read descriptor
+        .filter_eq::<Pos, PosX>(10) // reads Pos, but Pos is already write in Q -> remains write
+        .filter::<Vel>(|v| v.dx > 0) // reads Vel, Vel is read in Q -> remains read
+        .filter::<TagDisabled>(|_| true); // reads TagDisabled, not in Q -> added as read
+
+    let descriptors = merged_access_descriptors::<(&mut Pos, &Vel), _>(&builder.filter);
+    assert_eq!(descriptors.len(), 3);
+
+    let pos_desc = descriptors
+        .iter()
+        .find(|(cid, _, _)| *cid == ComponentTypeId::of::<Pos>())
+        .expect("Pos must be present");
+    assert!(pos_desc.2, "Pos was &mut in Q, so merged descriptor must be write=true");
+
+    let vel_desc = descriptors
+        .iter()
+        .find(|(cid, _, _)| *cid == ComponentTypeId::of::<Vel>())
+        .expect("Vel must be present");
+    assert!(!vel_desc.2, "Vel was & in Q, so merged descriptor must be write=false");
+
+    let tag_disabled_desc = descriptors
+        .iter()
+        .find(|(cid, _, _)| *cid == ComponentTypeId::of::<TagDisabled>())
+        .expect("TagDisabled must be present from filter");
+    assert!(!tag_disabled_desc.2, "TagDisabled added by filter must be write=false");
+
+    assert!(
+        descriptors
+            .iter()
+            .all(|(cid, _, _)| *cid != ComponentTypeId::of::<TagActive>()),
+        "TagActive (from with) must NOT be present in access descriptors"
+    );
+}
+
+#[test]
+fn test_matches_row_for_filter_eq_and_filter() {
+    let mut store = Store::new();
+    // Row 0: Pos { x: 10, y: 100 }, Vel { dx: 5, dy: 0 }
+    store
+        .create_entity(
+            EntityId::from_u128(10),
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 100 })
+                .unwrap()
+                .with(Vel { dx: 5, dy: 0 })
+                .unwrap(),
+        )
+        .unwrap();
+    // Row 1: Pos { x: 20, y: 200 }, Vel { dx: -3, dy: 0 }
+    store
+        .create_entity(
+            EntityId::from_u128(20),
+            EntityBundle::new()
+                .with(Pos { x: 20, y: 200 })
+                .unwrap()
+                .with(Vel { dx: -3, dy: 0 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    let query = QueryBuilder::<(&Pos,)>::new()
+        .filter_eq::<Pos, PosX>(10)
+        .filter::<Vel>(|v| v.dx > 0)
+        .build(&store)
+        .unwrap();
+
+    let arch_id = query.matched_archetypes()[0];
+    let arch = store.archetypes.iter().find(|a| a.id() == arch_id).unwrap();
+
+    // Row 0 has x=10 and dx=5 > 0: matches!
+    assert!(query.filter().matches_row(arch, 0));
+    // Row 1 has x=20 and dx=-3: does not match!
+    assert!(!query.filter().matches_row(arch, 1));
+    // Row 2 is out of bounds: does not match!
+    assert!(!query.filter().matches_row(arch, 2));
+
+    // Test filter_eq alone
+    let q_eq = QueryBuilder::<(&Pos,)>::new()
+        .filter_eq::<Pos, PosX>(20)
+        .build(&store)
+        .unwrap();
+    assert!(!q_eq.filter().matches_row(arch, 0));
+    assert!(q_eq.filter().matches_row(arch, 1));
+
+    // Test filter predicate alone
+    let q_pred = QueryBuilder::<(&Pos,)>::new()
+        .filter::<Vel>(|v| v.dx < 0)
+        .build(&store)
+        .unwrap();
+    assert!(!q_pred.filter().matches_row(arch, 0));
+    assert!(q_pred.filter().matches_row(arch, 1));
+}
+
+#[test]
+fn test_query_ensure_cache_current_on_generation_change() {
+    let mut store = Store::new();
+    // Create entity with Pos and Vel
+    store
+        .create_entity(
+            EntityId::from_u128(1),
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 20 })
+                .unwrap()
+                .with(Vel { dx: 1, dy: 2 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    let query = QueryBuilder::<(&Pos,)>::new()
+        .with::<Vel>()
+        .build(&store)
+        .unwrap();
+
+    assert_eq!(query.matched_count(), 1);
+    let initial_gen = query.archetype_set_generation();
+
+    // No changes to store -> refresh is a no-op
+    query.with_matched_archetypes(&store, |_| Ok(())).unwrap();
+    assert_eq!(query.archetype_set_generation(), initial_gen);
+    assert_eq!(query.matched_count(), 1);
+
+    // Now create an entity with Pos, Vel, AND TagActive -> creates a new Archetype!
+    store
+        .create_entity(
+            EntityId::from_u128(2),
+            EntityBundle::new()
+                .with(Pos { x: 30, y: 40 })
+                .unwrap()
+                .with(Vel { dx: 3, dy: 4 })
+                .unwrap()
+                .with(TagActive)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert!(store.archetype_set_generation() > initial_gen);
+    // Before refresh, query still holds the old cached count and gen
+    assert_eq!(query.matched_count(), 1);
+    assert_eq!(query.archetype_set_generation(), initial_gen);
+
+    // Refresh query
+    query.with_matched_archetypes(&store, |_| Ok(())).unwrap();
+    assert_eq!(
+        query.archetype_set_generation(),
+        store.archetype_set_generation()
+    );
+    assert_eq!(query.matched_count(), 2);
+
+    // Test mismatched store
+    let other_store = Store::new();
+    let err = query.with_matched_archetypes(&other_store, |_| Ok(())).unwrap_err();
+    match err {
+        StateError::StoreMismatch {
+            expected_store,
+            actual_store,
+        } => {
+            assert_eq!(expected_store, store.store_id());
+            assert_eq!(actual_store, other_store.store_id());
+        }
+        other => panic!("expected StoreMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_query_exclusive_lock_free_and_cached_slice_reuse() {
+    let mut store = Store::new();
+    let e1 = EntityId::from_u128(501);
+    store
+        .create_entity(
+            e1,
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 20 })
+                .unwrap()
+                .with(Vel { dx: 1, dy: 2 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    let mut query = QueryBuilder::<(&mut Pos, &Vel)>::new()
+        .build(&store)
+        .unwrap();
+
+    // 1. 缓存命中路径：测试连续切片直借的内存地址稳定性（无重复分配）
+    let ptr1 = {
+        query.with_matched_archetypes_mut(&store, |slice, _| {
+            assert_eq!(slice.len(), 1);
+            Ok(slice.as_ptr())
+        }).unwrap()
+    };
+    let ptr2 = {
+        query.with_matched_archetypes_mut(&store, |slice, _| {
+            assert_eq!(slice.len(), 1);
+            Ok(slice.as_ptr())
+        }).unwrap()
+    };
+    // 缓存命中期间直接借用既有切片，指针绝对相等，证明无二次堆分配
+    assert_eq!(ptr1, ptr2);
+
+    // 2. 底层新增原型推进全局代际，触发缓存刷新扫描
+    let e2 = EntityId::from_u128(502);
+    store
+        .create_entity(
+            e2,
+            EntityBundle::new()
+                .with(Pos { x: 30, y: 40 })
+                .unwrap()
+                .with(Vel { dx: 3, dy: 4 })
+                .unwrap()
+                .with(TagActive)
+                .unwrap(),
+        )
+        .unwrap();
+
+    query.with_matched_archetypes_mut(&store, |slice, _| {
+        assert_eq!(slice.len(), 2);
+        Ok(())
+    }).unwrap();
+    assert_eq!(
+        query.archetype_set_generation(),
+        store.archetype_set_generation()
+    );
+}
+
+#[test]
+fn test_level2_matched_table_bindings_and_store_chunk_fast_path() {
+    let mut store = Store::new();
+    let e1 = EntityId::from_u128(701);
+    let e2 = EntityId::from_u128(702);
+    store
+        .create_entity(
+            e1,
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 20 })
+                .unwrap()
+                .with(Vel { dx: 2, dy: 3 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    let mut q_mut = Query::<(&mut Pos, &Vel)>::from_store(&store).unwrap();
+    let q_ro = Query::<&Pos>::from_store(&store).unwrap();
+
+    // 1. 验证 Level-2 预绑定列下标与 Archetype::component_types_slice 严格对应
+    let bindings = q_mut.matched_bindings_arc();
+    assert_eq!(bindings.len(), 1);
+    let arch = &store.archetypes[bindings[0].archetype_id.0 as usize];
+    assert_eq!(
+        arch.component_types_slice()[bindings[0].flat_col_indices[0] as usize],
+        ComponentTypeId::of::<Pos>()
+    );
+    assert_eq!(
+        arch.component_types_slice()[bindings[0].flat_col_indices[1] as usize],
+        ComponentTypeId::of::<Vel>()
+    );
+
+    // 2. 验证 Store::query_mut 不会破坏 flat_columns 缓存
+    for (_id, (pos, vel)) in store.query_mut::<(&mut Pos, &Vel)>().unwrap() {
+        pos.x += vel.dx;
+        pos.y += vel.dy;
+    }
+    let arch_after_qmut = &store.archetypes[bindings[0].archetype_id.0 as usize];
+    assert!(!arch_after_qmut.may_be_segmented_or_unaligned());
+    assert_eq!(
+        arch_after_qmut.flat_columns().len(),
+        arch_after_qmut.component_types_slice().len()
+    );
+
+    // 3. 验证动态新增原型表后，Store::query_mut()?.chunks() 与 Query 缓存均正确工作
+    store
+        .insert((
+            e2,
+            (
+                Pos { x: 100, y: 200 },
+                Vel { dx: 5, dy: 6 },
+                TagActive,
+            ),
+        ))
+        .unwrap();
+
+    for (_ents, (pos, vel)) in store.query_mut::<(&mut Pos, &Vel)>().unwrap().chunks() {
+        for i in 0..pos.len() {
+            pos[i].x += vel[i].dx;
+            pos[i].y += vel[i].dy;
+        }
+    }
+    q_mut.ensure_cache_current_mut(&store).unwrap();
+    assert_eq!(q_mut.matched_bindings_arc().len(), 2);
+
+    let mut sum_x = 0;
+    for (_ents, pos) in store.query::<&Pos>().chunks() {
+        for p in pos {
+            sum_x += p.x;
+        }
+    }
+    let _ = &q_ro;
+    // e1: 10 + 2 + 2 = 14; e2: 100 + 5 = 105 -> sum_x = 119
+    assert_eq!(sum_x, 119);
+}
+

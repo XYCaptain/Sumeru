@@ -1,0 +1,1026 @@
+use super::*;
+use crate::id::ArchetypeId;
+
+/// 纯函数：根据给定的查询形态 Q 和过滤器 F，从原型头切片中筛选匹配的 ArchetypeId 列表。
+pub(crate) fn match_archetypes_for_query<Q: QueryMutShape, F: QueryFilter, H: ArchetypeHeader>(
+    archetypes: &[H],
+    filter: &F,
+) -> Result<Vec<ArchetypeId>, StateError> {
+    Q::validate_shape()?;
+    let descriptors = Q::access_descriptors();
+    let mut matched = Vec::new();
+    for arch in archetypes {
+        if filter.matches_archetype(arch)
+            && descriptors
+                .iter()
+                .all(|(cid, _, _)| arch.contains_component(*cid))
+        {
+            matched.push(arch.archetype_id());
+        }
+    }
+    Ok(matched)
+}
+
+/// 共享的原型匹配算法：扫描 Store 中所有原型，按查询形态和过滤器筛选匹配的原型 ID。
+///
+/// 当代际（`archetype_set_generation`）不一致时，**全量重新扫描原型集合**并重建匹配列表。
+/// 确保所有查询路径使用完全相同的匹配逻辑。
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn rebuild_matched_archetypes<Q: QueryMutShape, F: QueryFilter>(
+    store: &Store,
+    filter: &F,
+) -> Vec<ArchetypeId> {
+    match_archetypes_for_query::<Q, F, Archetype>(&store.archetypes, filter)
+        .unwrap_or_default()
+}
+
+/// 纯函数：根据给定的查询形态 Q 和过滤器 F，从原型头切片中筛选匹配的 ArchetypeId 列表并预绑定物理列槽位。
+pub(crate) fn match_bindings_for_query<
+    Q: QueryMutShape,
+    F: QueryFilter,
+    H: ArchetypeHeader,
+>(
+    archetypes: &[H],
+    filter: &F,
+) -> Result<(Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>), StateError> {
+    Q::validate_shape()?;
+    let descriptors = Q::access_descriptors();
+    let mut matched = Vec::new();
+    let mut bindings = Vec::new();
+    for arch in archetypes {
+        if !filter.matches_archetype(arch) {
+            continue;
+        }
+        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(descriptors.len());
+        let mut all_present = true;
+        for &(cid, _, _) in &descriptors {
+            if let Some(idx) = arch.component_column_index(cid) {
+                flat_col_indices.push(idx);
+            } else {
+                all_present = false;
+                break;
+            }
+        }
+        if all_present {
+            let archetype_id = arch.archetype_id();
+            matched.push(archetype_id);
+            bindings.push(crate::storage::query::handle::MatchedTableBinding {
+                archetype_id,
+                flat_col_indices,
+            });
+        }
+    }
+    Ok((matched, bindings))
+}
+
+#[inline]
+pub(crate) fn rebuild_matched_bindings<Q: QueryMutShape, F: QueryFilter>(
+    store: &Store,
+    filter: &F,
+) -> (Vec<ArchetypeId>, Vec<crate::storage::query::handle::MatchedTableBinding>) {
+    match_bindings_for_query::<Q, F, Archetype>(&store.archetypes, filter)
+        .unwrap_or_default()
+}
+
+/// 合并查询形状 `Q` 的读写列与过滤器 `F` 读取列的前置权限描述符列表。
+///
+/// 若某组件在 `Q` 中为写权限（`is_write = true`），即使在 `filter` 中仅作为读取，其权限依然保持写权限；
+/// 若某组件在 `Q` 中为读权限或仅在 `filter` 中出现，则登记为读权限（`is_write = false`）。
+pub fn merged_access_descriptors<Q: QueryMutShape, F: QueryFilter>(
+    filter: &F,
+) -> Vec<(ComponentTypeId, &'static str, bool)> {
+    let mut map = std::collections::BTreeMap::new();
+    Q::for_each_access_descriptor(|cid, name, is_write| {
+        map.insert(cid, (name, is_write));
+    });
+    QueryFilter::filter_read_components(filter, &mut |cid, name| {
+        map.entry(cid)
+            .and_modify(|(_, _is_write)| {
+                // If it's already write, it stays write!
+            })
+            .or_insert((name, false));
+    });
+    map.into_iter().map(|(cid, (name, write))| (cid, name, write)).collect()
+}
+
+/// 强类型原生列可变指针包装器（根据组件的 Send 实现跨线程安全发送）
+#[derive(Debug, Clone)]
+pub struct MutColumnPtr<T>(ColumnDescriptor, PhantomData<T>);
+unsafe impl<T: Send> Send for MutColumnPtr<T> {}
+
+/// 强类型原生列只读指针包装器（根据组件的 Sync 实现跨线程安全发送）
+#[derive(Debug, Clone)]
+pub struct ConstColumnPtr<T>(ColumnDescriptor, PhantomData<T>);
+unsafe impl<T: Sync> Send for ConstColumnPtr<T> {}
+
+/// Represents the static shape of a mutable query parameter, decoupled from borrow lifetimes.
+///
+/// This trait is sealed: only internal shapes (`&'static T` and `&'static mut T`) may implement it.
+///
+/// An external type cannot implement the sealed `QueryMutParamShape` trait because
+/// the supertrait `sealed::QueryMutParamShapeInternal` is private to this crate:
+/// ```compile_fail,E0277
+/// struct ExternalParamShape;
+/// impl sumer_state::QueryMutParamShape for ExternalParamShape {
+///     fn component_type_id() -> sumer_state::ComponentTypeId { sumer_state::ComponentTypeId::of::<i32>() }
+///     fn type_name() -> &'static str { "i32" }
+///     fn is_write() -> bool { true }
+/// }
+/// ```
+#[allow(private_bounds, private_interfaces)]
+pub trait QueryMutParamShape: sealed::QueryMutParamShapeInternal + Send + 'static {
+    fn component_type_id() -> ComponentTypeId;
+    fn type_name() -> &'static str;
+    fn is_write() -> bool;
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutParamShape
+    for &'static mut T
+{
+    #[inline]
+    fn component_type_id() -> ComponentTypeId {
+        ComponentTypeId::of::<T>()
+    }
+    #[inline]
+    fn type_name() -> &'static str {
+        std::any::type_name::<T>()
+    }
+    #[inline]
+    fn is_write() -> bool {
+        true
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned> sealed::QueryMutParamShapeInternal
+    for &'static mut T
+{
+    type Param<'a> = &'a mut T;
+    type ColumnBuffer = MutColumnPtr<T>;
+    type IterState<'a> = std::slice::IterMut<'a, T>;
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ColumnBuffer, row: usize, cursor: &mut usize) -> usize {
+        buffer.0.locate_with_cursor(row, cursor).2
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer(
+        desc: &ColumnDescriptor,
+        expected_len: usize,
+    ) -> Option<MutColumnPtr<T>> {
+        if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+            return None;
+        }
+        Some(MutColumnPtr(desc.clone(), PhantomData))
+    }
+    #[inline]
+    unsafe fn prepare_state<'view>(
+        buffer: &MutColumnPtr<T>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> std::slice::IterMut<'view, T> {
+        let (base, offset, end) = buffer.0.locate_with_cursor(range.start, cursor);
+        assert!(range.end <= end);
+        let ptr = unsafe { (base as *mut T).add(offset) };
+        unsafe { std::slice::from_raw_parts_mut(ptr, range.len()).iter_mut() }
+    }
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+    ) -> <Self::Param<'view> as QueryMutParam<'view>>::Item {
+        debug_assert!(state.len() != 0, "validated equal-length component slice");
+        // SAFETY: this sealed operation requires an unexhausted iterator.
+        // QueryView prepares equal-length component iterators for one exact
+        // selected run and advances components only after the equally sized
+        // identity iterator has yielded an item.
+        unsafe { state.next().unwrap_unchecked() }
+    }
+    #[inline]
+    unsafe fn skip_items<'view>(state: &mut Self::IterState<'view>, count: usize) {
+        if count > 0 {
+            let _ = state.nth(count - 1);
+        }
+    }
+    #[inline]
+    unsafe fn chunk_state<'view>(buffer: &MutColumnPtr<T>, range: Range<usize>, cursor: &mut usize) -> &'view mut [T] {
+        let (base, offset, end) = buffer.0.locate_with_cursor(range.start, cursor);
+        assert!(range.end <= end);
+        let ptr = unsafe { (base as *mut T).add(offset) };
+        unsafe { std::slice::from_raw_parts_mut(ptr, range.len()) }
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Sync> QueryMutParamShape for &'static T {
+    #[inline]
+    fn component_type_id() -> ComponentTypeId {
+        ComponentTypeId::of::<T>()
+    }
+    #[inline]
+    fn type_name() -> &'static str {
+        std::any::type_name::<T>()
+    }
+    #[inline]
+    fn is_write() -> bool {
+        false
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned> sealed::QueryMutParamShapeInternal
+    for &'static T
+{
+    type Param<'a> = &'a T;
+    type ColumnBuffer = ConstColumnPtr<T>;
+    type IterState<'a> = std::slice::Iter<'a, T>;
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ColumnBuffer, row: usize, cursor: &mut usize) -> usize {
+        buffer.0.locate_with_cursor(row, cursor).2
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer(
+        desc: &ColumnDescriptor,
+        expected_len: usize,
+    ) -> Option<ConstColumnPtr<T>> {
+        if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+            return None;
+        }
+        Some(ConstColumnPtr(desc.clone(), PhantomData))
+    }
+    #[inline]
+    unsafe fn prepare_state<'view>(
+        buffer: &ConstColumnPtr<T>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> std::slice::Iter<'view, T> {
+        let (base, offset, end) = buffer.0.locate_with_cursor(range.start, cursor);
+        assert!(range.end <= end);
+        let ptr = unsafe { (base as *const T).add(offset) };
+        unsafe { std::slice::from_raw_parts(ptr, range.len()).iter() }
+    }
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+    ) -> <Self::Param<'view> as QueryMutParam<'view>>::Item {
+        debug_assert!(state.len() != 0, "validated equal-length component slice");
+        // SAFETY: the same unexhausted-run contract as the mutable parameter.
+        unsafe { state.next().unwrap_unchecked() }
+    }
+    #[inline]
+    unsafe fn skip_items<'view>(state: &mut Self::IterState<'view>, count: usize) {
+        if count > 0 {
+            let _ = state.nth(count - 1);
+        }
+    }
+    #[inline]
+    unsafe fn chunk_state<'view>(buffer: &ConstColumnPtr<T>, range: Range<usize>, cursor: &mut usize) -> &'view [T] {
+        let (base, offset, end) = buffer.0.locate_with_cursor(range.start, cursor);
+        assert!(range.end <= end);
+        let ptr = unsafe { (base as *const T).add(offset) };
+        unsafe { std::slice::from_raw_parts(ptr, range.len()) }
+    }
+}
+
+/// Represents the static shape of a mutable query, decoupled from any specific borrow lifetime.
+#[allow(private_bounds)]
+pub trait QueryMutShape:
+    sealed::QueryMutShapeInternal<Self::ArchetypeBuffers> + Send + 'static
+{
+    type View<'view>: QueryMutData<'view, Item = Self::Item<'view>, Chunk = Self::Chunk<'view>>;
+    type Item<'view>;
+    type Chunk<'view>;
+    type ArchetypeBuffers: Send + Clone;
+    type IterState<'view>;
+    type Cursor: Default + Send + 'static;
+
+    const PARAM_COUNT: usize;
+    fn for_each_access_descriptor(f: impl FnMut(ComponentTypeId, &'static str, bool));
+
+    #[inline]
+    fn access_descriptors() -> Vec<(ComponentTypeId, &'static str, bool)> {
+        let mut v = Vec::with_capacity(Self::PARAM_COUNT);
+        Self::for_each_access_descriptor(|cid, name, write| v.push((cid, name, write)));
+        v
+    }
+
+    /// 校验查询形状内部是否存在别名/读写冲突（例如元组中对同一组件同时存在写操作）
+    fn validate_shape() -> Result<(), StateError>;
+
+    /// 计算当前游标所在分段边界
+    fn segment_end_with_cursor(
+        buffers: &Self::ArchetypeBuffers,
+        row: usize,
+        cursor: &mut Self::Cursor,
+    ) -> usize;
+
+    /// 迭代准备：直接使用扁平物理基址与区间，零虚调用，O(1) 定位
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view>;
+
+    /// 行迭代推进。
+    ///
+    /// # Safety
+    /// All component iterators must have at least one remaining item, prepared
+    /// for the same exact leased run. Each call advances every component once;
+    /// callers must stop at the run length before preparing another disjoint run.
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view>;
+
+    /// 跳过指定行数推进迭代器（用于行级过滤）
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    );
+
+    /// 切片分块提取
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view>;
+}
+
+macro_rules! count_params {
+    () => { 0 };
+    ($head:ident $($tail:ident)*) => { 1 + count_params!($($tail)*) };
+}
+
+macro_rules! tuple_query_mut_shape {
+    ($($P:ident : $idx:tt),+) => {
+        impl<$($P: QueryMutParamShape),+> sealed::QueryMutShapeInternal<($($P::ColumnBuffer,)+)> for ($($P,)+) {
+            #[inline]
+            unsafe fn resolve_archetype_buffers(
+                get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+                expected_len: usize,
+            ) -> Option<($($P::ColumnBuffer,)+)> {
+                Some((
+                    $(
+                        unsafe {
+                            let desc = get_desc($P::component_type_id())?;
+                            $P::resolve_buffer(&desc, expected_len)?
+                        },
+                    )+
+                ))
+            }
+        }
+
+        impl<$($P: QueryMutParamShape),+> QueryMutShape for ($($P,)+) {
+            type View<'view> = ($($P::Param<'view>,)+);
+            type Item<'view> = (EntityId, ($(<$P::Param<'view> as QueryMutParam<'view>>::Item,)+));
+            type Chunk<'view> = (&'view [EntityId], ($(<$P::Param<'view> as QueryMutParam<'view>>::Chunk,)+));
+            type ArchetypeBuffers = ($($P::ColumnBuffer,)+);
+            type IterState<'view> = ($($P::IterState<'view>,)+);
+            type Cursor = [usize; 16];
+
+            const PARAM_COUNT: usize = count_params!($($P)+);
+
+            #[inline]
+            fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+                $(
+                    f($P::component_type_id(), $P::type_name(), $P::is_write());
+                )+
+            }
+
+            fn validate_shape() -> Result<(), StateError> {
+                let descriptors = [
+                    $(
+                        ($P::component_type_id(), $P::type_name(), $P::is_write()),
+                    )+
+                ];
+                for i in 0..descriptors.len() {
+                    let (id_i, name_i, write_i) = descriptors[i];
+                    for j in (i + 1)..descriptors.len() {
+                        let (id_j, _, write_j) = descriptors[j];
+                        if id_i == id_j && (write_i || write_j) {
+                            return Err(StateError::SelfBorrowConflict {
+                                component: name_i.to_string(),
+                                detail: format!(
+                                    "Conflicting tuple parameters: {} vs {}",
+                                    if write_i { "Write" } else { "Read" },
+                                    if write_j { "Write" } else { "Read" },
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            #[inline]
+            fn segment_end_with_cursor(buffers: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+                usize::MAX $(.min($P::segment_end_with_cursor(&buffers.$idx, row, &mut cursor[$idx])))+
+            }
+
+            #[inline]
+            unsafe fn prepare_iter<'view>(
+                buffers: &Self::ArchetypeBuffers,
+                range: Range<usize>,
+                cursor: &mut Self::Cursor,
+            ) -> Self::IterState<'view> {
+                (
+                    $(
+                        unsafe { $P::prepare_state(&buffers.$idx, range.clone(), &mut cursor[$idx]) },
+                    )+
+                )
+            }
+
+            #[inline]
+            unsafe fn next_item<'view>(
+                state: &mut Self::IterState<'view>,
+                entity: EntityId,
+            ) -> Self::Item<'view> {
+                (
+                    entity,
+                    (
+                        $(
+                            unsafe { $P::next_item(&mut state.$idx) },
+                        )+
+                    ),
+                )
+            }
+
+            #[inline]
+            unsafe fn skip_items<'view>(
+                state: &mut Self::IterState<'view>,
+                count: usize,
+            ) {
+                $(
+                    unsafe { $P::skip_items(&mut state.$idx, count) };
+                )+
+            }
+
+            #[inline]
+            unsafe fn chunk<'view>(
+                entities: &'view [EntityId],
+                buffers: &Self::ArchetypeBuffers,
+                range: Range<usize>,
+                cursor: &mut Self::Cursor,
+            ) -> Self::Chunk<'view> {
+                (
+                    entities,
+                    (
+                        $(
+                            unsafe { $P::chunk_state(&buffers.$idx, range.clone(), &mut cursor[$idx]) },
+                        )+
+                    ),
+                )
+            }
+        }
+    };
+}
+
+all_tuples!(tuple_query_mut_shape);
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send>
+    sealed::QueryMutShapeInternal<MutColumnPtr<T>> for &'static mut T
+{
+    #[inline]
+    unsafe fn resolve_archetype_buffers(
+        get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<MutColumnPtr<T>> {
+        unsafe {
+            let desc = get_desc(ComponentTypeId::of::<T>())?;
+            <&'static mut T as sealed::QueryMutParamShapeInternal>::resolve_buffer(
+                &desc,
+                expected_len,
+            )
+        }
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutShape for &'static mut T {
+    type View<'view> = &'view mut T;
+    type Item<'view> = (EntityId, &'view mut T);
+    type Chunk<'view> = (&'view [EntityId], &'view mut [T]);
+    type ArchetypeBuffers = MutColumnPtr<T>;
+    type IterState<'view> = std::slice::IterMut<'view, T>;
+    type Cursor = usize;
+
+    const PARAM_COUNT: usize = 1;
+
+    #[inline]
+    fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), true);
+    }
+
+    #[inline]
+    fn validate_shape() -> Result<(), StateError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+        <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
+    }
+
+    #[inline]
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view> {
+        unsafe {
+            <&'static mut T as sealed::QueryMutParamShapeInternal>::prepare_state(buffers, range, cursor)
+        }
+    }
+
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view> {
+        (entity, unsafe {
+            <&'static mut T as sealed::QueryMutParamShapeInternal>::next_item(state)
+        })
+    }
+
+    #[inline]
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    ) {
+        unsafe { <&'static mut T as sealed::QueryMutParamShapeInternal>::skip_items(state, count) }
+    }
+
+    #[inline]
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view> {
+        (entities, unsafe {
+            <&'static mut T as sealed::QueryMutParamShapeInternal>::chunk_state(buffers, range, cursor)
+        })
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned>
+    sealed::QueryMutShapeInternal<ConstColumnPtr<T>> for &'static T
+{
+    #[inline]
+    unsafe fn resolve_archetype_buffers(
+        get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<ConstColumnPtr<T>> {
+        let desc = get_desc(ComponentTypeId::of::<T>())?;
+        // SAFETY: forwarded layout and lease requirements are unchanged.
+        unsafe { <Self as sealed::QueryMutParamShapeInternal>::resolve_buffer(&desc, expected_len) }
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned> QueryMutShape for &'static T {
+    type View<'view> = &'view T;
+    type Item<'view> = (EntityId, &'view T);
+    type Chunk<'view> = (&'view [EntityId], &'view [T]);
+    type ArchetypeBuffers = ConstColumnPtr<T>;
+    type IterState<'view> = std::slice::Iter<'view, T>;
+    type Cursor = usize;
+    const PARAM_COUNT: usize = 1;
+
+    fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false);
+    }
+
+    fn validate_shape() -> Result<(), StateError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+        <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
+    }
+
+    #[inline]
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view> {
+        // SAFETY: caller guarantees a valid, read-leased range.
+        unsafe { <Self as sealed::QueryMutParamShapeInternal>::prepare_state(buffers, range, cursor) }
+    }
+
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view> {
+        (entity, unsafe { <Self as sealed::QueryMutParamShapeInternal>::next_item(state) })
+    }
+
+    #[inline]
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    ) {
+        unsafe { <Self as sealed::QueryMutParamShapeInternal>::skip_items(state, count) }
+    }
+
+    #[inline]
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view> {
+        (entities, unsafe { <Self as sealed::QueryMutParamShapeInternal>::chunk_state(buffers, range, cursor) })
+    }
+}
+
+impl<Q: QueryMutShape> sealed::QueryMutShapeInternal<Q::ArchetypeBuffers> for (EntityId, Q) {
+    #[inline]
+    unsafe fn resolve_archetype_buffers(
+        get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<Q::ArchetypeBuffers> {
+        unsafe { Q::resolve_archetype_buffers(get_desc, expected_len) }
+    }
+}
+
+impl<Q: QueryMutShape> QueryMutShape for (EntityId, Q) {
+    type View<'view> = (EntityId, Q::View<'view>);
+    type Item<'view> = Q::Item<'view>;
+    type Chunk<'view> = Q::Chunk<'view>;
+    type ArchetypeBuffers = Q::ArchetypeBuffers;
+    type IterState<'view> = Q::IterState<'view>;
+    type Cursor = Q::Cursor;
+
+    const PARAM_COUNT: usize = Q::PARAM_COUNT;
+
+    #[inline]
+    fn for_each_access_descriptor(f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+        Q::for_each_access_descriptor(f);
+    }
+
+    #[inline]
+    fn validate_shape() -> Result<(), StateError> {
+        Q::validate_shape()
+    }
+
+    #[inline]
+    fn segment_end_with_cursor(buffers: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+        Q::segment_end_with_cursor(buffers, row, cursor)
+    }
+
+    #[inline]
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view> {
+        unsafe { Q::prepare_iter(buffers, range, cursor) }
+    }
+
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view> {
+        unsafe { Q::next_item(state, entity) }
+    }
+
+    #[inline]
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    ) {
+        unsafe { Q::skip_items(state, count) }
+    }
+
+    #[inline]
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view> {
+        unsafe { Q::chunk(entities, buffers, range, cursor) }
+    }
+}
+
+impl<'a, Q: QueryMutData<'a>> QueryMutData<'a> for (EntityId, Q) {
+    type Item = Q::Item;
+    type Chunk = Q::Chunk;
+
+    fn validate_query() {
+        Q::validate_query();
+    }
+}
+
+impl<'a, Q: QueryMutData<'a>> sealed::FetchMut<'a> for (EntityId, Q) {
+    type State = Q::State;
+    #[inline]
+    fn prepare(
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+        range: Range<usize>,
+    ) -> Option<Self::State> {
+        Q::prepare(columns, range)
+    }
+
+    #[inline(always)]
+    fn fast_prepare_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        Q::fast_prepare_archetype(archetype)
+    }
+
+    #[inline]
+    fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
+        Q::next(state, entity)
+    }
+
+    #[inline]
+    fn chunk(
+        entities: &'a [EntityId],
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+            range: Range<usize>,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        Q::chunk(entities, columns, range)
+    }
+
+    #[inline(always)]
+    fn fast_chunk_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        Q::fast_chunk_archetype(archetype)
+    }
+
+    #[inline]
+    fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]> {
+        Q::access_descriptors()
+    }
+}
+
+impl<'a, Q: QueryData<'a>> QueryData<'a> for (EntityId, Q) {
+    type Item = Q::Item;
+    type Chunk = Q::Chunk;
+}
+
+impl<'a, Q: QueryData<'a>> sealed::Fetch<'a> for (EntityId, Q) {
+    type State = Q::State;
+    #[inline]
+    fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
+        Q::prepare(archetype, start)
+    }
+    #[inline]
+    fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryData<'a>>::Item {
+        Q::next(state, entity)
+    }
+    #[inline]
+    fn chunk(archetype: &'a Archetype, start: usize) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
+        Q::chunk(archetype, start)
+    }
+}
+
+pub(crate) fn for_each_matched_chunk_ro<'store, Q>(
+    store: &'store Store,
+    matched_archetypes: &[ArchetypeId],
+    mut f: impl FnMut(Q::Chunk<'store>),
+) where
+    Q: QueryMutShape,
+    for<'a> Q::View<'a>: QueryData<'a, Chunk = Q::Chunk<'a>>,
+{
+    for &arch_id in matched_archetypes {
+        let Some(arch) = store.archetypes.get(arch_id.0 as usize) else {
+            continue;
+        };
+        let mut row = 0;
+        while row < arch.len() {
+            let Some((chunk, end)) = <Q::View<'store> as sealed::Fetch<'store>>::chunk(arch, row)
+            else {
+                break;
+            };
+            f(chunk);
+            row = end;
+        }
+    }
+}
+
+pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
+    store: &'store mut Store,
+    matched_archetypes: &[ArchetypeId],
+    mut f: impl FnMut(Q::Chunk<'store>),
+) where
+    Q: QueryMutShape,
+{
+    let archetypes_ptr = store.archetypes.as_mut_ptr();
+    let archetypes_len = store.archetypes.len();
+    for &arch_id in matched_archetypes {
+        let idx = arch_id.0 as usize;
+        if idx >= archetypes_len {
+            continue;
+        }
+        // SAFETY: `matched_archetypes` contains distinct ArchetypeIds; we borrow each matched
+        // archetype exclusively for the duration of its chunk callback.
+        let arch = unsafe { &mut *archetypes_ptr.add(idx) };
+        if arch.is_empty() {
+            continue;
+        }
+        if !arch.may_be_segmented_or_unaligned()
+            && arch.flat_columns().len() == arch.component_types_slice().len()
+        {
+            if let Some(chunk) =
+                <Q::View<'store> as sealed::FetchMut<'store>>::fast_chunk_archetype(arch)
+            {
+                f(chunk);
+            }
+            continue;
+        }
+        let (entities, _, _, _, cols) = arch.split_for_query_mut();
+        let wanted = <Q::View<'store> as sealed::FetchMut<'store>>::access_descriptors();
+        let req_mask = <Q::View<'store> as sealed::FetchMut<'store>>::required_mask();
+        let mut columns =
+            smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(
+                wanted.len(),
+            );
+        let mut ok = true;
+        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+            let is_req = (req_mask & (1u16 << i)) != 0;
+            if let Some(col) = cols.get_mut(&id) {
+                let desc = ColumnDescriptor::from_column(&mut **col);
+                if desc.len != entities.len() {
+                    ok = false;
+                    break;
+                }
+                columns.push((id, desc));
+            } else if is_req {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut row = 0;
+        while row < entities.len() {
+            let end = columns
+                .iter()
+                .fold(entities.len(), |e, (_, col)| e.min(col.locate(row).2));
+            if end <= row {
+                break;
+            }
+            let range = row..end;
+            row = end;
+            if let Some(chunk) = <Q::View<'store> as sealed::FetchMut<'store>>::chunk(
+                &entities[range.clone()],
+                &columns,
+                range,
+            ) {
+                f(chunk);
+            }
+        }
+    }
+}
+
+pub(crate) fn for_each_matched_ro<'store, Q, F>(
+    store: &'store Store,
+    matched_archetypes: &[ArchetypeId],
+    filter: &F,
+    mut f: impl FnMut(Q::Item<'store>),
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+    for<'a> Q::View<'a>: QueryData<'a, Item = Q::Item<'a>>,
+{
+    for &arch_id in matched_archetypes {
+        let Some(arch) = store.archetypes.get(arch_id.0 as usize) else {
+            continue;
+        };
+        if arch.is_empty() {
+            continue;
+        }
+        let entities = arch.entities();
+        let mut row = 0;
+        while row < arch.len() {
+            let Some((mut state, end)) =
+                <Q::View<'store> as sealed::Fetch<'store>>::prepare(arch, row)
+            else {
+                break;
+            };
+            for current_row in row..end {
+                let item = <Q::View<'store> as sealed::Fetch<'store>>::next(
+                    &mut state,
+                    entities[current_row],
+                );
+                if F::IS_ROW_FILTERED && !filter.matches_row(arch, current_row) {
+                    continue;
+                }
+                f(item);
+            }
+            row = end;
+        }
+    }
+}
+
+pub(crate) fn for_each_matched_mut<'store, Q, F>(
+    store: &'store mut Store,
+    matched_archetypes: &[ArchetypeId],
+    filter: &F,
+    mut f: impl FnMut(Q::Item<'store>),
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    let archetypes_ptr = store.archetypes.as_mut_ptr();
+    let archetypes_len = store.archetypes.len();
+    for &arch_id in matched_archetypes {
+        let idx = arch_id.0 as usize;
+        if idx >= archetypes_len {
+            continue;
+        }
+        // SAFETY: `matched_archetypes` contains distinct ArchetypeIds; we borrow each matched
+        // archetype exclusively for the duration of its row callbacks.
+        let arch = unsafe { &mut *archetypes_ptr.add(idx) };
+        if arch.is_empty() {
+            continue;
+        }
+        let filtered_rows = if F::IS_ROW_FILTERED {
+            filter.collect_matched_rows(&*arch)
+        } else {
+            None
+        };
+        if filtered_rows.as_ref().is_some_and(|r| r.is_empty()) {
+            continue;
+        }
+        if !arch.may_be_segmented_or_unaligned()
+            && arch.flat_columns().len() == arch.component_types_slice().len()
+        {
+            if let Some((mut state, entities)) =
+                <Q::View<'store> as sealed::FetchMut<'store>>::fast_prepare_archetype(arch)
+            {
+                for (current_row, &entity) in entities.iter().enumerate() {
+                    let item =
+                        <Q::View<'store> as sealed::FetchMut<'store>>::next(&mut state, entity);
+                    if let Some(matched) = &filtered_rows {
+                        if matched.binary_search(&current_row).is_err() {
+                            continue;
+                        }
+                    }
+                    f(item);
+                }
+            }
+            continue;
+        }
+        let (entities, _, _, _, cols) = arch.split_for_query_mut();
+        let wanted = <Q::View<'store> as sealed::FetchMut<'store>>::access_descriptors();
+        let req_mask = <Q::View<'store> as sealed::FetchMut<'store>>::required_mask();
+        let mut columns =
+            smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(
+                wanted.len(),
+            );
+        let mut ok = true;
+        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+            let is_req = (req_mask & (1u16 << i)) != 0;
+            if let Some(col) = cols.get_mut(&id) {
+                let desc = ColumnDescriptor::from_column(&mut **col);
+                if desc.len != entities.len() {
+                    ok = false;
+                    break;
+                }
+                columns.push((id, desc));
+            } else if is_req {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut row = 0;
+        while row < entities.len() {
+            let end = columns
+                .iter()
+                .fold(entities.len(), |e, (_, col)| e.min(col.locate(row).2));
+            if end <= row {
+                break;
+            }
+            let range = row..end;
+            if let Some(mut state) =
+                <Q::View<'store> as sealed::FetchMut<'store>>::prepare(&columns, range.clone())
+            {
+                for current_row in range {
+                    let item = <Q::View<'store> as sealed::FetchMut<'store>>::next(
+                        &mut state,
+                        entities[current_row],
+                    );
+                    if let Some(matched) = &filtered_rows {
+                        if matched.binary_search(&current_row).is_err() {
+                            continue;
+                        }
+                    }
+                    f(item);
+                }
+            }
+            row = end;
+        }
+    }
+}
+
+

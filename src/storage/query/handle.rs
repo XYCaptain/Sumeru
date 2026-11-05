@@ -1,0 +1,560 @@
+//! 长期可复用查询句柄与流式构建器 (Query & QueryBuilder)
+//!
+//! 提供基于强类型访问形态 `Q: QueryMutShape` 与过滤链 `F: QueryFilter` 的长期查询能力：
+//! 1. **Query**：持有不可变过滤硬边界与匹配成功的 ArchetypeId 缓存，随代际戳自适应增量刷新；
+//! 2. **QueryBuilder**：提供链式 `.with()`、`.without()`、`.filter_eq()`、`.filter()` 构造 API；
+//! 3. **QueryEntityRequest**：封装面向确定性实体 ID 列表的查询请求契约。
+
+use std::marker::PhantomData;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::id::ArchetypeId;
+use crate::id::ComponentTypeId;
+use super::spec::ComponentField;
+use super::spec::{
+    All, BusinessFilter, FilterEq, QueryFilter, QueryMutShape, With, Without,
+};
+use crate::storage::store::Store;
+use crate::binding::EntityId;
+use crate::context::ModelComponent;
+use crate::error::StateError;
+
+/// 预绑定原型表与组件物理列槽位偏移项（Level-2 预绑定缓存，对标 Flecs `ecs_query_t`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedTableBinding {
+    pub archetype_id: ArchetypeId,
+    /// 按查询形态 `Q` 的参数声明顺序预绑定的 `Archetype::flat_columns` 物理列下标
+    pub flat_col_indices: smallvec::SmallVec<[u16; 8]>,
+}
+
+/// 长期可复用查询句柄 (Query)。
+///
+/// 保存查询类型签名 `Q`（组件读写形态）、过滤器 `F` 以及基于 `archetype_set_generation` 缓存的物理原型表列表。
+/// 杜绝在每次查询构建时全表重新扫描，并在底层存储发生结构修改（Archetype 增删）时支持自适应增量刷新。
+#[derive(Debug, Clone)]
+pub(crate) struct QueryCache {
+    pub(crate) archetype_set_generation: u64,
+    pub(crate) matched_archetypes: std::sync::Arc<[ArchetypeId]>,
+    pub(crate) matched_bindings: std::sync::Arc<[MatchedTableBinding]>,
+    pub(crate) shared_template: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    pub(crate) template_limit_bytes: usize,
+    #[cfg(feature = "test-internals")]
+    pub(crate) template_rebuilds: u64,
+}
+
+/// 长期可复用查询句柄 (Query)。
+///
+/// 保存查询类型签名 `Q`（组件读写形态）、预编译的访问描述符、过滤器 `F` 以及基于 `archetype_set_generation` 缓存的物理原型表列表。
+/// 杜绝在每次查询构建时全表重新扫描，并在底层存储发生结构修改（Archetype 增删）时支持自适应增量刷新。
+#[derive(Debug)]
+pub struct Query<Q: QueryMutShape, F: QueryFilter + Clone = All> {
+    pub(crate) store_id: u64,
+    pub(crate) session_closed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) cache: std::sync::RwLock<QueryCache>,
+    pub(crate) descriptors: std::sync::Arc<[(ComponentTypeId, &'static str, bool)]>,
+    pub(crate) filter: F,
+    pub(crate) entities: Option<std::sync::Arc<[EntityId]>>,
+    pub(crate) marker: PhantomData<fn() -> Q>,
+}
+
+impl<Q: QueryMutShape, F: QueryFilter + Clone> Clone for Query<Q, F> {
+    fn clone(&self) -> Self {
+        let cache_val = self
+            .cache
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|p| p.into_inner().clone());
+        Self {
+            store_id: self.store_id,
+            session_closed: self.session_closed.clone(),
+            cache: std::sync::RwLock::new(cache_val),
+            descriptors: std::sync::Arc::clone(&self.descriptors),
+            filter: self.filter.clone(),
+            entities: self.entities.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Q: QueryMutShape> Query<Q, All> {
+    /// 从底层存储快速创建无过滤的长期查询对象
+    #[inline]
+    pub fn from_store(store: &Store) -> Result<Self, StateError> {
+        QueryBuilder::<Q>::new().build(store)
+    }
+}
+
+impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
+    pub(crate) fn check_session(&self) -> Result<(), StateError> {
+        if self.session_closed.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(StateError::AccessDenied("SharedSession is closed".into()));
+        }
+        Ok(())
+    }
+
+    /// Explicitly transfer this declaration out of its application session.
+    pub fn into_shared(mut self) -> Self {
+        self.session_closed = None;
+        self
+    }
+    /// 创建新的长期查询对象（仅限内部由 QueryBuilder::build 构建，杜绝外部传入伪造的匹配原型列表）。
+    #[inline]
+    pub(crate) fn new(
+        store_id: u64,
+        archetype_set_generation: u64,
+        matched_archetypes: std::sync::Arc<[ArchetypeId]>,
+        descriptors: std::sync::Arc<[(ComponentTypeId, &'static str, bool)]>,
+        filter: F,
+    ) -> Self {
+        Self::new_with_bindings(
+            store_id,
+            archetype_set_generation,
+            matched_archetypes,
+            std::sync::Arc::from([]),
+            descriptors,
+            filter,
+        )
+    }
+
+    /// 创建包含 Level-2 预绑定槽位的长期查询对象。
+    #[inline]
+    pub(crate) fn new_with_bindings(
+        store_id: u64,
+        archetype_set_generation: u64,
+        matched_archetypes: std::sync::Arc<[ArchetypeId]>,
+        matched_bindings: std::sync::Arc<[MatchedTableBinding]>,
+        descriptors: std::sync::Arc<[(ComponentTypeId, &'static str, bool)]>,
+        filter: F,
+    ) -> Self {
+        Self {
+            store_id,
+            session_closed: None,
+            cache: std::sync::RwLock::new(QueryCache {
+                archetype_set_generation,
+                matched_archetypes,
+                matched_bindings,
+                shared_template: None,
+                template_limit_bytes: 64 * 1024 * 1024,
+                #[cfg(feature = "test-internals")]
+                template_rebuilds: 0,
+            }),
+            descriptors,
+            filter,
+            entities: None,
+            marker: PhantomData,
+        }
+    }
+
+    /// 基于给定过滤器从底层存储构建 Query
+    #[inline]
+    pub fn with_filter(store: &Store, filter: F) -> Result<Self, StateError> {
+        QueryBuilder {
+            filter,
+            marker: PhantomData,
+        }
+        .build(store)
+    }
+
+    /// 绑定的存储内核实例 ID。
+    #[inline]
+    pub fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// 匹配的原型表集合代际版本。
+    #[inline]
+    pub fn archetype_set_generation(&self) -> u64 {
+        self.cache
+            .read()
+            .map(|g| g.archetype_set_generation)
+            .unwrap_or_else(|p| p.into_inner().archetype_set_generation)
+    }
+
+    /// 获取预编译的组件访问描述符切片引用（0 堆分配、0 锁保护、编译期确定不可变）。
+    #[inline]
+    pub fn descriptors(&self) -> &[(ComponentTypeId, &'static str, bool)] {
+        &self.descriptors
+    }
+
+    /// 获取显式实体列表切片引用（若指定了实体限制）。
+    #[inline]
+    pub fn entities(&self) -> Option<&[EntityId]> {
+        self.entities.as_deref()
+    }
+
+    /// Bound retained shared identity/request templates (default: 64 MiB).
+    /// Zero disables this optimization; over-limit queries use the original
+    /// protected path. This is not a process-wide or live-View memory budget.
+    /// Changing the bound drops this Query's template, not any active View.
+    pub fn set_template_cache_limit_bytes(&mut self, limit: usize) -> Result<(), StateError> {
+        let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
+        cache.template_limit_bytes = limit;
+        cache.shared_template = None;
+        Ok(())
+    }
+
+    /// 匹配的原型表 ID 列表快照（克隆 Arc<[ArchetypeId]>，零切片元素深拷贝）。
+    #[inline]
+    pub fn matched_archetypes_arc(&self) -> std::sync::Arc<[ArchetypeId]> {
+        self.cache
+            .read()
+            .map(|g| std::sync::Arc::clone(&g.matched_archetypes))
+            .unwrap_or_else(|p| std::sync::Arc::clone(&p.into_inner().matched_archetypes))
+    }
+
+    /// 匹配的原型表 ID 列表快照。
+    #[inline]
+    pub fn matched_archetypes(&self) -> Vec<ArchetypeId> {
+        self.matched_archetypes_arc().to_vec()
+    }
+
+    /// 匹配的原型表数量。
+    #[inline]
+    pub fn matched_count(&self) -> usize {
+        self.cache
+            .read()
+            .map(|g| g.matched_archetypes.len())
+            .unwrap_or_else(|p| p.into_inner().matched_archetypes.len())
+    }
+
+    /// 当前配置的过滤器引用。
+    #[inline]
+    pub fn filter(&self) -> &F {
+        &self.filter
+    }
+
+    /// 独占刷新缓存：持有 &mut self 时直接通过 get_mut 绕过 RwLock，彻底消除原子锁争用。
+    #[inline]
+    pub(crate) fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {
+        self.check_session()?;
+        if store.store_id() != self.store_id {
+            return Err(StateError::StoreMismatch {
+                expected_store: self.store_id,
+                actual_store: store.store_id(),
+            });
+        }
+
+        let current_gen = store.archetype_set_generation();
+        let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
+        if cache.archetype_set_generation != current_gen
+            || cache.matched_bindings.len() != cache.matched_archetypes.len()
+        {
+            let (matched, bindings) =
+                super::spec::rebuild_matched_bindings::<Q, F>(store, &self.filter);
+            cache.matched_archetypes = std::sync::Arc::from(matched.into_boxed_slice());
+            cache.matched_bindings = std::sync::Arc::from(bindings.into_boxed_slice());
+            cache.archetype_set_generation = current_gen;
+        }
+        Ok(())
+    }
+
+    /// Refresh/check the cache under its lock, then invoke the callback WITHOUT
+    /// that lock. The Arc snapshot keeps the slice alive (no element copy or
+    /// allocation on a cache hit). Callback reentry/panic cannot poison the cache.
+    pub(crate) fn with_matched_slice<R>(
+        &self,
+        store: &Store,
+        f: impl FnOnce(&[ArchetypeId], &[(ComponentTypeId, &'static str, bool)]) -> Result<R, StateError>,
+    ) -> Result<R, StateError> {
+        self.check_session()?;
+        if store.store_id() != self.store_id {
+            return Err(StateError::StoreMismatch {
+                expected_store: self.store_id,
+                actual_store: store.store_id(),
+            });
+        }
+        let current_gen = store.archetype_set_generation();
+        {
+            let guard = self.cache.read().map_err(|_| StateError::SessionPoisoned)?;
+            if guard.archetype_set_generation == current_gen {
+                let matched = std::sync::Arc::clone(&guard.matched_archetypes);
+                drop(guard);
+                return f(&matched, &self.descriptors);
+            }
+        }
+        let mut guard = self.cache.write().map_err(|_| StateError::SessionPoisoned)?;
+        if guard.archetype_set_generation != current_gen
+            || guard.matched_bindings.len() != guard.matched_archetypes.len()
+        {
+            let (matched, bindings) =
+                super::spec::rebuild_matched_bindings::<Q, F>(store, &self.filter);
+            guard.matched_archetypes = std::sync::Arc::from(matched.into_boxed_slice());
+            guard.matched_bindings = std::sync::Arc::from(bindings.into_boxed_slice());
+            guard.archetype_set_generation = current_gen;
+        }
+        let matched = std::sync::Arc::clone(&guard.matched_archetypes);
+        drop(guard);
+        f(&matched, &self.descriptors)
+    }
+
+    /// 匹配的原型表与预绑定物理列槽位快照（克隆 Arc<[MatchedTableBinding]>，零切片元素深拷贝）。
+    #[inline]
+    pub fn matched_bindings_arc(&self) -> std::sync::Arc<[MatchedTableBinding]> {
+        self.cache
+            .read()
+            .map(|g| std::sync::Arc::clone(&g.matched_bindings))
+            .unwrap_or_else(|p| std::sync::Arc::clone(&p.into_inner().matched_bindings))
+    }
+
+    /// 独占闭包借用预绑定原型表槽位切片与过滤器引用：0 锁争用、0 堆分配、0 次克隆。
+    #[inline]
+    pub fn with_matched_bindings_mut<R>(
+        &mut self,
+        store: &Store,
+        f: impl FnOnce(&[MatchedTableBinding], &F) -> Result<R, StateError>,
+    ) -> Result<R, StateError> {
+        self.ensure_cache_current_mut(store)?;
+        let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
+        f(&cache.matched_bindings, &self.filter)
+    }
+
+    /// 共享闭包借用匹配原型切片：消除任何全量克隆 Vec<ArchetypeId> 的开销。
+    #[inline]
+    pub fn with_matched_archetypes<R>(
+        &self,
+        store: &Store,
+        f: impl FnOnce(&[ArchetypeId]) -> Result<R, StateError>,
+    ) -> Result<R, StateError> {
+        self.with_matched_slice(store, |matched, _| f(matched))
+    }
+
+    /// 独占闭包借用匹配原型切片与过滤器引用：0 锁争用、0 堆分配、0 次克隆。
+    #[inline]
+    pub fn with_matched_archetypes_mut<R>(
+        &mut self,
+        store: &Store,
+        f: impl FnOnce(&[ArchetypeId], &F) -> Result<R, StateError>,
+    ) -> Result<R, StateError> {
+        self.ensure_cache_current_mut(store)?;
+        let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
+        f(&cache.matched_archetypes, &self.filter)
+    }
+
+    /// 构造指定实体 ID 列表的查询请求对象。
+    #[inline]
+    pub fn entity_request<'a>(&'a self, ids: &'a [EntityId]) -> QueryEntityRequest<'a, Q, F> {
+        QueryEntityRequest::new(self, ids)
+    }
+}
+
+/// 实体级查询请求描述对象。
+#[derive(Clone, Copy, Debug)]
+pub struct QueryEntityRequest<'a, Q: QueryMutShape, F: QueryFilter + Clone> {
+    query: &'a Query<Q, F>,
+    ids: &'a [EntityId],
+}
+
+impl<'a, Q: QueryMutShape, F: QueryFilter + Clone> QueryEntityRequest<'a, Q, F> {
+    #[inline]
+    pub fn new(query: &'a Query<Q, F>, ids: &'a [EntityId]) -> Self {
+        Self { query, ids }
+    }
+
+    #[inline]
+    pub fn query(&self) -> &'a Query<Q, F> {
+        self.query
+    }
+
+    #[inline]
+    pub fn ids(&self) -> &'a [EntityId] {
+        self.ids
+    }
+}
+
+/// 强类型查询构建器。
+#[derive(Clone, Debug)]
+pub struct QueryBuilder<Q: QueryMutShape, F = All> {
+    pub(crate) filter: F,
+    pub(crate) marker: PhantomData<fn() -> Q>,
+}
+
+impl<Q: QueryMutShape> QueryBuilder<Q, All> {
+    /// 创建无过滤初始状态的查询构建器。
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            filter: All,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<Q: QueryMutShape> Default for QueryBuilder<Q, All> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
+    /// 增加包含组件 T 的硬边界过滤条件（仅校验表级原型元数据）。
+    #[inline]
+    pub fn with<T: 'static>(self) -> QueryBuilder<Q, With<T, F>> {
+        QueryBuilder {
+            filter: With::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// 增加排除组件 T 的硬边界过滤条件（仅校验表级原型元数据）。
+    #[inline]
+    pub fn without<T: 'static>(self) -> QueryBuilder<Q, Without<T, F>> {
+        QueryBuilder {
+            filter: Without::new(self.filter),
+            marker: PhantomData,
+        }
+    }
+
+    /// 增加包含特定目标实体关系对 `(R, target)` 的行级硬边界过滤条件。
+    #[inline]
+    pub fn with_pair<R: ModelComponent + Serialize + DeserializeOwned + 'static>(
+        self,
+        target: EntityId,
+    ) -> QueryBuilder<Q, BusinessFilter<F, crate::al::Pair<R>>> {
+        self.filter::<crate::al::Pair<R>>(move |pair| pair.target == target)
+    }
+
+    /// 增加排除关系对 `Pair<R>` 的表级硬边界过滤条件。
+    #[inline]
+    pub fn without_pair<R: 'static>(self) -> QueryBuilder<Q, Without<crate::al::Pair<R>, F>> {
+        self.without::<crate::al::Pair<R>>()
+    }
+
+    /// 增加包含零大小静态标签 `Tag<N>` 的表级硬边界过滤条件。
+    #[inline]
+    pub fn with_tag<const N: u8>(self) -> QueryBuilder<Q, With<crate::al::Tag<N>, F>> {
+        self.with::<crate::al::Tag<N>>()
+    }
+
+    /// 增加排除零大小静态标签 `Tag<N>` 的表级硬边界过滤条件。
+    #[inline]
+    pub fn without_tag<const N: u8>(self) -> QueryBuilder<Q, Without<crate::al::Tag<N>, F>> {
+        self.without::<crate::al::Tag<N>>()
+    }
+
+    /// 增加基于组件特定字段相等性的硬边界过滤条件。
+    #[inline]
+    pub fn filter_eq<C: ModelComponent + Serialize + DeserializeOwned, Field: ComponentField<C>>(
+        self,
+        expected: Field::Value,
+    ) -> QueryBuilder<Q, FilterEq<F, C, Field>> {
+        QueryBuilder {
+            filter: FilterEq::new(self.filter, expected),
+            marker: PhantomData,
+        }
+    }
+
+    /// 增加基于受信任业务谓词闭包的行级过滤条件。
+    #[inline]
+    pub fn filter<C: ModelComponent + Serialize + DeserializeOwned>(
+        self,
+        predicate: impl Fn(&C) -> bool + Send + Sync + 'static,
+    ) -> QueryBuilder<Q, BusinessFilter<F, C>> {
+        QueryBuilder {
+            filter: BusinessFilter::new(self.filter, predicate),
+            marker: PhantomData,
+        }
+    }
+
+    /// 构建长期可复用的查询句柄，预计算匹配成功的 ArchetypeId 集合及物理列槽位偏移并绑定当前存储内核代际。
+    pub fn build(self, store: &Store) -> Result<Query<Q, F>, StateError> {
+        let (matched, bindings) = super::spec::match_bindings_for_query::<
+            Q,
+            F,
+            crate::storage::archetype::Archetype,
+        >(&store.archetypes, &self.filter)?;
+        let descriptors = std::sync::Arc::from(
+            super::spec::merged_access_descriptors::<Q, F>(&self.filter).into_boxed_slice(),
+        );
+        Ok(Query::new_with_bindings(
+            store.store_id(),
+            store.archetype_set_generation(),
+            std::sync::Arc::from(matched.into_boxed_slice()),
+            std::sync::Arc::from(bindings.into_boxed_slice()),
+            descriptors,
+            self.filter,
+        ))
+    }
+
+    /// 构建长期可复用的查询计划句柄（`build` 的同义方法）。
+    #[inline]
+    pub fn plan(self, store: &Store) -> Result<Query<Q, F>, StateError> {
+        self.build(store)
+    }
+}
+
+impl Store {
+    /// 创建面向持久化查询计划 `Query<Q, F>` 的流式构建器。
+    #[inline]
+    pub fn query_builder<Q: QueryMutShape>(&self) -> QueryBuilder<Q, All> {
+        QueryBuilder::new()
+    }
+}
+
+impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
+    /// 基于预编译的匹配原型表缓存与行级过滤器遍历只读元素。
+    pub fn for_each<'store>(
+        &self,
+        store: &'store Store,
+        f: impl FnMut(Q::Item<'store>),
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Item = Q::Item<'a>>,
+    {
+        self.with_matched_slice(store, |matched, _| {
+            super::spec::iter::for_each_matched_ro::<Q, F>(store, matched, &self.filter, f);
+            Ok(())
+        })
+    }
+
+    /// 基于预编译的匹配原型表缓存与行级过滤器遍历可变元素。
+    pub fn for_each_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl FnMut(Q::Item<'store>),
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let matched = self.with_matched_slice(store, |m, _| Ok(m.to_vec()))?;
+        store.bump_epoch();
+        super::spec::iter::for_each_matched_mut::<Q, F>(store, &matched, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于预编译的匹配原型表缓存遍历只读连续切片块（Level-2 预绑定极速路径）。
+    pub fn for_each_chunk<'store>(
+        &self,
+        store: &'store Store,
+        f: impl FnMut(Q::Chunk<'store>),
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
+    {
+        self.with_matched_slice(store, |matched, _| {
+            super::spec::iter::for_each_matched_chunk_ro::<Q>(store, matched, f);
+            Ok(())
+        })
+    }
+
+    /// 基于预编译的匹配原型表缓存遍历可变连续切片块（Level-2 预绑定极速路径）。
+    pub fn for_each_chunk_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl FnMut(Q::Chunk<'store>),
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let matched = self.with_matched_slice(store, |m, _| Ok(m.to_vec()))?;
+        store.bump_epoch();
+        super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &matched, f);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "handle_tests.rs"]
+mod tests;
