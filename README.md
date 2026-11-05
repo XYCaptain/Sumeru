@@ -1,4 +1,4 @@
-# SumerState
+# Sumeru
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024-orange.svg)](Cargo.toml)
@@ -6,7 +6,7 @@
 
 English | [简体中文](README_zh-CN.md)
 
-**SumerState is a high-performance contiguous columnar in-memory state engine written in Rust.** Built for large-scale simulations, digital twins, real-time games, and data-intensive stateful systems, it unifies expressive relational state modeling, deterministic transactional evolution, and a zero-copy columnar data foundation.
+**Sumeru is a high-performance contiguous columnar in-memory state engine written in Rust.** Built for large-scale simulations, digital twins, real-time games, and data-intensive stateful systems, it unifies expressive relational state modeling, deterministic transactional evolution, and a zero-copy columnar data foundation.
 
 ---
 
@@ -14,7 +14,7 @@ English | [简体中文](README_zh-CN.md)
 
 Traditional game frameworks (such as ECS) excel at fast frame-local loops but treat world state as ephemeral memory without strict storage contracts. Conversely, in-memory databases provide transactional rigor but lack the cache-coherent ergonomics and fine-grained throughput required by real-time simulations.
 
-Rather than being just an ECS container, SumerState elevates world state into a first-class **Columnar State Fabric**—combining entity-component cache locality and rich relational topology with transactional safety, deterministic time-travel snapshots, and zero-copy analytical interoperability.
+Rather than being just an ECS container, Sumeru elevates world state into a first-class **Columnar State Fabric**—combining entity-component cache locality and rich relational topology with transactional safety, deterministic time-travel snapshots, and zero-copy analytical interoperability.
 
 ## Highlights
 
@@ -31,12 +31,12 @@ Rather than being just an ECS container, SumerState elevates world state into a 
 
 ```toml
 [dependencies]
-sumer_state = { git = "https://github.com/xumi-lab/SumerState" }
+sumeru = { git = "https://github.com/xumi-lab/Sumeru" }
 ```
 
 ```rust
 use serde::{Deserialize, Serialize};
-use sumer_state::{Pair, QueryBuilder, Store};
+use sumeru::{Pair, QueryBuilder, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct Position { x: f32, y: f32 }
@@ -87,7 +87,7 @@ cargo test --example flecs
 ## Architecture
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="SumerState Architecture" width="100%" />
+  <img src="assets/architecture.svg" alt="Sumeru Architecture" width="100%" />
 </p>
 
 ---

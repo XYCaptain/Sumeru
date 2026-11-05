@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/reflection/reflection_nested_set_member.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/reflection_nested_set_member.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

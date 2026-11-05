@@ -1,4 +1,4 @@
-//! All 18 Flecs reflection examples implemented on `sumer_state::Store`.
+//! All 18 Flecs reflection examples implemented on `sumeru::Store`.
 
 pub mod entity_type;
 pub mod member_ranges;

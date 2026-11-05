@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/systems/system_custom_phases.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/systems/system_custom_phases.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

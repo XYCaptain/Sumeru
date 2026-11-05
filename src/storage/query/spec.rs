@@ -60,7 +60,7 @@ impl ArchetypeHeader for Archetype {
 ///
 /// ```compile_fail
 /// struct ExternalQuery;
-/// impl<'a> sumer_state::QueryData<'a> for ExternalQuery {
+/// impl<'a> sumeru::QueryData<'a> for ExternalQuery {
 ///     type Item = ();
 /// }
 /// ```
@@ -82,7 +82,7 @@ pub trait QueryData<'a>: sealed::Fetch<'a> {
 ///
 /// ```compile_fail
 /// struct ExternalMutQuery;
-/// impl<'a> sumer_state::QueryMutData<'a> for ExternalMutQuery {
+/// impl<'a> sumeru::QueryMutData<'a> for ExternalMutQuery {
 ///     type Item = ();
 ///     type Chunk = ();
 /// }

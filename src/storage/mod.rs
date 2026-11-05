@@ -1,4 +1,4 @@
-//! 连续列式存储内核与关系型 ECS 门面 (SumerState Storage Core)
+//! 连续列式存储内核与关系型 ECS 门面 (Sumeru Storage Core)
 //!
 //! # 访问契约
 //!
@@ -19,19 +19,19 @@
 //!
 //! 已删除的兼容查询入口不属于公共 API：
 //! ```compile_fail
-//! use sumer_state::Store;
+//! use sumeru::Store;
 //! let store = Store::new();
 //! let _ = store.select::<&u64>();
 //! ```
 //! ```compile_fail
-//! use sumer_state::Store;
+//! use sumeru::Store;
 //! let mut store = Store::new();
 //! let _ = store.select_mut::<&mut u64>();
 //! ```
 //!
 //! Physical backend types are deliberately not available to external callers.
 //! ```compile_fail
-//! use sumer_state::storage::{EntityAllocator, EntityLocation, AnyColumn, TypedColumn, Archetype};
+//! use sumeru::storage::{EntityAllocator, EntityLocation, AnyColumn, TypedColumn, Archetype};
 //! ```
 
 pub use crate::al as contracts;

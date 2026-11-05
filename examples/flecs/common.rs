@@ -1,15 +1,15 @@
-//! Shared helpers for the 85 Flecs-canonical examples implemented on `sumer_state::Store`.
+//! Shared helpers for the 85 Flecs-canonical examples implemented on `sumeru::Store`.
 //!
 //! All state storage, entity lifecycle, columnar queries, command buffers, relationships,
-//! change tracking, and snapshots execute directly on `sumer_state::Store`.
+//! change tracking, and snapshots execute directly on `sumeru::Store`.
 
 use std::cell::RefCell;
 
-pub use sumer_state::al::{
+pub use sumeru::al::{
     All, ColumnChunkProbe, CommandBufferAccess, Component, EntityCommandsAccess, EntityHandle,
     EntityMutAccess, EntityRefAccess, Pair, QueryFilter, StateSpace, Tag, With, Without,
 };
-pub use sumer_state::{
+pub use sumeru::{
     ArchetypeId, BatchReceipt, ColumnarStoreSnapshot, CommandBuffer, ComponentField,
     ComponentRegistration, ComponentSchema, ComponentTypeId, DomainTypeDefinition, DomainTypeId,
     DomainTypeKey, EntityCommands, EntityId, EntityMut, EntityRef, IntoEntity, ModelComponent,
@@ -63,7 +63,7 @@ macro_rules! elog {
     };
 }
 
-/// Standard entity name component stored directly inside `sumer_state::Store`.
+/// Standard entity name component stored directly inside `sumeru::Store`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EntityName(pub String);
 
@@ -97,7 +97,7 @@ pub struct Velocity {
     pub y: f32,
 }
 
-/// Ergonomic extension trait over `sumer_state::Store` for named entities and hierarchical paths.
+/// Ergonomic extension trait over `sumeru::Store` for named entities and hierarchical paths.
 pub trait StoreExampleExt {
     /// Spawns a new empty entity in `Store`.
     fn spawn_empty(&mut self) -> EntityId;

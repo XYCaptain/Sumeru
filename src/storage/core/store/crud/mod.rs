@@ -55,7 +55,7 @@ impl Store {
     ///
     /// A borrow cannot escape the modify closure:
     /// ```compile_fail
-    /// use sumer_state::{EntityId, Store};
+    /// use sumeru::{EntityId, Store};
     /// let mut store = Store::new();
     /// let id = EntityId::from_u128(1);
     /// let _ = store.modify::<u64, _>(id, |v| v);

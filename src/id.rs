@@ -1,6 +1,6 @@
 //! 稳定 ID、版本与代际键定义
 //!
-//! `sumer_state` 零内部依赖核心标识定义：包含 128 位稳定实体标识 [`EntityId`]、
+//! `sumeru` 零内部依赖核心标识定义：包含 128 位稳定实体标识 [`EntityId`]、
 //! 64 位局部物理槽位标识 [`LocalSlotId`]、16 位连续列标识 [`ColumnId`] 以及组件/领域类型标识。
 
 use serde::{Deserialize, Serialize};

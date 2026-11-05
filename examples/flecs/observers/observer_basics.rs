@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/observers/observer_basics.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/observers/observer_basics.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

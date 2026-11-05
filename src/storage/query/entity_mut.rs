@@ -5,7 +5,7 @@
 //!
 //! ```compile_fail
 //! // 负例 1：同一 Store 上无法同时存活两个独占可写句柄 EntityMut (E0499)
-//! use sumer_state::{Entity, EntityId, Store};
+//! use sumeru::{Entity, EntityId, Store};
 //! let mut store = Store::new();
 //! let id1 = EntityId::from_uuid(uuid::Uuid::new_v4());
 //! let id2 = EntityId::from_uuid(uuid::Uuid::new_v4());
@@ -18,7 +18,7 @@
 //!
 //! ```compile_fail
 //! // 负例 2：从 EntityMut 派生的组件引用与后续写操作冲突 (E0502)
-//! use sumer_state::{Store, EntityId, Entity};
+//! use sumeru::{Store, EntityId, Entity};
 //! #[derive(Clone, serde::Serialize, serde::Deserialize)]
 //! struct Pos(f64);
 //! let mut store = Store::new();
@@ -32,7 +32,7 @@
 //!
 //! ```compile_fail
 //! // 负例 3：从 EntityMut 派生的 EntityRef 只读视图与后续结构写冲突 (E0502)
-//! use sumer_state::{Store, EntityId, Entity};
+//! use sumeru::{Store, EntityId, Entity};
 //! #[derive(Clone, serde::Serialize, serde::Deserialize)]
 //! struct Pos(f64);
 //! let mut store = Store::new();

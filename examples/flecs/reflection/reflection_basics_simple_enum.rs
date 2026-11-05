@@ -1,8 +1,8 @@
-//! Port of `examples/flecs/reflection/reflection_basics_simple_enum.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/reflection_basics_simple_enum.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;
-use sumer_state::SchemaVersion;
+use sumeru::SchemaVersion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(C)]

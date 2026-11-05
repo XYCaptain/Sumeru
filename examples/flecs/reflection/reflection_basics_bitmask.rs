@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/reflection/reflection_basics_bitmask.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/reflection_basics_bitmask.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

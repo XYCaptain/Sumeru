@@ -1,8 +1,8 @@
-//! Port of `examples/flecs/reflection/reflection_basics.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/reflection_basics.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;
-use sumer_state::SchemaVersion;
+use sumeru::SchemaVersion;
 
 pub struct PosXField;
 pub struct PosYField;

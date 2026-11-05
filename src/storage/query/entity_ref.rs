@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 ///
 /// A borrowed component cannot outlive an intervening structural write:
 /// ```compile_fail
-/// use sumer_state::{EntityBundle, EntityId, Store};
+/// use sumeru::{EntityBundle, EntityId, Store};
 /// let mut store = Store::new();
 /// let id = EntityId::from_u128(1);
 /// store.create_entity(id, EntityBundle::new().with(1u64).unwrap()).unwrap();
@@ -227,7 +227,7 @@ impl<'a> ComponentRef<'a> {
 /// An external type cannot implement the sealed EntityData trait:
 /// ```compile_fail
 /// struct ExternalData;
-/// impl<'a> sumer_state::storage::EntityData<'a> for ExternalData {
+/// impl<'a> sumeru::storage::EntityData<'a> for ExternalData {
 ///     type Item = ();
 /// }
 /// ```

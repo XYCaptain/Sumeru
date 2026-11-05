@@ -40,7 +40,7 @@
 
   <!-- Title Header -->
   <text x="540" y="38" text-anchor="middle" fill="#F8FAFC" font-size="20" font-weight="700" letter-spacing="0.4">
-    SumerState — Contiguous Columnar State Fabric Architecture
+    Sumeru — Contiguous Columnar State Fabric Architecture
   </text>
   <text x="540" y="61" text-anchor="middle" fill="#94A3B8" font-size="12.5">
     Relational Topology · Level-2 Bound &amp; Bitmask-Jump Queries · In-Place Bit-Planes &amp; Chunk Dirty Tracking · Zero-Copy Columnar Fabric

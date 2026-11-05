@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/game_mechanics/inventory_system.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/game_mechanics/inventory_system.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

@@ -1,4 +1,4 @@
-# SumerState
+# Sumeru
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024-orange.svg)](Cargo.toml)
@@ -6,7 +6,7 @@
 
 [English](README.md) | 简体中文
 
-**SumerState 是一个基于 Rust 构建的高性能连续列式内存状态引擎。** 它专为大规模仿真、数字孪生、实时游戏与数据密集型系统设计，将高表达力的关系型实体状态建模、确定性事务演进与零拷贝列式数据底座融为一体。
+**Sumeru 是一个基于 Rust 构建的高性能连续列式内存状态引擎。** 它专为大规模仿真、数字孪生、实时游戏与数据密集型系统设计，将高表达力的关系型实体状态建模、确定性事务演进与零拷贝列式数据底座融为一体。
 
 ---
 
@@ -14,7 +14,7 @@
 
 传统的游戏框架（如 ECS）擅长极速的帧内遍历，但将世界状态局限于瞬态内存，缺乏严密的状态契约；而传统内存数据库具备严谨的事务与存储语义，却难以满足高频实时仿真的低延迟吞吐与细粒度演进需求。
 
-SumerState 不局限于单一的 ECS 容器，而是将复杂的世界状态升格为一等公民的**列式状态底座（Columnar State Fabric）**——在兼具实体组件级缓存局部性与关系图谱表达力的同时，让每一次状态跃迁都具备事务级安全性、时间回溯确定性与开放的分析生态互操作性。
+Sumeru 不局限于单一的 ECS 容器，而是将复杂的世界状态升格为一等公民的**列式状态底座（Columnar State Fabric）**——在兼具实体组件级缓存局部性与关系图谱表达力的同时，让每一次状态跃迁都具备事务级安全性、时间回溯确定性与开放的分析生态互操作性。
 
 ## 核心特性
 
@@ -31,12 +31,12 @@ SumerState 不局限于单一的 ECS 容器，而是将复杂的世界状态升�
 
 ```toml
 [dependencies]
-sumer_state = { git = "https://github.com/xumi-lab/SumerState" }
+sumeru = { git = "https://github.com/xumi-lab/Sumeru" }
 ```
 
 ```rust
 use serde::{Deserialize, Serialize};
-use sumer_state::{Pair, QueryBuilder, Store};
+use sumeru::{Pair, QueryBuilder, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct Position { x: f32, y: f32 }
@@ -87,7 +87,7 @@ cargo test --example flecs
 ## 架构概览
 
 <p align="center">
-  <img src="assets/architecture_zh.svg" alt="SumerState 架构概览" width="100%" />
+  <img src="assets/architecture_zh.svg" alt="Sumeru 架构概览" width="100%" />
 </p>
 
 ---

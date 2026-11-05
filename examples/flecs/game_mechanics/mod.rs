@@ -1,4 +1,4 @@
-//! Game mechanics examples implemented on `sumer_state::Store`.
+//! Game mechanics examples implemented on `sumeru::Store`.
 
 pub mod inventory_system;
 

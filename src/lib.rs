@@ -1,6 +1,6 @@
-//! # `sumer_state` (SumerState)
+//! # `sumeru` (Sumeru)
 //!
-//! **SumerState** — 高性能纯连续内存列式状态引擎与关系型 ECS 内核 (Open-Source Core Edition, MIT License)。
+//! **Sumeru** — 高性能纯连续内存列式状态引擎与关系型 ECS 内核 (Open-Source Core Edition, MIT License)。
 //!
 //! 公开导出：
 //! - 稳定标识与 Schema 元数据：[`id`]、[`schema`]、[`error`]、[`binding`]、[`context`]

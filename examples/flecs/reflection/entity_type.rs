@@ -1,8 +1,8 @@
-//! Port of `examples/flecs/reflection/entity_type.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/entity_type.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;
-use sumer_state::SchemaVersion;
+use sumeru::SchemaVersion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeWithEntity {

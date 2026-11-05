@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/reflection/reflection_ser_std_vector_custom_types.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/reflection/reflection_ser_std_vector_custom_types.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

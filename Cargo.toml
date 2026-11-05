@@ -1,11 +1,11 @@
 [package]
-name = "sumer_state"
+name = "sumeru"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/xumi-lab/SumerState"
-homepage = "https://github.com/xumi-lab/SumerState"
-description = "SumerState — High-Performance Contiguous Columnar In-Memory State Engine & Flecs-Style Relational ECS in Rust (with Zero-Copy Apache Arrow & rkyv)"
+repository = "https://github.com/xumi-lab/Sumeru"
+homepage = "https://github.com/xumi-lab/Sumeru"
+description = "Sumeru — High-Performance Contiguous Columnar In-Memory State Engine & Flecs-Style Relational ECS in Rust (with Zero-Copy Apache Arrow & rkyv)"
 keywords = ["ecs", "columnar", "arrow", "in-memory-database", "flecs"]
 categories = ["data-structures", "database-implementations", "game-development", "simulation"]
 

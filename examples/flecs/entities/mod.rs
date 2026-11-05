@@ -1,4 +1,4 @@
-//! Entity examples implemented on `sumer_state::Store`.
+//! Entity examples implemented on `sumeru::Store`.
 
 use crate::common::*;
 

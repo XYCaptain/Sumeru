@@ -220,8 +220,8 @@ unsafe impl<T: Sync> Send for ConstColumnPtr<T> {}
 /// the supertrait `sealed::QueryMutParamShapeInternal` is private to this crate:
 /// ```compile_fail,E0277
 /// struct ExternalParamShape;
-/// impl sumer_state::QueryMutParamShape for ExternalParamShape {
-///     fn component_type_id() -> sumer_state::ComponentTypeId { sumer_state::ComponentTypeId::of::<i32>() }
+/// impl sumeru::QueryMutParamShape for ExternalParamShape {
+///     fn component_type_id() -> sumeru::ComponentTypeId { sumeru::ComponentTypeId::of::<i32>() }
 ///     fn type_name() -> &'static str { "i32" }
 ///     fn is_write() -> bool { true }
 /// }

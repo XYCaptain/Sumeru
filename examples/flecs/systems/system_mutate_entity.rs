@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/systems/system_mutate_entity.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/systems/system_mutate_entity.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

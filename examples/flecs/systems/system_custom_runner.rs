@@ -1,4 +1,4 @@
-//! Port of `examples/flecs/systems/system_custom_runner.rs` using `sumer_state::Store`.
+//! Port of `examples/flecs/systems/system_custom_runner.rs` using `sumeru::Store`.
 
 use crate::common::*;
 use crate::elog;

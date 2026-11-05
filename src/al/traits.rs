@@ -1,10 +1,10 @@
 //! # StateFabric Abstraction Layer (AL) — Core Traits & GAT Contracts
 //!
-//! 抽象层直接将 `sumer_state` 的原生公开接口（`Store`、`EntityRef<'a>`、`EntityMut<'a>`、
+//! 抽象层直接将 `sumeru` 的原生公开接口（`Store`、`EntityRef<'a>`、`EntityMut<'a>`、
 //! `CommandBuffer`、`EntityCommands<'a>`、多维切片查询、并行块迭代与关系对 `Pair<R, E>`）
 //! 升格为标准 Trait + GAT 关联类型契约 [`StateSpace`]（别名 [`WorldEngine`]）。
 //!
-//! - 对于 `sumer_state::Store`，关联类型直接绑定其原生句柄类型，**零二次包装、零旁路钩子**；
+//! - 对于 `sumeru::Store`，关联类型直接绑定其原生句柄类型，**零二次包装、零旁路钩子**；
 //! - 对于外部对比引擎（如 `hecs`、`bevy_ecs`、`flecs`），通过本模块提供的通用轻量门面实现同一契约。
 
 use std::fmt::{Debug, Display};
@@ -143,7 +143,7 @@ impl<R, E> Pair<R, E> {
 // 1. 原生句柄门面契约 (EntityRefAccess / EntityMutAccess / CommandBufferAccess)
 // ============================================================================
 
-/// 单实体只读访问门面契约（直接对应 `sumer_state::EntityRef<'a>`）。
+/// 单实体只读访问门面契约（直接对应 `sumeru::EntityRef<'a>`）。
 pub trait EntityRefAccess<'a> {
     type Entity: EntityHandle;
     type Error: Debug + Display + Send + Sync + 'static;
@@ -161,7 +161,7 @@ pub trait EntityRefAccess<'a> {
     fn try_get<T: Component>(&self) -> Result<&'a T, Self::Error>;
 }
 
-/// 单实体独占可变访问门面契约（直接对应 `sumer_state::EntityMut<'a>`，支持链式与原位修改）。
+/// 单实体独占可变访问门面契约（直接对应 `sumeru::EntityMut<'a>`，支持链式与原位修改）。
 pub trait EntityMutAccess<'a>: Sized {
     type Entity: EntityHandle;
     type Error: Debug + Display + Send + Sync + 'static;
@@ -215,7 +215,7 @@ pub trait EntityMutAccess<'a>: Sized {
     }
 }
 
-/// 单实体延迟命令流式构建器契约（直接对应 `sumer_state::EntityCommands<'a>`）。
+/// 单实体延迟命令流式构建器契约（直接对应 `sumeru::EntityCommands<'a>`）。
 pub trait EntityCommandsAccess<'a>: Sized {
     type Entity: EntityHandle;
 
@@ -280,7 +280,7 @@ pub trait EntityCommandsAccess<'a>: Sized {
     }
 }
 
-/// 两阶段延迟命令缓冲契约（直接对应 `sumer_state::CommandBuffer`）。
+/// 两阶段延迟命令缓冲契约（直接对应 `sumeru::CommandBuffer`）。
 ///
 /// 第一阶段在 `&S` 只读借用或独立状态下录制命令，第二阶段通过 `apply_discard(&mut S)` 统一提交生效。
 pub trait CommandBufferAccess<S: ?Sized>: Sized {
@@ -580,7 +580,7 @@ impl<E: StateSpace> CommandBufferAccess<E> for GenericCommandBuffer<E> {
 // 3. Layer 1: StateSpace (WorldEngine) — 通用状态空间数据平面契约
 // ============================================================================
 
-/// 通用状态空间数据平面契约（直接对应 `sumer_state::Store` 的公开接口定义）。
+/// 通用状态空间数据平面契约（直接对应 `sumeru::Store` 的公开接口定义）。
 ///
 /// 严格区分：
 /// 1. **零开销快速探针路径（Fast-Path Probe，`Option<T>` / `bool`）**：
@@ -601,17 +601,17 @@ pub trait StateSpace: Send + Sync + 'static {
     /// 引擎错误类型。
     type Error: Debug + Display + Send + Sync + 'static;
 
-    /// 单实体只读视图（在 `Store` 上直接绑定为 `sumer_state::EntityRef<'a>`）。
+    /// 单实体只读视图（在 `Store` 上直接绑定为 `sumeru::EntityRef<'a>`）。
     type EntityRef<'a>: EntityRefAccess<'a, Entity = Self::Entity, Error = Self::Error>
     where
         Self: 'a;
 
-    /// 单实体独占可变视图（在 `Store` 上直接绑定为 `sumer_state::EntityMut<'a>`）。
+    /// 单实体独占可变视图（在 `Store` 上直接绑定为 `sumeru::EntityMut<'a>`）。
     type EntityMut<'a>: EntityMutAccess<'a, Entity = Self::Entity, Error = Self::Error>
     where
         Self: 'a;
 
-    /// 两阶段延迟命令缓冲（在 `Store` 上直接绑定为 `sumer_state::CommandBuffer`）。
+    /// 两阶段延迟命令缓冲（在 `Store` 上直接绑定为 `sumeru::CommandBuffer`）。
     type CommandBuffer: CommandBufferAccess<Self, Entity = Self::Entity, Error = Self::Error>;
 
     // ── 容量、存活状态与空间生命周期 ──────────────────────────────────────────

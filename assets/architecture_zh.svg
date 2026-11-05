@@ -40,7 +40,7 @@
 
   <!-- Title Header -->
   <text x="540" y="38" text-anchor="middle" fill="#F8FAFC" font-size="20" font-weight="700" letter-spacing="0.5">
-    SumerState — 连续列式内存状态底座架构 (Columnar State Fabric)
+    Sumeru — 连续列式内存状态底座架构 (Columnar State Fabric)
   </text>
   <text x="540" y="61" text-anchor="middle" fill="#94A3B8" font-size="12.5">
     关系型拓扑建模 · 二级预绑定与位图跳跃查询 · 原位状态位平面与块级脏追踪 · 两阶段事务与零拷贝列存底座

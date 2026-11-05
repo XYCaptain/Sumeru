@@ -5,13 +5,13 @@
 //!
 //! ```compile_fail
 //! // CommandBuffer::new is crate-private
-//! use sumer_state::CommandBuffer;
+//! use sumeru::CommandBuffer;
 //! let _ = CommandBuffer::new(1, 1);
 //! ```
 //!
 //! ```compile_fail
 //! // CommandBuffer::into_batch is crate-private
-//! use sumer_state::Store;
+//! use sumeru::Store;
 //! let store = Store::new();
 //! let cmd = store.commands();
 //! let _ = cmd.into_batch();
@@ -19,18 +19,18 @@
 //!
 //! Homogeneous recording is a CommandBuffer operation, not another public batch.
 //! ```compile_fail
-//! use sumer_state::UpdateBatch;
+//! use sumeru::UpdateBatch;
 //! ```
 //! ```compile_fail
-//! let store = sumer_state::Store::new();
+//! let store = sumeru::Store::new();
 //! let _ = store.update_batch::<u64>();
 //! ```
 //! ```compile_fail
-//! let mut store = sumer_state::Store::new();
+//! let mut store = sumeru::Store::new();
 //! let _ = store.update_many::<u64>([]);
 //! ```
 //! ```compile_fail
-//! let mut store = sumer_state::Store::new();
+//! let mut store = sumeru::Store::new();
 //! let _ = store.modify_batch::<u64>([], |_, _| {});
 //! ```
 //!

@@ -1,6 +1,6 @@
 //! # StateFabric Abstraction Layer (AL) — Zero-Cost Native `Store` Implementation
 //!
-//! `sumer_state::Store` 直接实现 `StateSpace`（`WorldEngine`），且其 GAT 关联类型直接绑定为原生句柄：
+//! `sumeru::Store` 直接实现 `StateSpace`（`WorldEngine`），且其 GAT 关联类型直接绑定为原生句柄：
 //! - `type EntityRef<'a> = crate::EntityRef<'a>;`
 //! - `type EntityMut<'a> = crate::EntityMut<'a>;`
 //! - `type CommandBuffer = crate::CommandBuffer;`
