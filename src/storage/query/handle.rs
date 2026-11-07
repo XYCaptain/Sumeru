@@ -665,6 +665,203 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &bindings, f);
         Ok(())
     }
+
+    /// 基于预编译的匹配原型缓存执行两阶段原子 16KB 页对齐零拷贝 GPU 内核派发（使用线程本地默认计算引擎）。
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_for_each<K>(&self, store: &mut Store, kernel: K) -> Result<crate::storage::gpu::GpuDispatchStats, StateError>
+    where
+        Q: super::spec::QueryMutData<'static>,
+        K: crate::storage::gpu::GpuKernel<'static, Query = Q>,
+    {
+        thread_local! {
+            static DEFAULT_QUERY_METAL_ENGINE: std::cell::RefCell<crate::storage::gpu::MetalComputeEngine> =
+                std::cell::RefCell::new(crate::storage::gpu::MetalComputeEngine::new());
+        }
+        DEFAULT_QUERY_METAL_ENGINE.with(|cell| {
+            let mut engine = cell.borrow_mut();
+            self.gpu_for_each_on(store, &mut engine, kernel)
+        })
+    }
+
+    /// 基于预编译的匹配原型缓存在指定 [`MetalComputeEngine`](crate::storage::gpu::MetalComputeEngine) 上执行两阶段原子 16KB 页对齐零拷贝 GPU 派发。
+    ///
+    /// - **阶段 0**：拦截行级 CPU 谓词过滤器，校验 `Store` 归属与内核管线编译；
+    /// - **阶段 1a**：对缓存命中的非空 Archetype 执行纯只读列完整性与容量溢出校验（失败时零副作用）；
+    /// - **阶段 1b**：对匹配 Archetype 按需提升为 16KB 页对齐、执行可变列 COW 独占分离并生成零拷贝描述符；
+    /// - **阶段 2**：统一提交硬件/回退计算派发并推进 Store 与写入列的 64 行块纪元。
+    #[cfg(feature = "gpu")]
+    pub fn gpu_for_each_on<K>(
+        &self,
+        store: &mut Store,
+        engine: &mut crate::storage::gpu::MetalComputeEngine,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError>
+    where
+        Q: super::spec::QueryMutData<'static>,
+        K: crate::storage::gpu::GpuKernel<'static, Query = Q>,
+    {
+        if F::IS_ROW_FILTERED {
+            return Err(StateError::AccessDenied(
+                "GPU whole-column dispatch does not support row-level CPU predicate filters; use archetype filters (.with / .without)".into(),
+            ));
+        }
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        <Q as super::spec::QueryMutData<'static>>::validate_query();
+        let write_epoch = store.next_epoch()?;
+        let matched = self.with_matched_slice(store, |_, _| Ok(self.matched_archetypes_arc()))?;
+
+        let desc = kernel.descriptor();
+        engine.ensure_pipeline_compiled(desc)?;
+
+        struct PreparedQueryArchDispatch {
+            arch_idx: usize,
+            arch_id: ArchetypeId,
+            active_rows: usize,
+            pages_16k: usize,
+            raw_bindings: Vec<(ComponentTypeId, crate::storage::gpu::MetalNoCopyBufferDescriptor)>,
+        }
+
+        // 阶段 1a：纯只读预校验（确保任意 Archetype 异常时绝不产生半途提升、COW 解冻或纪元推进副作用）
+        let mut valid_arch_indices = Vec::with_capacity(matched.len());
+        for &arch_id in matched.iter() {
+            let arch_idx = arch_id.0 as usize;
+            let Some(archetype) = store.archetypes.get(arch_idx) else {
+                continue;
+            };
+            let active_rows = archetype.len();
+            if active_rows == 0 || !self.filter.matches_archetype(archetype) {
+                continue;
+            }
+            let comp_slice = archetype.component_types_slice();
+            if !desc
+                .bindings()
+                .iter()
+                .all(|b| comp_slice.binary_search(&b.type_id).is_ok())
+            {
+                continue;
+            }
+            let cols = archetype.columns();
+            for b in desc.bindings() {
+                let col = cols.get(&b.type_id).ok_or_else(|| {
+                    StateError::ComponentNotFound(format!("{}", b.type_id))
+                })?;
+                if col.len() != active_rows {
+                    return Err(StateError::AccessDenied(format!(
+                        "Column {} length {} does not match archetype {} active_rows {}",
+                        b.struct_name,
+                        col.len(),
+                        arch_id.0,
+                        active_rows
+                    )));
+                }
+                let _active_bytes = active_rows.checked_mul(b.elem_size).ok_or_else(|| {
+                    StateError::CapacityExhausted("GPU column active byte size overflow".into())
+                })?;
+            }
+            valid_arch_indices.push(arch_idx);
+        }
+
+        // 阶段 1b：16KB 页对齐按需提升、COW 独占分离与零拷贝描述符构造
+        let mut prepared = Vec::with_capacity(valid_arch_indices.len());
+        for arch_idx in valid_arch_indices {
+            let archetype = &mut store.archetypes[arch_idx];
+            let active_rows = archetype.len();
+            let arch_id = archetype.id();
+            let mut changed_any = false;
+            for b in desc.bindings() {
+                let needs_promote = archetype
+                    .columns()
+                    .get(&b.type_id)
+                    .is_some_and(|col| !col.is_page_aligned());
+                if needs_promote || b.mutable {
+                    let col = archetype
+                        .get_erased_column_mut(b.type_id)
+                        .expect("verified in Phase 1a");
+                    if needs_promote {
+                        col.promote_to_page_aligned();
+                    }
+                    if b.mutable {
+                        col.ensure_contiguous()?;
+                    }
+                    changed_any = true;
+                }
+            }
+            if changed_any {
+                archetype.rebuild_flat_columns();
+            }
+
+            let mut raw_bindings = Vec::with_capacity(desc.bindings().len());
+            let mut arch_pages = 0usize;
+            {
+                let cols = archetype.columns();
+                for b in desc.bindings() {
+                    let col = cols.get(&b.type_id).expect("verified in Phase 1a");
+                    let (ptr, allocated_bytes) = col.metal_raw_parts().ok_or_else(|| {
+                        StateError::AccessDenied(format!(
+                            "Column {} in archetype {} is not backed by a 16KB PageAlignedBuffer",
+                            b.struct_name, arch_id.0
+                        ))
+                    })?;
+                    let generation = col.physical_version();
+                    let active_bytes = active_rows * b.elem_size;
+                    let buf_desc =
+                        crate::storage::gpu::MetalNoCopyBufferDescriptor::validate_raw(
+                            ptr,
+                            allocated_bytes,
+                            active_bytes,
+                            generation,
+                        )?;
+                    let geom = crate::storage::gpu::PageGeometry::compute(
+                        b.elem_size,
+                        active_rows,
+                        allocated_bytes,
+                    );
+                    arch_pages += geom.page_count;
+                    raw_bindings.push((b.type_id, buf_desc));
+                }
+            }
+
+            prepared.push(PreparedQueryArchDispatch {
+                arch_idx,
+                arch_id,
+                active_rows,
+                pages_16k: arch_pages,
+                raw_bindings,
+            });
+        }
+
+        // 阶段 2：推进 Store 全局纪元，执行派发并标记写入列的 64 行块纪元
+        store.bump_epoch();
+        let mut stats = crate::storage::gpu::GpuDispatchStats {
+            execution_mode: engine.execution_mode(),
+            ..Default::default()
+        };
+        for item in prepared {
+            let (_grid, hits, misses) = unsafe {
+                engine.dispatch_archetype_raw(
+                    item.arch_id,
+                    item.active_rows,
+                    desc,
+                    &item.raw_bindings,
+                )?
+            };
+            let archetype = &mut store.archetypes[item.arch_idx];
+            <Q as super::spec::sealed::FetchMut<'static>>::mark_written_columns(
+                archetype,
+                None,
+                write_epoch,
+            );
+            stats.dispatched_archetypes += 1;
+            stats.total_rows += item.active_rows;
+            stats.total_pages_16k += item.pages_16k;
+            stats.buffer_cache_hits += hits;
+            stats.buffer_cache_misses += misses;
+        }
+
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]

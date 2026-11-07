@@ -14,12 +14,14 @@
 //!    - `.par_for_each(...)` / `.par().for_each(...)`（CPU 多核 Rayon 并行执行）
 //!    - `.gpu().for_each(...)`（GPU 硬件 16KB 页对齐零拷贝派发）
 
+pub mod ir;
 pub mod kernel;
 pub mod metal;
 
 #[cfg(test)]
 mod tests;
 
+pub use ir::*;
 pub use kernel::*;
 pub use metal::*;
 

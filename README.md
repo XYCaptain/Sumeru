@@ -75,11 +75,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Running the Examples
 
-Explore 85 self-contained state and relational modeling examples under [`examples/flecs`](examples/flecs):
+Explore 85 self-contained state and relational modeling examples under [`examples/flecs`](examples/flecs), as well as 13 16KB page-aligned zero-copy GPU compute & Typed Shader IR examples under [`examples/gpu`](examples/gpu):
 
 ```bash
+# Relational ECS & state modeling examples (85 scenarios)
 cargo run --example flecs
 cargo test --example flecs
+
+# 16KB page-aligned zero-copy GPU compute & three-tier execution examples (13 scenarios)
+cargo run --example gpu --features gpu
+cargo test --example gpu --features gpu
 ```
 
 ---

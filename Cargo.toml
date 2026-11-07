@@ -36,3 +36,8 @@ uuid = { version = "1.23", features = ["v4", "v5", "serde"] }
 [[example]]
 name = "flecs"
 path = "examples/flecs/main.rs"
+
+[[example]]
+name = "gpu"
+path = "examples/gpu/main.rs"
+required-features = ["gpu"]

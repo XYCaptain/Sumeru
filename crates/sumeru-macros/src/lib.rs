@@ -1,7 +1,8 @@
 //! Procedural macros for Sumeru 16KB page-aligned GPU compute (`#[gpu]`, `#[gpu_component]`, `#[gpu_kernel]`).
 //!
-//! Uses `syn` AST parsing and strict shader subset validation to translate Rust kernel bodies
-//! into Apple Metal Shading Language (MSL) and WebGPU Shading Language (WGSL) at compile time.
+//! Lowers Rust `syn` AST into Sumeru's target-independent Typed Shader IR (`GpuBlock` / `GpuStmt` / `GpuExpr`)
+//! with lexical scope tracking, compile-time `const` evaluation (`GpuConstValue`), and composable `#[gpu]`
+//! pure helper functions (`GpuHelperFnDescriptor`).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -15,11 +16,10 @@ use syn::{
 ///
 /// - When placed on a `struct`, expands to a `#[repr(C)]` Pod/Zeroable GPU component with
 ///   automatic `GpuComponent` and `GpuShaderStruct` (MSL + WGSL) implementations.
-/// - When placed on a `fn`, validates the Rust AST against the GPU compute subset and expands to a
-///   dual-target operator that can be:
-///   1. Called directly in Rust or inside `.for_each(|(a, b)| ...)` / `.par_for_each(|(a, b)| ...)`,
-///   2. Passed directly to `.run(op)` or `.par_run(op)` / `.par().run(op)`,
-///   3. Dispatched to GPU via `.gpu().for_each(op)?` or `.gpu().run(op)?`.
+/// - When placed on a `fn` with `&T` / `&mut T` component parameters, lowers the Rust AST into
+///   a Typed Shader IR (`GpuBlock`) and expands to a three-tier operator (`run`, `par_run`, `gpu().for_each`).
+/// - When placed on a pure scalar `fn(f32, ...) -> f32`, expands to a composable `#[gpu]` device helper
+///   function that can be called both on CPU and from inside other `#[gpu]` kernels/helpers.
 #[proc_macro_attribute]
 pub fn gpu(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_gpu_item(attr.into(), item.into()).into()
@@ -207,42 +207,42 @@ struct ParsedKernelParam {
     elem_ty: Type,
 }
 
-fn expand_gpu_fn_impl(
-    attr: TokenStream2,
-    item: TokenStream2,
-    same_name_callable: bool,
-) -> syn::Result<TokenStream2> {
-    let item_fn: ItemFn = syn::parse2(item)?;
-    let sig = &item_fn.sig;
+struct ParsedHelperParam {
+    ident: Ident,
+    is_mut: bool,
+    ty: Type,
+    kind_tokens: TokenStream2,
+}
 
+fn validate_fn_common_signature(sig: &syn::Signature) -> syn::Result<()> {
     if let Some(async_kw) = &sig.asyncness {
         return Err(Error::new_spanned(
             async_kw,
-            "`#[gpu]` kernel functions cannot be `async`",
+            "`#[gpu]` functions cannot be `async`",
         ));
     }
     if let Some(const_kw) = &sig.constness {
         return Err(Error::new_spanned(
             const_kw,
-            "`#[gpu]` kernel functions cannot be `const`",
+            "`#[gpu]` functions cannot be `const`",
         ));
     }
     if let Some(unsafe_kw) = &sig.unsafety {
         return Err(Error::new_spanned(
             unsafe_kw,
-            "`#[gpu]` kernel functions cannot be `unsafe`",
+            "`#[gpu]` functions cannot be `unsafe`",
         ));
     }
     if let Some(abi) = &sig.abi {
         return Err(Error::new_spanned(
             abi,
-            "`#[gpu]` kernel functions cannot have an `extern` ABI",
+            "`#[gpu]` functions cannot have an `extern` ABI",
         ));
     }
     if let Some(variadic) = &sig.variadic {
         return Err(Error::new_spanned(
             variadic,
-            "`#[gpu]` kernel functions cannot be variadic",
+            "`#[gpu]` functions cannot be variadic",
         ));
     }
     for param in &sig.generics.params {
@@ -251,13 +251,13 @@ fn expand_gpu_fn_impl(
             GenericParam::Type(tp) => {
                 return Err(Error::new_spanned(
                     tp,
-                    "`#[gpu]` kernel functions cannot have generic type parameters",
+                    "`#[gpu]` functions cannot have generic type parameters",
                 ));
             }
             GenericParam::Const(cp) => {
                 return Err(Error::new_spanned(
                     cp,
-                    "`#[gpu]` kernel functions cannot have const generic parameters",
+                    "`#[gpu]` functions cannot have const generic parameters",
                 ));
             }
         }
@@ -265,14 +265,31 @@ fn expand_gpu_fn_impl(
     if let Some(where_clause) = &sig.generics.where_clause {
         return Err(Error::new_spanned(
             where_clause,
-            "`#[gpu]` kernel functions cannot have a `where` clause",
+            "`#[gpu]` functions cannot have a `where` clause",
         ));
     }
+    Ok(())
+}
+
+fn expand_gpu_fn_impl(
+    attr: TokenStream2,
+    item: TokenStream2,
+    same_name_callable: bool,
+) -> syn::Result<TokenStream2> {
+    let item_fn: ItemFn = syn::parse2(item)?;
+    let sig = &item_fn.sig;
+    validate_fn_common_signature(sig)?;
+
+    // Determine whether this is a pure scalar helper function (`fn(f32, ...) -> f32`)
+    // or a component kernel function (`fn(&mut CompA, &CompB)`).
     if let ReturnType::Type(_, ret_ty) = &sig.output {
-        return Err(Error::new_spanned(
-            ret_ty,
-            "`#[gpu]` kernel functions must not have a return type",
-        ));
+        if !same_name_callable || !attr.is_empty() {
+            return Err(Error::new_spanned(
+                ret_ty,
+                "`#[gpu_kernel]` entry points must not have a return type; use `#[gpu]` for composable scalar helper functions",
+            ));
+        }
+        return expand_gpu_helper_fn_impl(&item_fn, ret_ty);
     }
 
     let mut params = Vec::new();
@@ -322,16 +339,9 @@ fn expand_gpu_fn_impl(
         ));
     }
 
-    let mut_params: Vec<String> = params
-        .iter()
-        .filter(|p| p.is_mut)
-        .map(|p| p.ident.to_string())
-        .collect();
-
-    let msl_body = ShaderTranslator::new(ShaderTarget::Msl, &mut_params)
-        .translate_block(&item_fn.block)?;
-    let wgsl_body = ShaderTranslator::new(ShaderTarget::Wgsl, &mut_params)
-        .translate_block(&item_fn.block)?;
+    let root_names: Vec<String> = params.iter().map(|p| p.ident.to_string()).collect();
+    let mut ir_builder = IrAstBuilder::new(root_names, false);
+    let ir_block = ir_builder.lower_block(&item_fn.block)?;
 
     let attrs = &item_fn.attrs;
     let vis = &item_fn.vis;
@@ -358,11 +368,10 @@ fn expand_gpu_fn_impl(
         }
         Ok(quote! {
             ::sumeru::sumeru_gpu_fn! {
-                @translated
+                @ir
                 #(#attrs)*
                 #vis fn #fn_name ( #(#param_tokens),* )
-                msl = #msl_body,
-                wgsl = #wgsl_body,
+                ir = #ir_block,
                 body = { #(#stmts)* }
             }
         })
@@ -370,45 +379,232 @@ fn expand_gpu_fn_impl(
         let custom_ident: Ident = syn::parse2(attr)?;
         Ok(quote! {
             ::sumeru::sumeru_gpu_kernel! {
-                @translated
+                @ir
                 #(#attrs)*
                 #vis kernel #custom_ident fn #fn_name ( #(#param_tokens),* )
-                msl = #msl_body,
-                wgsl = #wgsl_body,
+                ir = #ir_block,
                 body = { #(#stmts)* }
             }
         })
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ShaderTarget {
-    Msl,
-    Wgsl,
-}
+fn expand_gpu_helper_fn_impl(item_fn: &ItemFn, ret_ty: &Type) -> syn::Result<TokenStream2> {
+    let sig = &item_fn.sig;
+    let ret_kind = parse_scalar_kind_tokens(ret_ty)?;
 
-struct ShaderTranslator<'a> {
-    target: ShaderTarget,
-    mut_params: &'a [String],
-}
-
-impl<'a> ShaderTranslator<'a> {
-    fn new(target: ShaderTarget, mut_params: &'a [String]) -> Self {
-        Self { target, mut_params }
-    }
-
-    fn translate_block(&self, block: &Block) -> syn::Result<String> {
-        let mut out = String::new();
-        for (idx, stmt) in block.stmts.iter().enumerate() {
-            if idx > 0 {
-                out.push(' ');
-            }
-            out.push_str(&self.translate_stmt(stmt)?);
+    let mut params = Vec::new();
+    for arg in &sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            return Err(Error::new_spanned(
+                arg,
+                "`#[gpu]` helper functions cannot take `self`",
+            ));
+        };
+        let Pat::Ident(pat_ident) = &*pat_type.pat else {
+            return Err(Error::new_spanned(
+                &pat_type.pat,
+                "`#[gpu]` helper parameter pattern must be a simple identifier",
+            ));
+        };
+        let pname = pat_ident.ident.to_string();
+        if pname.starts_with("__") || pname.starts_with("sumeru_") {
+            return Err(Error::new_spanned(
+                &pat_ident.ident,
+                "`#[gpu]` parameter name cannot start with reserved prefix `__` or `sumeru_`",
+            ));
         }
-        Ok(out)
+        if matches!(&*pat_type.ty, Type::Reference(_)) {
+            return Err(Error::new_spanned(
+                &pat_type.ty,
+                format!(
+                    "`#[gpu]` function with return type cannot take component reference `{pname}`; component kernels must not return a value, and pure helper functions must take scalar values (`f32`, `i32`, `u32`, `usize`, `bool`)"
+                ),
+            ));
+        }
+        let kind_tokens = parse_scalar_kind_tokens(&pat_type.ty)?;
+        params.push(ParsedHelperParam {
+            ident: pat_ident.ident.clone(),
+            is_mut: pat_ident.mutability.is_some(),
+            ty: (*pat_type.ty).clone(),
+            kind_tokens,
+        });
     }
 
-    fn translate_stmt(&self, stmt: &Stmt) -> syn::Result<String> {
+    if params.is_empty() || params.len() > 8 {
+        return Err(Error::new_spanned(
+            &sig.inputs,
+            "`#[gpu]` pure helper functions must have between 1 and 8 scalar parameters",
+        ));
+    }
+
+    let root_names: Vec<String> = params.iter().map(|p| p.ident.to_string()).collect();
+    let mut ir_builder = IrAstBuilder::new(root_names, true);
+    let ir_block = ir_builder.lower_block_with_tail_return(&item_fn.block)?;
+
+    let attrs = &item_fn.attrs;
+    let vis = &item_fn.vis;
+    let fn_name = &sig.ident;
+    let stmts = &item_fn.block.stmts;
+
+    let param_tokens = params.iter().map(|p| {
+        let ident = &p.ident;
+        let mode = if p.is_mut {
+            Ident::new("mut", ident.span())
+        } else {
+            Ident::new("ref", ident.span())
+        };
+        let ty = &p.ty;
+        let kind = &p.kind_tokens;
+        quote! { #ident : [#mode] #ty => #kind }
+    });
+
+    Ok(quote! {
+        ::sumeru::sumeru_gpu_helper_fn! {
+            #(#attrs)*
+            #vis fn #fn_name ( #(#param_tokens),* ) -> #ret_ty => #ret_kind,
+            ir = #ir_block,
+            body = { #(#stmts)* }
+        }
+    })
+}
+
+fn parse_scalar_kind_tokens(ty: &Type) -> syn::Result<TokenStream2> {
+    let s = ty.to_token_stream().to_string();
+    match s.trim() {
+        "f32" => Ok(quote! { ::sumeru::GpuScalarKind::F32 }),
+        "i32" => Ok(quote! { ::sumeru::GpuScalarKind::I32 }),
+        "u32" | "usize" => Ok(quote! { ::sumeru::GpuScalarKind::U32 }),
+        "bool" => Ok(quote! { ::sumeru::GpuScalarKind::Bool }),
+        _ => Err(Error::new_spanned(
+            ty,
+            format!(
+                "type `{s}` is not supported in `#[gpu]` scalar annotations/casts/helpers; use `f32`, `i32`, `u32`, `usize`, or `bool`"
+            ),
+        )),
+    }
+}
+
+/// Lexical-scope-aware AST-to-Typed-Shader-IR builder.
+struct IrAstBuilder {
+    scopes: Vec<Vec<String>>,
+    is_helper_fn: bool,
+}
+
+impl IrAstBuilder {
+    fn new(root_params: Vec<String>, is_helper_fn: bool) -> Self {
+        Self {
+            scopes: vec![root_params],
+            is_helper_fn,
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare_local(&mut self, name: String) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.push(name);
+        }
+    }
+
+    fn is_in_local_scope(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|s| s.iter().any(|v| v == name))
+    }
+
+    fn lower_block(&mut self, block: &Block) -> syn::Result<TokenStream2> {
+        self.push_scope();
+        let mut stmt_tokens = Vec::with_capacity(block.stmts.len());
+        for stmt in &block.stmts {
+            stmt_tokens.push(self.lower_stmt(stmt)?);
+        }
+        self.pop_scope();
+        Ok(quote! {
+            ::sumeru::GpuBlock::new(::std::vec![ #(#stmt_tokens),* ])
+        })
+    }
+
+    fn lower_block_with_tail_return(&mut self, block: &Block) -> syn::Result<TokenStream2> {
+        self.push_scope();
+        let mut stmt_tokens = Vec::with_capacity(block.stmts.len());
+        let len = block.stmts.len();
+        for (idx, stmt) in block.stmts.iter().enumerate() {
+            if idx + 1 == len {
+                stmt_tokens.push(self.lower_tail_stmt(stmt)?);
+            } else {
+                stmt_tokens.push(self.lower_stmt(stmt)?);
+            }
+        }
+        self.pop_scope();
+        Ok(quote! {
+            ::sumeru::GpuBlock::new(::std::vec![ #(#stmt_tokens),* ])
+        })
+    }
+
+    fn lower_tail_stmt(&mut self, stmt: &Stmt) -> syn::Result<TokenStream2> {
+        match stmt {
+            Stmt::Expr(expr, None) => self.lower_tail_expr(expr),
+            _ => self.lower_stmt(stmt),
+        }
+    }
+
+    fn lower_tail_expr(&mut self, expr: &Expr) -> syn::Result<TokenStream2> {
+        match expr {
+            Expr::Return(_) => self.lower_stmt_expr(expr, true),
+            Expr::If(expr_if) => {
+                let cond = self.lower_expr(&expr_if.cond)?;
+                let then_block = self.lower_block_with_tail_return(&expr_if.then_branch)?;
+                let else_tokens = if let Some((_, else_expr)) = &expr_if.else_branch {
+                    match &**else_expr {
+                        Expr::If(_) => {
+                            let elif = self.lower_tail_expr(else_expr)?;
+                            quote! { ::std::option::Option::Some(::sumeru::GpuElseBranch::ElseIf(::std::boxed::Box::new(#elif))) }
+                        }
+                        Expr::Block(eb) => {
+                            let eblock = self.lower_block_with_tail_return(&eb.block)?;
+                            quote! { ::std::option::Option::Some(::sumeru::GpuElseBranch::ElseBlock(#eblock)) }
+                        }
+                        other => {
+                            return Err(Error::new_spanned(
+                                other,
+                                "unsupported `else` branch in `#[gpu]` function",
+                            ));
+                        }
+                    }
+                } else {
+                    quote! { ::std::option::Option::None }
+                };
+                Ok(quote! {
+                    ::sumeru::GpuStmt::If {
+                        cond: #cond,
+                        then_block: #then_block,
+                        else_branch: #else_tokens,
+                    }
+                })
+            }
+            Expr::Block(eb) => {
+                if eb.label.is_some() {
+                    return Err(Error::new_spanned(
+                        &eb.label,
+                        "labeled blocks are not supported in `#[gpu]` functions",
+                    ));
+                }
+                let inner = self.lower_block_with_tail_return(&eb.block)?;
+                Ok(quote! { ::sumeru::GpuStmt::Block(#inner) })
+            }
+            other => {
+                let val = self.lower_expr(other)?;
+                Ok(quote! { ::sumeru::GpuStmt::Return(::std::option::Option::Some(#val)) })
+            }
+        }
+    }
+
+    fn lower_stmt(&mut self, stmt: &Stmt) -> syn::Result<TokenStream2> {
         match stmt {
             Stmt::Local(local) => {
                 let Some(init) = &local.init else {
@@ -432,8 +628,8 @@ impl<'a> ShaderTranslator<'a> {
                                 "unsupported pattern in `#[gpu]` local variable declaration",
                             ));
                         };
-                        let ty_str = self.translate_scalar_type(&pt.ty)?;
-                        (&pi.ident, pi.mutability.is_some(), Some(ty_str))
+                        let kind_tokens = parse_scalar_kind_tokens(&pt.ty)?;
+                        (&pi.ident, pi.mutability.is_some(), Some(kind_tokens))
                     }
                     other => {
                         return Err(Error::new_spanned(
@@ -449,62 +645,90 @@ impl<'a> ShaderTranslator<'a> {
                         "local variable name in `#[gpu]` kernel cannot start with `__` or `sumeru_`",
                     ));
                 }
-                let rhs = self.translate_expr(&init.expr)?;
-                match (self.target, is_mut, explicit_ty) {
-                    (ShaderTarget::Msl, true, Some(ty)) => Ok(format!("{ty} {vname} = {rhs};")),
-                    (ShaderTarget::Msl, false, Some(ty)) => {
-                        Ok(format!("const {ty} {vname} = {rhs};"))
+                let rhs = self.lower_expr(&init.expr)?;
+                self.declare_local(vname.clone());
+                let explicit_ty_tokens = match explicit_ty {
+                    Some(k) => quote! { ::std::option::Option::Some(#k) },
+                    None => quote! { ::std::option::Option::None },
+                };
+                Ok(quote! {
+                    ::sumeru::GpuStmt::Let {
+                        name: #vname,
+                        mutable: #is_mut,
+                        explicit_ty: #explicit_ty_tokens,
+                        init: #rhs,
                     }
-                    (ShaderTarget::Msl, true, None) => Ok(format!("auto {vname} = {rhs};")),
-                    (ShaderTarget::Msl, false, None) => Ok(format!("const auto {vname} = {rhs};")),
-                    (ShaderTarget::Wgsl, true, Some(ty)) => {
-                        Ok(format!("var {vname}: {ty} = {rhs};"))
-                    }
-                    (ShaderTarget::Wgsl, false, Some(ty)) => {
-                        Ok(format!("let {vname}: {ty} = {rhs};"))
-                    }
-                    (ShaderTarget::Wgsl, true, None) => Ok(format!("var {vname} = {rhs};")),
-                    (ShaderTarget::Wgsl, false, None) => Ok(format!("let {vname} = {rhs};")),
+                })
+            }
+            Stmt::Item(Item::Const(item_const)) => {
+                let vname = item_const.ident.to_string();
+                if vname.starts_with("__") || vname.starts_with("sumeru_") {
+                    return Err(Error::new_spanned(
+                        &item_const.ident,
+                        "const name in `#[gpu]` kernel cannot start with `__` or `sumeru_`",
+                    ));
                 }
+                let kind_tokens = parse_scalar_kind_tokens(&item_const.ty)?;
+                let rhs = self.lower_expr(&item_const.expr)?;
+                self.declare_local(vname.clone());
+                Ok(quote! {
+                    ::sumeru::GpuStmt::Let {
+                        name: #vname,
+                        mutable: false,
+                        explicit_ty: ::std::option::Option::Some(#kind_tokens),
+                        init: #rhs,
+                    }
+                })
             }
             Stmt::Item(item) => Err(Error::new_spanned(
                 item,
-                "nested item declarations are not supported in `#[gpu]` kernels",
+                "nested item declarations (other than scalar `const`) are not supported in `#[gpu]` kernels",
             )),
             Stmt::Macro(mac) => Err(Error::new_spanned(
                 mac,
                 "macros are not supported inside `#[gpu]` kernel bodies",
             )),
-            Stmt::Expr(expr, semi) => self.translate_stmt_expr(expr, semi.is_some()),
+            Stmt::Expr(expr, semi) => self.lower_stmt_expr(expr, semi.is_some()),
         }
     }
 
-    fn translate_stmt_expr(&self, expr: &Expr, has_semi: bool) -> syn::Result<String> {
+    fn lower_stmt_expr(&mut self, expr: &Expr, has_semi: bool) -> syn::Result<TokenStream2> {
         match expr {
             Expr::Assign(assign) => {
-                let lhs = self.translate_lvalue(&assign.left)?;
-                let rhs = self.translate_expr(&assign.right)?;
-                Ok(format!("{lhs} = {rhs};"))
+                let lhs = self.lower_lvalue(&assign.left)?;
+                let rhs = self.lower_expr(&assign.right)?;
+                Ok(quote! {
+                    ::sumeru::GpuStmt::Assign {
+                        op: ::sumeru::GpuAssignOp::Assign,
+                        target: #lhs,
+                        value: #rhs,
+                    }
+                })
             }
             Expr::Binary(bin) if is_compound_assign(&bin.op) => {
-                let lhs = self.translate_lvalue(&bin.left)?;
-                let op = translate_binop(&bin.op)?;
-                let rhs = self.translate_expr(&bin.right)?;
-                Ok(format!("{lhs} {op} {rhs};"))
+                let lhs = self.lower_lvalue(&bin.left)?;
+                let op = lower_assign_op(&bin.op)?;
+                let rhs = self.lower_expr(&bin.right)?;
+                Ok(quote! {
+                    ::sumeru::GpuStmt::Assign {
+                        op: #op,
+                        target: #lhs,
+                        value: #rhs,
+                    }
+                })
             }
             Expr::If(expr_if) => {
-                let cond = self.translate_expr(&expr_if.cond)?;
-                let then_body = self.translate_block(&expr_if.then_branch)?;
-                let mut s = format!("if ({cond}) {{ {then_body} }}");
-                if let Some((_, else_expr)) = &expr_if.else_branch {
+                let cond = self.lower_expr(&expr_if.cond)?;
+                let then_block = self.lower_block(&expr_if.then_branch)?;
+                let else_tokens = if let Some((_, else_expr)) = &expr_if.else_branch {
                     match &**else_expr {
                         Expr::If(_) => {
-                            let else_if = self.translate_stmt_expr(else_expr, true)?;
-                            s.push_str(&format!(" else {else_if}"));
+                            let else_if = self.lower_stmt_expr(else_expr, true)?;
+                            quote! { ::std::option::Option::Some(::sumeru::GpuElseBranch::ElseIf(::std::boxed::Box::new(#else_if))) }
                         }
                         Expr::Block(eb) => {
-                            let else_body = self.translate_block(&eb.block)?;
-                            s.push_str(&format!(" else {{ {else_body} }}"));
+                            let else_body = self.lower_block(&eb.block)?;
+                            quote! { ::std::option::Option::Some(::sumeru::GpuElseBranch::ElseBlock(#else_body)) }
                         }
                         other => {
                             return Err(Error::new_spanned(
@@ -513,13 +737,26 @@ impl<'a> ShaderTranslator<'a> {
                             ));
                         }
                     }
-                }
-                Ok(s)
+                } else {
+                    quote! { ::std::option::Option::None }
+                };
+                Ok(quote! {
+                    ::sumeru::GpuStmt::If {
+                        cond: #cond,
+                        then_block: #then_block,
+                        else_branch: #else_tokens,
+                    }
+                })
             }
             Expr::While(expr_while) => {
-                let cond = self.translate_expr(&expr_while.cond)?;
-                let body = self.translate_block(&expr_while.body)?;
-                Ok(format!("while ({cond}) {{ {body} }}"))
+                let cond = self.lower_expr(&expr_while.cond)?;
+                let body = self.lower_block(&expr_while.body)?;
+                Ok(quote! {
+                    ::sumeru::GpuStmt::While {
+                        cond: #cond,
+                        body: #body,
+                    }
+                })
             }
             Expr::ForLoop(expr_for) => {
                 let Pat::Ident(pat_ident) = &*expr_for.pat else {
@@ -541,21 +778,22 @@ impl<'a> ShaderTranslator<'a> {
                         "`for` loop range in `#[gpu]` kernel must specify both start and end bounds",
                     ));
                 };
-                let start = self.translate_expr(start_expr)?;
-                let end = self.translate_expr(end_expr)?;
-                let cmp = match range.limits {
-                    RangeLimits::HalfOpen(_) => "<",
-                    RangeLimits::Closed(_) => "<=",
-                };
-                let body = self.translate_block(&expr_for.body)?;
-                match self.target {
-                    ShaderTarget::Msl => Ok(format!(
-                        "for (auto {var_name} = {start}; {var_name} {cmp} {end}; {var_name} += 1) {{ {body} }}"
-                    )),
-                    ShaderTarget::Wgsl => Ok(format!(
-                        "for (var {var_name} = {start}; {var_name} {cmp} {end}; {var_name} += 1) {{ {body} }}"
-                    )),
-                }
+                let start = self.lower_expr(start_expr)?;
+                let end = self.lower_expr(end_expr)?;
+                let inclusive = matches!(range.limits, RangeLimits::Closed(_));
+                self.push_scope();
+                self.declare_local(var_name.clone());
+                let body = self.lower_block(&expr_for.body)?;
+                self.pop_scope();
+                Ok(quote! {
+                    ::sumeru::GpuStmt::ForRange {
+                        var: #var_name,
+                        start: #start,
+                        end: #end,
+                        inclusive: #inclusive,
+                        body: #body,
+                    }
+                })
             }
             Expr::Block(eb) => {
                 if eb.label.is_some() {
@@ -564,30 +802,27 @@ impl<'a> ShaderTranslator<'a> {
                         "labeled blocks are not supported in `#[gpu]` kernels",
                     ));
                 }
-                let inner = self.translate_block(&eb.block)?;
-                Ok(format!("{{ {inner} }}"))
+                let inner = self.lower_block(&eb.block)?;
+                Ok(quote! { ::sumeru::GpuStmt::Block(#inner) })
             }
             Expr::Return(ret) => {
                 if let Some(val) = &ret.expr {
-                    return Err(Error::new_spanned(
-                        val,
-                        "`#[gpu]` kernel cannot return a value",
-                    ));
-                }
-                match self.target {
-                    ShaderTarget::Msl => Ok("return;".into()),
-                    ShaderTarget::Wgsl => {
-                        if self.mut_params.is_empty() {
-                            Ok("return;".into())
-                        } else {
-                            let mut wb = String::new();
-                            for p in self.mut_params {
-                                wb.push_str(&format!("sumeru_buf_{p}[gid] = {p}; "));
-                            }
-                            wb.push_str("return;");
-                            Ok(wb)
-                        }
+                    if !self.is_helper_fn {
+                        return Err(Error::new_spanned(
+                            val,
+                            "`#[gpu]` kernel cannot return a value",
+                        ));
                     }
+                    let lowered_val = self.lower_expr(val)?;
+                    Ok(quote! { ::sumeru::GpuStmt::Return(::std::option::Option::Some(#lowered_val)) })
+                } else {
+                    if self.is_helper_fn {
+                        return Err(Error::new_spanned(
+                            ret,
+                            "`#[gpu]` helper function with a return type must return a value",
+                        ));
+                    }
+                    Ok(quote! { ::sumeru::GpuStmt::Return(::std::option::Option::None) })
                 }
             }
             Expr::Break(brk) => {
@@ -597,7 +832,7 @@ impl<'a> ShaderTranslator<'a> {
                         "labeled or value `break` is not supported in `#[gpu]` kernels",
                     ));
                 }
-                Ok("break;".into())
+                Ok(quote! { ::sumeru::GpuStmt::Break })
             }
             Expr::Continue(cont) => {
                 if cont.label.is_some() {
@@ -606,7 +841,7 @@ impl<'a> ShaderTranslator<'a> {
                         "labeled `continue` is not supported in `#[gpu]` kernels",
                     ));
                 }
-                Ok("continue;".into())
+                Ok(quote! { ::sumeru::GpuStmt::Continue })
             }
             other => {
                 if !has_semi {
@@ -623,13 +858,14 @@ impl<'a> ShaderTranslator<'a> {
         }
     }
 
-    fn translate_lvalue(&self, expr: &Expr) -> syn::Result<String> {
+    fn lower_lvalue(&mut self, expr: &Expr) -> syn::Result<TokenStream2> {
         match expr {
             Expr::Path(p) if p.qself.is_none() && p.path.segments.len() == 1 => {
-                Ok(p.path.segments[0].ident.to_string())
+                let name = p.path.segments[0].ident.to_string();
+                Ok(quote! { ::sumeru::GpuLValue::Var(#name) })
             }
             Expr::Field(f) => {
-                let base = self.translate_lvalue(&f.base)?;
+                let base = self.lower_lvalue(&f.base)?;
                 let member = match &f.member {
                     Member::Named(id) => id.to_string(),
                     Member::Unnamed(idx) => {
@@ -639,15 +875,25 @@ impl<'a> ShaderTranslator<'a> {
                         ));
                     }
                 };
-                Ok(format!("{base}.{member}"))
+                Ok(quote! {
+                    ::sumeru::GpuLValue::Field {
+                        base: ::std::boxed::Box::new(#base),
+                        field: #member,
+                    }
+                })
             }
             Expr::Index(idx) => {
-                let base = self.translate_lvalue(&idx.expr)?;
-                let index = self.translate_expr(&idx.index)?;
-                Ok(format!("{base}[{index}]"))
+                let base = self.lower_lvalue(&idx.expr)?;
+                let index = self.lower_expr(&idx.index)?;
+                Ok(quote! {
+                    ::sumeru::GpuLValue::Index {
+                        base: ::std::boxed::Box::new(#base),
+                        index: ::std::boxed::Box::new(#index),
+                    }
+                })
             }
-            Expr::Unary(un) if matches!(un.op, UnOp::Deref(_)) => self.translate_lvalue(&un.expr),
-            Expr::Paren(p) => self.translate_lvalue(&p.expr),
+            Expr::Unary(un) if matches!(un.op, UnOp::Deref(_)) => self.lower_lvalue(&un.expr),
+            Expr::Paren(p) => self.lower_lvalue(&p.expr),
             other => Err(Error::new_spanned(
                 other,
                 "invalid assignment target in `#[gpu]` kernel",
@@ -655,20 +901,21 @@ impl<'a> ShaderTranslator<'a> {
         }
     }
 
-    fn translate_expr(&self, expr: &Expr) -> syn::Result<String> {
+    fn lower_expr(&mut self, expr: &Expr) -> syn::Result<TokenStream2> {
         match expr {
-            Expr::Path(p) if p.qself.is_none() => {
-                if p.path.segments.len() == 1 {
-                    Ok(p.path.segments[0].ident.to_string())
-                } else {
-                    Err(Error::new_spanned(
-                        p,
-                        "multi-segment paths and external constants are not supported in `#[gpu]` kernels",
-                    ))
+            Expr::Path(p) => {
+                if p.qself.is_none() && p.path.segments.len() == 1 {
+                    let ident_str = p.path.segments[0].ident.to_string();
+                    if self.is_in_local_scope(&ident_str) {
+                        return Ok(quote! { ::sumeru::GpuExpr::Var(#ident_str) });
+                    }
                 }
+                // External Rust `const` identifier or multi-segment path (e.g. `DT` or `std::f32::consts::PI`):
+                // evaluated at compile time by `rustc` via `GpuConstValue`.
+                Ok(quote! { ::sumeru::GpuConstValue::to_gpu_expr(&(#p)) })
             }
             Expr::Field(f) => {
-                let base = self.translate_expr(&f.base)?;
+                let base = self.lower_expr(&f.base)?;
                 let member = match &f.member {
                     Member::Named(id) => id.to_string(),
                     Member::Unnamed(idx) => {
@@ -678,12 +925,22 @@ impl<'a> ShaderTranslator<'a> {
                         ));
                     }
                 };
-                Ok(format!("{base}.{member}"))
+                Ok(quote! {
+                    ::sumeru::GpuExpr::Field {
+                        base: ::std::boxed::Box::new(#base),
+                        field: #member,
+                    }
+                })
             }
             Expr::Index(idx) => {
-                let base = self.translate_expr(&idx.expr)?;
-                let index = self.translate_expr(&idx.index)?;
-                Ok(format!("{base}[{index}]"))
+                let base = self.lower_expr(&idx.expr)?;
+                let index = self.lower_expr(&idx.index)?;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::Index {
+                        base: ::std::boxed::Box::new(#base),
+                        index: ::std::boxed::Box::new(#index),
+                    }
+                })
             }
             Expr::Binary(bin) => {
                 if is_compound_assign(&bin.op) {
@@ -692,118 +949,175 @@ impl<'a> ShaderTranslator<'a> {
                         "compound assignment cannot be used as a sub-expression in `#[gpu]` kernels",
                     ));
                 }
-                let lhs = self.translate_expr(&bin.left)?;
-                let op = translate_binop(&bin.op)?;
-                let rhs = self.translate_expr(&bin.right)?;
-                Ok(format!("{lhs} {op} {rhs}"))
+                let lhs = self.lower_expr(&bin.left)?;
+                let op = lower_binop(&bin.op)?;
+                let rhs = self.lower_expr(&bin.right)?;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::Binary {
+                        op: #op,
+                        lhs: ::std::boxed::Box::new(#lhs),
+                        rhs: ::std::boxed::Box::new(#rhs),
+                    }
+                })
             }
             Expr::Unary(un) => match un.op {
                 UnOp::Neg(_) => {
-                    let inner = self.translate_expr(&un.expr)?;
-                    Ok(format!("-({inner})"))
+                    let inner = self.lower_expr(&un.expr)?;
+                    Ok(quote! {
+                        ::sumeru::GpuExpr::Unary {
+                            op: ::sumeru::GpuUnaryOp::Neg,
+                            expr: ::std::boxed::Box::new(#inner),
+                        }
+                    })
                 }
                 UnOp::Not(_) => {
-                    let inner = self.translate_expr(&un.expr)?;
-                    Ok(format!("!({inner})"))
+                    let inner = self.lower_expr(&un.expr)?;
+                    Ok(quote! {
+                        ::sumeru::GpuExpr::Unary {
+                            op: ::sumeru::GpuUnaryOp::Not,
+                            expr: ::std::boxed::Box::new(#inner),
+                        }
+                    })
                 }
-                UnOp::Deref(_) => self.translate_expr(&un.expr),
+                UnOp::Deref(_) => self.lower_expr(&un.expr),
                 _ => Err(Error::new_spanned(
                     un,
                     "unsupported unary operator in `#[gpu]` kernel",
                 )),
             },
             Expr::Paren(p) => {
-                let inner = self.translate_expr(&p.expr)?;
-                Ok(format!("({inner})"))
+                let inner = self.lower_expr(&p.expr)?;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::Paren(::std::boxed::Box::new(#inner))
+                })
             }
             Expr::Cast(cast) => {
-                let inner = self.translate_expr(&cast.expr)?;
-                let ty = self.translate_scalar_type(&cast.ty)?;
-                Ok(format!("{ty}({inner})"))
+                let inner = self.lower_expr(&cast.expr)?;
+                let ty = parse_scalar_kind_tokens(&cast.ty)?;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::Cast {
+                        expr: ::std::boxed::Box::new(#inner),
+                        ty: #ty,
+                    }
+                })
             }
-            Expr::Lit(expr_lit) => self.translate_lit(&expr_lit.lit),
+            Expr::Lit(expr_lit) => self.lower_lit(&expr_lit.lit),
             Expr::MethodCall(mc) => {
-                let receiver = self.translate_expr(&mc.receiver)?;
+                let receiver = self.lower_expr(&mc.receiver)?;
                 let method = mc.method.to_string();
                 let mut args = Vec::with_capacity(mc.args.len());
                 for arg in &mc.args {
-                    args.push(self.translate_expr(arg)?);
+                    args.push(self.lower_expr(arg)?);
                 }
-                match (method.as_str(), args.len()) {
-                    (
-                        "abs" | "sqrt" | "sin" | "cos" | "tan" | "floor" | "ceil" | "round"
-                        | "fract" | "exp",
-                        0,
-                    ) => Ok(format!("{method}({receiver})")),
-                    ("ln", 0) => Ok(format!("log({receiver})")),
-                    ("min" | "max" | "atan2", 1) => Ok(format!("{method}({receiver}, {})", args[0])),
-                    ("powf", 1) => Ok(format!("pow({receiver}, {})", args[0])),
-                    ("clamp", 2) => Ok(format!("clamp({receiver}, {}, {})", args[0], args[1])),
-                    ("mul_add" | "fma", 2) => {
-                        Ok(format!("fma({receiver}, {}, {})", args[0], args[1]))
+                let intrinsic = match (method.as_str(), args.len()) {
+                    ("abs", 0) => quote! { ::sumeru::GpuMathIntrinsic::Abs },
+                    ("sqrt", 0) => quote! { ::sumeru::GpuMathIntrinsic::Sqrt },
+                    ("sin", 0) => quote! { ::sumeru::GpuMathIntrinsic::Sin },
+                    ("cos", 0) => quote! { ::sumeru::GpuMathIntrinsic::Cos },
+                    ("tan", 0) => quote! { ::sumeru::GpuMathIntrinsic::Tan },
+                    ("floor", 0) => quote! { ::sumeru::GpuMathIntrinsic::Floor },
+                    ("ceil", 0) => quote! { ::sumeru::GpuMathIntrinsic::Ceil },
+                    ("round", 0) => quote! { ::sumeru::GpuMathIntrinsic::Round },
+                    ("fract", 0) => quote! { ::sumeru::GpuMathIntrinsic::Fract },
+                    ("exp", 0) => quote! { ::sumeru::GpuMathIntrinsic::Exp },
+                    ("ln", 0) => quote! { ::sumeru::GpuMathIntrinsic::Ln },
+                    ("min", 1) => quote! { ::sumeru::GpuMathIntrinsic::Min },
+                    ("max", 1) => quote! { ::sumeru::GpuMathIntrinsic::Max },
+                    ("atan2", 1) => quote! { ::sumeru::GpuMathIntrinsic::Atan2 },
+                    ("powf", 1) => quote! { ::sumeru::GpuMathIntrinsic::Powf },
+                    ("clamp", 2) => quote! { ::sumeru::GpuMathIntrinsic::Clamp },
+                    ("mul_add" | "fma", 2) => quote! { ::sumeru::GpuMathIntrinsic::Fma },
+                    _ => {
+                        return Err(Error::new_spanned(
+                            &mc.method,
+                            format!(
+                                "method `{method}` (with {} arg(s)) is not supported in `#[gpu]` kernels; supported methods: abs, sqrt, min, max, clamp, sin, cos, tan, floor, ceil, round, fract, exp, ln, powf, atan2, mul_add",
+                                args.len()
+                            ),
+                        ));
                     }
-                    _ => Err(Error::new_spanned(
-                        &mc.method,
-                        format!(
-                            "method `{method}` (with {} arg(s)) is not supported in `#[gpu]` kernels; supported methods: abs, sqrt, min, max, clamp, sin, cos, tan, floor, ceil, round, fract, exp, ln, powf, atan2, mul_add",
-                            args.len()
-                        ),
-                    )),
+                };
+                Ok(quote! {
+                    ::sumeru::GpuExpr::MathCall {
+                        receiver: ::std::boxed::Box::new(#receiver),
+                        intrinsic: #intrinsic,
+                        args: ::std::vec![ #(#args),* ],
+                    }
+                })
+            }
+            Expr::Call(call) => {
+                let Expr::Path(func_path) = &*call.func else {
+                    return Err(Error::new_spanned(
+                        &call.func,
+                        "only direct calls to `#[gpu]` pure helper functions are supported in `#[gpu]` kernels",
+                    ));
+                };
+                if func_path.qself.is_some() {
+                    return Err(Error::new_spanned(
+                        func_path,
+                        "qualified `<T as Trait>::fn` calls are not supported in `#[gpu]` kernels",
+                    ));
                 }
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in &call.args {
+                    args.push(self.lower_expr(arg)?);
+                }
+                let path = &func_path.path;
+                Ok(quote! {
+                    ::sumeru::GpuExpr::HelperCall {
+                        helper: #path::gpu_helper_descriptor(),
+                        args: ::std::vec![ #(#args),* ],
+                    }
+                })
             }
             other => Err(Error::new_spanned(
                 other,
-                "unsupported Rust expression in `#[gpu]` kernel; arbitrary function calls, closures, `match`, and references are not permitted in GPU shaders",
+                "unsupported Rust expression in `#[gpu]` kernel; closures, `match`, and references are not permitted in GPU shaders",
             )),
         }
     }
 
-    fn translate_lit(&self, lit: &Lit) -> syn::Result<String> {
+    fn lower_lit(&self, lit: &Lit) -> syn::Result<TokenStream2> {
         match lit {
             Lit::Float(fl) => {
                 let digits = fl.base10_digits().replace('_', "");
-                if digits.contains('.') || digits.contains('e') || digits.contains('E') {
-                    Ok(digits)
+                let formatted = if digits.contains('.') || digits.contains('e') || digits.contains('E') {
+                    digits
                 } else {
-                    Ok(format!("{digits}.0"))
-                }
+                    format!("{digits}.0")
+                };
+                Ok(quote! { ::sumeru::GpuExpr::Lit(::sumeru::GpuLit::FloatRaw(#formatted)) })
             }
             Lit::Int(il) => {
-                let digits = il.base10_digits();
                 let suffix = il.suffix();
                 match suffix {
-                    "" | "i32" => Ok(digits.to_string()),
-                    "u32" | "usize" => Ok(format!("{digits}u")),
+                    "" => {
+                        let val: i64 = il.base10_parse()?;
+                        Ok(quote! { ::sumeru::GpuExpr::Lit(::sumeru::GpuLit::UntypedInt(#val)) })
+                    }
+                    "i32" => {
+                        let val: i32 = il.base10_parse()?;
+                        Ok(quote! { ::sumeru::GpuExpr::Lit(::sumeru::GpuLit::I32(#val)) })
+                    }
+                    "u32" | "usize" => {
+                        let val: u64 = il.base10_parse()?;
+                        Ok(quote! { ::sumeru::GpuExpr::Lit(::sumeru::GpuLit::U32(#val)) })
+                    }
                     other => Err(Error::new_spanned(
                         il,
                         format!(
-                            "integer literal suffix `{other}` is not supported in `#[gpu]` kernels; use `i32` or `u32`"
+                            "integer literal suffix `{other}` is not supported in `#[gpu]` kernels; use `i32`, `u32`, or `usize`"
                         ),
                     )),
                 }
             }
-            Lit::Bool(b) => Ok(if b.value { "true".into() } else { "false".into() }),
+            Lit::Bool(b) => {
+                let val = b.value;
+                Ok(quote! { ::sumeru::GpuExpr::Lit(::sumeru::GpuLit::Bool(#val)) })
+            }
             other => Err(Error::new_spanned(
                 other,
                 "string/byte/char literals are not supported in `#[gpu]` kernels",
-            )),
-        }
-    }
-
-    fn translate_scalar_type(&self, ty: &Type) -> syn::Result<&'static str> {
-        let s = ty.to_token_stream().to_string();
-        match (self.target, s.trim()) {
-            (ShaderTarget::Msl, "f32") => Ok("float"),
-            (ShaderTarget::Msl, "i32") => Ok("int"),
-            (ShaderTarget::Msl, "u32") => Ok("uint"),
-            (ShaderTarget::Wgsl, "f32") => Ok("f32"),
-            (ShaderTarget::Wgsl, "i32") => Ok("i32"),
-            (ShaderTarget::Wgsl, "u32") => Ok("u32"),
-            _ => Err(Error::new_spanned(
-                ty,
-                format!(
-                    "type `{s}` is not supported in `#[gpu]` scalar annotations/casts; use `f32`, `i32`, or `u32`"
-                ),
             )),
         }
     }
@@ -825,36 +1139,45 @@ fn is_compound_assign(op: &BinOp) -> bool {
     )
 }
 
-fn translate_binop(op: &BinOp) -> syn::Result<&'static str> {
+fn lower_assign_op(op: &BinOp) -> syn::Result<TokenStream2> {
     match op {
-        BinOp::Add(_) => Ok("+"),
-        BinOp::Sub(_) => Ok("-"),
-        BinOp::Mul(_) => Ok("*"),
-        BinOp::Div(_) => Ok("/"),
-        BinOp::Rem(_) => Ok("%"),
-        BinOp::And(_) => Ok("&&"),
-        BinOp::Or(_) => Ok("||"),
-        BinOp::BitXor(_) => Ok("^"),
-        BinOp::BitAnd(_) => Ok("&"),
-        BinOp::BitOr(_) => Ok("|"),
-        BinOp::Shl(_) => Ok("<<"),
-        BinOp::Shr(_) => Ok(">>"),
-        BinOp::Eq(_) => Ok("=="),
-        BinOp::Lt(_) => Ok("<"),
-        BinOp::Le(_) => Ok("<="),
-        BinOp::Ne(_) => Ok("!="),
-        BinOp::Ge(_) => Ok(">="),
-        BinOp::Gt(_) => Ok(">"),
-        BinOp::AddAssign(_) => Ok("+="),
-        BinOp::SubAssign(_) => Ok("-="),
-        BinOp::MulAssign(_) => Ok("*="),
-        BinOp::DivAssign(_) => Ok("/="),
-        BinOp::RemAssign(_) => Ok("%="),
-        BinOp::BitXorAssign(_) => Ok("^="),
-        BinOp::BitAndAssign(_) => Ok("&="),
-        BinOp::BitOrAssign(_) => Ok("|="),
-        BinOp::ShlAssign(_) => Ok("<<="),
-        BinOp::ShrAssign(_) => Ok(">>="),
+        BinOp::AddAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::AddAssign }),
+        BinOp::SubAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::SubAssign }),
+        BinOp::MulAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::MulAssign }),
+        BinOp::DivAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::DivAssign }),
+        BinOp::RemAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::RemAssign }),
+        BinOp::BitXorAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::BitXorAssign }),
+        BinOp::BitAndAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::BitAndAssign }),
+        BinOp::BitOrAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::BitOrAssign }),
+        BinOp::ShlAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::ShlAssign }),
+        BinOp::ShrAssign(_) => Ok(quote! { ::sumeru::GpuAssignOp::ShrAssign }),
+        other => Err(Error::new_spanned(
+            other,
+            "unsupported compound assignment operator in `#[gpu]` kernel",
+        )),
+    }
+}
+
+fn lower_binop(op: &BinOp) -> syn::Result<TokenStream2> {
+    match op {
+        BinOp::Add(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Add }),
+        BinOp::Sub(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Sub }),
+        BinOp::Mul(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Mul }),
+        BinOp::Div(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Div }),
+        BinOp::Rem(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Rem }),
+        BinOp::And(_) => Ok(quote! { ::sumeru::GpuBinaryOp::And }),
+        BinOp::Or(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Or }),
+        BinOp::BitXor(_) => Ok(quote! { ::sumeru::GpuBinaryOp::BitXor }),
+        BinOp::BitAnd(_) => Ok(quote! { ::sumeru::GpuBinaryOp::BitAnd }),
+        BinOp::BitOr(_) => Ok(quote! { ::sumeru::GpuBinaryOp::BitOr }),
+        BinOp::Shl(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Shl }),
+        BinOp::Shr(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Shr }),
+        BinOp::Eq(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Eq }),
+        BinOp::Lt(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Lt }),
+        BinOp::Le(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Le }),
+        BinOp::Ne(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Ne }),
+        BinOp::Ge(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Ge }),
+        BinOp::Gt(_) => Ok(quote! { ::sumeru::GpuBinaryOp::Gt }),
         other => Err(Error::new_spanned(
             other,
             "unsupported binary operator in `#[gpu]` kernel",

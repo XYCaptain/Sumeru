@@ -322,6 +322,17 @@ pub fn build_msl_kernel_source(
     bindings: &[GpuKernelBindingSpec],
     msl_body: &str,
 ) -> String {
+    build_msl_kernel_source_with_helpers(kernel_name, struct_defs, bindings, "", msl_body)
+}
+
+/// 根据结构体定义、绑定表、前置 `#[gpu]` 辅助函数与已翻译的 MSL 函数体生成完整的 MSL 源码。
+pub fn build_msl_kernel_source_with_helpers(
+    kernel_name: &str,
+    struct_defs: &[String],
+    bindings: &[GpuKernelBindingSpec],
+    msl_helpers: &str,
+    msl_body: &str,
+) -> String {
     let mut src = String::from(
         "#include <metal_stdlib>\nusing namespace metal;\n\n\
          struct GpuDispatchUniforms {\n\
@@ -347,6 +358,10 @@ pub fn build_msl_kernel_source(
             src.push_str(def);
             src.push('\n');
         }
+    }
+    if !msl_helpers.trim().is_empty() {
+        src.push_str(msl_helpers.trim());
+        src.push_str("\n\n");
     }
 
     src.push_str(&format!("kernel void {kernel_name}(\n"));
@@ -384,6 +399,17 @@ pub fn build_wgsl_kernel_source(
     bindings: &[GpuKernelBindingSpec],
     wgsl_body: &str,
 ) -> String {
+    build_wgsl_kernel_source_with_helpers(kernel_name, struct_defs, bindings, "", wgsl_body)
+}
+
+/// 根据结构体定义、绑定表、前置 `#[gpu]` 辅助函数与已翻译的 WGSL 函数体生成完整的 WGSL 源码。
+pub fn build_wgsl_kernel_source_with_helpers(
+    kernel_name: &str,
+    struct_defs: &[String],
+    bindings: &[GpuKernelBindingSpec],
+    wgsl_helpers: &str,
+    wgsl_body: &str,
+) -> String {
     let mut src = String::from(
         "struct GpuDispatchUniforms {\n\
          \x20   active_rows: u32,\n\
@@ -408,6 +434,10 @@ pub fn build_wgsl_kernel_source(
             src.push_str(def);
             src.push('\n');
         }
+    }
+    if !wgsl_helpers.trim().is_empty() {
+        src.push_str(wgsl_helpers.trim());
+        src.push_str("\n\n");
     }
     for (idx, b) in bindings.iter().enumerate() {
         let access = if b.mutable { "read_write" } else { "read" };
@@ -1163,6 +1193,712 @@ macro_rules! sumeru_gpu_fn {
         }
     };
 
+    // 1 parameter (Typed Shader IR)
+    (
+        @ir
+        $(#[$meta:meta])*
+        $vis:vis fn $fn_name:ident (
+            $p0:ident : [$m0:ident] $T0:ty
+        )
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Default)]
+        $vis struct $fn_name;
+
+        impl $fn_name {
+            #[inline(always)]
+            pub fn call($p0: $crate::__sumeru_gpu_param_type!('_, [$m0] $T0)) {
+                $($body)*
+            }
+
+            unsafe fn __cpu_chunk_runner(
+                raw_ptrs: &[*mut u8],
+                active_rows: usize,
+                _uniforms: &$crate::GpuDispatchUniforms,
+            ) {
+                let s0 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m0] $T0, raw_ptrs[0], active_rows) };
+                for idx in 0..active_rows {
+                    Self::call($crate::__sumeru_gpu_elem_borrow!([$m0] s0, idx));
+                }
+            }
+        }
+
+        impl ::std::ops::Deref for $fn_name {
+            type Target = for<'a> fn($crate::__sumeru_gpu_param_type!('a, [$m0] $T0));
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                const FN_PTR: for<'a> fn($crate::__sumeru_gpu_param_type!('a, [$m0] $T0)) = $fn_name::call;
+                &FN_PTR
+            }
+        }
+
+        impl<'a> $crate::QueryForEachOp<($crate::EntityId, $crate::__sumeru_gpu_param_type!('a, [$m0] $T0)), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row(&mut self, (_entity, item): ($crate::EntityId, $crate::__sumeru_gpu_param_type!('a, [$m0] $T0))) {
+                Self::call(item);
+            }
+        }
+
+        impl<'a> $crate::QueryParForEachOp<($crate::EntityId, $crate::__sumeru_gpu_param_type!('a, [$m0] $T0)), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row_par(&self, (_entity, item): ($crate::EntityId, $crate::__sumeru_gpu_param_type!('a, [$m0] $T0))) {
+                Self::call(item);
+            }
+        }
+
+        unsafe impl<'a> $crate::GpuKernel<'a> for $fn_name {
+            type Query = $crate::__sumeru_gpu_param_type!('a, [$m0] $T0);
+
+            fn descriptor(&self) -> &'static $crate::GpuKernelDescriptor {
+                static DESC: ::std::sync::OnceLock<$crate::GpuKernelDescriptor> = ::std::sync::OnceLock::new();
+                DESC.get_or_init(|| {
+                    <$T0 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    let bindings = vec![
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T0>(),
+                            elem_size: ::std::mem::size_of::<$T0>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                    ];
+                    let components = [
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T0 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                    ];
+                    let msl_defs = vec![<$T0 as $crate::GpuShaderStruct>::msl_struct_definition()];
+                    let wgsl_defs = vec![<$T0 as $crate::GpuShaderStruct>::wgsl_struct_definition()];
+                    let ir: $crate::GpuBlock = $ir_block;
+                    let (msl_source, wgsl_source) = $crate::compile_kernel_ir_sources(
+                        stringify!($fn_name),
+                        &components,
+                        &msl_defs,
+                        &wgsl_defs,
+                        &bindings,
+                        &ir,
+                    );
+                    unsafe {
+                        $crate::GpuKernelDescriptor::new(
+                            stringify!($fn_name),
+                            bindings,
+                            msl_source,
+                            wgsl_source,
+                            Self::__cpu_chunk_runner,
+                        )
+                    }
+                })
+            }
+        }
+    };
+
+    // 2 parameters (Typed Shader IR)
+    (
+        @ir
+        $(#[$meta:meta])*
+        $vis:vis fn $fn_name:ident (
+            $p0:ident : [$m0:ident] $T0:ty,
+            $p1:ident : [$m1:ident] $T1:ty
+        )
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Default)]
+        $vis struct $fn_name;
+
+        impl $fn_name {
+            #[inline(always)]
+            pub fn call(
+                $p0: $crate::__sumeru_gpu_param_type!('_, [$m0] $T0),
+                $p1: $crate::__sumeru_gpu_param_type!('_, [$m1] $T1),
+            ) {
+                $($body)*
+            }
+
+            unsafe fn __cpu_chunk_runner(
+                raw_ptrs: &[*mut u8],
+                active_rows: usize,
+                _uniforms: &$crate::GpuDispatchUniforms,
+            ) {
+                let s0 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m0] $T0, raw_ptrs[0], active_rows) };
+                let s1 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m1] $T1, raw_ptrs[1], active_rows) };
+                for idx in 0..active_rows {
+                    Self::call(
+                        $crate::__sumeru_gpu_elem_borrow!([$m0] s0, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m1] s1, idx),
+                    );
+                }
+            }
+        }
+
+        impl ::std::ops::Deref for $fn_name {
+            type Target = for<'a, 'b> fn(
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+            );
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                const FN_PTR: for<'a, 'b> fn(
+                    $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                    $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+                ) = $fn_name::call;
+                &FN_PTR
+            }
+        }
+
+        impl<'a> $crate::QueryForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row(
+                &mut self,
+                (_entity, (a, b)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                    ),
+                ),
+            ) {
+                Self::call(a, b);
+            }
+        }
+
+        impl<'a> $crate::QueryParForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row_par(
+                &self,
+                (_entity, (a, b)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                    ),
+                ),
+            ) {
+                Self::call(a, b);
+            }
+        }
+
+        unsafe impl<'a> $crate::GpuKernel<'a> for $fn_name {
+            type Query = (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+            );
+
+            fn descriptor(&self) -> &'static $crate::GpuKernelDescriptor {
+                static DESC: ::std::sync::OnceLock<$crate::GpuKernelDescriptor> = ::std::sync::OnceLock::new();
+                DESC.get_or_init(|| {
+                    <$T0 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T1 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    let bindings = vec![
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T0>(),
+                            elem_size: ::std::mem::size_of::<$T0>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T1>(),
+                            elem_size: ::std::mem::size_of::<$T1>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                    ];
+                    let components = [
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T0 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T1 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                    ];
+                    let msl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                    ];
+                    let wgsl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                    ];
+                    let ir: $crate::GpuBlock = $ir_block;
+                    let (msl_source, wgsl_source) = $crate::compile_kernel_ir_sources(
+                        stringify!($fn_name),
+                        &components,
+                        &msl_defs,
+                        &wgsl_defs,
+                        &bindings,
+                        &ir,
+                    );
+                    unsafe {
+                        $crate::GpuKernelDescriptor::new(
+                            stringify!($fn_name),
+                            bindings,
+                            msl_source,
+                            wgsl_source,
+                            Self::__cpu_chunk_runner,
+                        )
+                    }
+                })
+            }
+        }
+    };
+
+    // 3 parameters (Typed Shader IR)
+    (
+        @ir
+        $(#[$meta:meta])*
+        $vis:vis fn $fn_name:ident (
+            $p0:ident : [$m0:ident] $T0:ty,
+            $p1:ident : [$m1:ident] $T1:ty,
+            $p2:ident : [$m2:ident] $T2:ty
+        )
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Default)]
+        $vis struct $fn_name;
+
+        impl $fn_name {
+            #[inline(always)]
+            pub fn call(
+                $p0: $crate::__sumeru_gpu_param_type!('_, [$m0] $T0),
+                $p1: $crate::__sumeru_gpu_param_type!('_, [$m1] $T1),
+                $p2: $crate::__sumeru_gpu_param_type!('_, [$m2] $T2),
+            ) {
+                $($body)*
+            }
+
+            unsafe fn __cpu_chunk_runner(
+                raw_ptrs: &[*mut u8],
+                active_rows: usize,
+                _uniforms: &$crate::GpuDispatchUniforms,
+            ) {
+                let s0 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m0] $T0, raw_ptrs[0], active_rows) };
+                let s1 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m1] $T1, raw_ptrs[1], active_rows) };
+                let s2 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m2] $T2, raw_ptrs[2], active_rows) };
+                for idx in 0..active_rows {
+                    Self::call(
+                        $crate::__sumeru_gpu_elem_borrow!([$m0] s0, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m1] s1, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m2] s2, idx),
+                    );
+                }
+            }
+        }
+
+        impl ::std::ops::Deref for $fn_name {
+            type Target = for<'a, 'b, 'c> fn(
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('c, [$m2] $T2),
+            );
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                const FN_PTR: for<'a, 'b, 'c> fn(
+                    $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                    $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+                    $crate::__sumeru_gpu_param_type!('c, [$m2] $T2),
+                ) = $fn_name::call;
+                &FN_PTR
+            }
+        }
+
+        impl<'a> $crate::QueryForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row(
+                &mut self,
+                (_entity, (a, b, c)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                        $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                    ),
+                ),
+            ) {
+                Self::call(a, b, c);
+            }
+        }
+
+        impl<'a> $crate::QueryParForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row_par(
+                &self,
+                (_entity, (a, b, c)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                        $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                    ),
+                ),
+            ) {
+                Self::call(a, b, c);
+            }
+        }
+
+        unsafe impl<'a> $crate::GpuKernel<'a> for $fn_name {
+            type Query = (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+            );
+
+            fn descriptor(&self) -> &'static $crate::GpuKernelDescriptor {
+                static DESC: ::std::sync::OnceLock<$crate::GpuKernelDescriptor> = ::std::sync::OnceLock::new();
+                DESC.get_or_init(|| {
+                    <$T0 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T1 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T2 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    let bindings = vec![
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T0>(),
+                            elem_size: ::std::mem::size_of::<$T0>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T1>(),
+                            elem_size: ::std::mem::size_of::<$T1>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p2),
+                            struct_name: <$T2 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T2>(),
+                            elem_size: ::std::mem::size_of::<$T2>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m2]),
+                        },
+                    ];
+                    let components = [
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T0 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T1 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p2),
+                            struct_name: <$T2 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T2 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m2]),
+                        },
+                    ];
+                    let msl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T2 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                    ];
+                    let wgsl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T2 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                    ];
+                    let ir: $crate::GpuBlock = $ir_block;
+                    let (msl_source, wgsl_source) = $crate::compile_kernel_ir_sources(
+                        stringify!($fn_name),
+                        &components,
+                        &msl_defs,
+                        &wgsl_defs,
+                        &bindings,
+                        &ir,
+                    );
+                    unsafe {
+                        $crate::GpuKernelDescriptor::new(
+                            stringify!($fn_name),
+                            bindings,
+                            msl_source,
+                            wgsl_source,
+                            Self::__cpu_chunk_runner,
+                        )
+                    }
+                })
+            }
+        }
+    };
+
+    // 4 parameters (Typed Shader IR)
+    (
+        @ir
+        $(#[$meta:meta])*
+        $vis:vis fn $fn_name:ident (
+            $p0:ident : [$m0:ident] $T0:ty,
+            $p1:ident : [$m1:ident] $T1:ty,
+            $p2:ident : [$m2:ident] $T2:ty,
+            $p3:ident : [$m3:ident] $T3:ty
+        )
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Default)]
+        $vis struct $fn_name;
+
+        impl $fn_name {
+            #[inline(always)]
+            pub fn call(
+                $p0: $crate::__sumeru_gpu_param_type!('_, [$m0] $T0),
+                $p1: $crate::__sumeru_gpu_param_type!('_, [$m1] $T1),
+                $p2: $crate::__sumeru_gpu_param_type!('_, [$m2] $T2),
+                $p3: $crate::__sumeru_gpu_param_type!('_, [$m3] $T3),
+            ) {
+                $($body)*
+            }
+
+            unsafe fn __cpu_chunk_runner(
+                raw_ptrs: &[*mut u8],
+                active_rows: usize,
+                _uniforms: &$crate::GpuDispatchUniforms,
+            ) {
+                let s0 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m0] $T0, raw_ptrs[0], active_rows) };
+                let s1 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m1] $T1, raw_ptrs[1], active_rows) };
+                let s2 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m2] $T2, raw_ptrs[2], active_rows) };
+                let s3 = unsafe { $crate::__sumeru_gpu_slice_from_raw!([$m3] $T3, raw_ptrs[3], active_rows) };
+                for idx in 0..active_rows {
+                    Self::call(
+                        $crate::__sumeru_gpu_elem_borrow!([$m0] s0, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m1] s1, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m2] s2, idx),
+                        $crate::__sumeru_gpu_elem_borrow!([$m3] s3, idx),
+                    );
+                }
+            }
+        }
+
+        impl ::std::ops::Deref for $fn_name {
+            type Target = for<'a, 'b, 'c, 'd> fn(
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('c, [$m2] $T2),
+                $crate::__sumeru_gpu_param_type!('d, [$m3] $T3),
+            );
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                const FN_PTR: for<'a, 'b, 'c, 'd> fn(
+                    $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                    $crate::__sumeru_gpu_param_type!('b, [$m1] $T1),
+                    $crate::__sumeru_gpu_param_type!('c, [$m2] $T2),
+                    $crate::__sumeru_gpu_param_type!('d, [$m3] $T3),
+                ) = $fn_name::call;
+                &FN_PTR
+            }
+        }
+
+        impl<'a> $crate::QueryForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                $crate::__sumeru_gpu_param_type!('a, [$m3] $T3),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row(
+                &mut self,
+                (_entity, (a, b, c, d)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                        $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                        $crate::__sumeru_gpu_param_type!('a, [$m3] $T3),
+                    ),
+                ),
+            ) {
+                Self::call(a, b, c, d);
+            }
+        }
+
+        impl<'a> $crate::QueryParForEachOp<(
+            $crate::EntityId,
+            (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                $crate::__sumeru_gpu_param_type!('a, [$m3] $T3),
+            ),
+        ), $crate::KernelOpMarker> for $fn_name {
+            #[inline(always)]
+            fn call_row_par(
+                &self,
+                (_entity, (a, b, c, d)): (
+                    $crate::EntityId,
+                    (
+                        $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                        $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                        $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                        $crate::__sumeru_gpu_param_type!('a, [$m3] $T3),
+                    ),
+                ),
+            ) {
+                Self::call(a, b, c, d);
+            }
+        }
+
+        unsafe impl<'a> $crate::GpuKernel<'a> for $fn_name {
+            type Query = (
+                $crate::__sumeru_gpu_param_type!('a, [$m0] $T0),
+                $crate::__sumeru_gpu_param_type!('a, [$m1] $T1),
+                $crate::__sumeru_gpu_param_type!('a, [$m2] $T2),
+                $crate::__sumeru_gpu_param_type!('a, [$m3] $T3),
+            );
+
+            fn descriptor(&self) -> &'static $crate::GpuKernelDescriptor {
+                static DESC: ::std::sync::OnceLock<$crate::GpuKernelDescriptor> = ::std::sync::OnceLock::new();
+                DESC.get_or_init(|| {
+                    <$T0 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T1 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T2 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    <$T3 as $crate::GpuShaderStruct>::assert_shader_layout();
+                    let bindings = vec![
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T0>(),
+                            elem_size: ::std::mem::size_of::<$T0>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T1>(),
+                            elem_size: ::std::mem::size_of::<$T1>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p2),
+                            struct_name: <$T2 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T2>(),
+                            elem_size: ::std::mem::size_of::<$T2>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m2]),
+                        },
+                        $crate::GpuKernelBindingSpec {
+                            param_name: stringify!($p3),
+                            struct_name: <$T3 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            type_id: $crate::ComponentTypeId::of::<$T3>(),
+                            elem_size: ::std::mem::size_of::<$T3>(),
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m3]),
+                        },
+                    ];
+                    let components = [
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p0),
+                            struct_name: <$T0 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T0 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m0]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p1),
+                            struct_name: <$T1 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T1 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m1]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p2),
+                            struct_name: <$T2 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T2 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m2]),
+                        },
+                        $crate::GpuComponentSchema {
+                            param_name: stringify!($p3),
+                            struct_name: <$T3 as $crate::GpuShaderStruct>::STRUCT_NAME,
+                            fields: <$T3 as $crate::GpuShaderStruct>::FIELDS,
+                            mutable: $crate::__sumeru_gpu_is_mut!([$m3]),
+                        },
+                    ];
+                    let msl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T2 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                        <$T3 as $crate::GpuShaderStruct>::msl_struct_definition(),
+                    ];
+                    let wgsl_defs = vec![
+                        <$T0 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T1 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T2 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                        <$T3 as $crate::GpuShaderStruct>::wgsl_struct_definition(),
+                    ];
+                    let ir: $crate::GpuBlock = $ir_block;
+                    let (msl_source, wgsl_source) = $crate::compile_kernel_ir_sources(
+                        stringify!($fn_name),
+                        &components,
+                        &msl_defs,
+                        &wgsl_defs,
+                        &bindings,
+                        &ir,
+                    );
+                    unsafe {
+                        $crate::GpuKernelDescriptor::new(
+                            stringify!($fn_name),
+                            bindings,
+                            msl_source,
+                            wgsl_source,
+                            Self::__cpu_chunk_runner,
+                        )
+                    }
+                })
+            }
+        }
+    };
+
     // Fallback @normalized arms for direct macro_rules! callers
     (
         @normalized
@@ -1184,6 +1920,24 @@ macro_rules! sumeru_gpu_fn {
 #[macro_export]
 macro_rules! sumeru_gpu_kernel {
     (
+        @ir
+        $(#[$meta:meta])*
+        $vis:vis kernel $KernelType:ident fn $fn_name:ident (
+            $($params:tt)*
+        )
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $crate::sumeru_gpu_fn! {
+            @ir
+            $(#[$meta])*
+            $vis fn $fn_name ( $($params)* )
+            ir = $ir_block,
+            body = { $($body)* }
+        }
+        $vis type $KernelType = $fn_name;
+    };
+    (
         @translated
         $(#[$meta:meta])*
         $vis:vis kernel $KernelType:ident fn $fn_name:ident (
@@ -1202,5 +1956,56 @@ macro_rules! sumeru_gpu_kernel {
             body = { $($body)* }
         }
         $vis type $KernelType = $fn_name;
+    };
+}
+
+/// 可组合 `#[gpu]` 纯计算辅助函数（Device Helper Function）展开宏。
+#[macro_export]
+macro_rules! sumeru_gpu_helper_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $fn_name:ident (
+            $( $p_ident:ident : [$p_mut:ident] $p_ty:ty => $p_kind:expr ),* $(,)?
+        ) -> $ret_ty:ty => $ret_kind:expr,
+        ir = $ir_block:expr,
+        body = { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Default)]
+        $vis struct $fn_name;
+
+        impl $fn_name {
+            #[inline(always)]
+            #[allow(unused_mut)]
+            pub fn call( $( mut $p_ident : $p_ty ),* ) -> $ret_ty {
+                $($body)*
+            }
+
+            #[inline]
+            pub fn gpu_helper_descriptor() -> &'static $crate::GpuHelperFnDescriptor {
+                static DESC: ::std::sync::OnceLock<$crate::GpuHelperFnDescriptor> = ::std::sync::OnceLock::new();
+                DESC.get_or_init(|| {
+                    $crate::GpuHelperFnDescriptor {
+                        name: stringify!($fn_name),
+                        params: ::std::vec![
+                            $( (stringify!($p_ident), $crate::__sumeru_gpu_is_mut!([$p_mut]), $p_kind) ),*
+                        ],
+                        return_type: $ret_kind,
+                        body: $ir_block,
+                    }
+                })
+            }
+        }
+
+        impl ::std::ops::Deref for $fn_name {
+            type Target = fn( $( $p_ty ),* ) -> $ret_ty;
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                const FN_PTR: fn( $( $p_ty ),* ) -> $ret_ty = $fn_name::call;
+                &FN_PTR
+            }
+        }
     };
 }

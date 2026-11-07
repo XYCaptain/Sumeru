@@ -1340,4 +1340,206 @@ fn m6_runtime_gpu_detection_driver_dispatch_and_morsel_par() {
     assert_eq!(cloned_store.epoch(), ep_before_failed_get_mut);
 }
 
+#[gpu]
+pub struct SimVec3State {
+    pub pos: [f32; 3],
+    pub vel: [f32; 3],
+    pub mask: [u32; 2],
+    pub steps: i32,
+}
+
+#[gpu]
+pub fn integrate_vec3_with_loops_and_bits(state: &mut SimVec3State) {
+    for axis in 0usize..3usize {
+        if (state.mask[0] & (1u32 << (axis as u32))) == 0u32 {
+            continue;
+        }
+        state.pos[axis] += state.vel[axis];
+    }
+    let mut rem: i32 = state.steps;
+    let mut acc: f32 = 0.0;
+    while rem > 0 {
+        rem -= 1;
+        acc += 0.5;
+        if acc >= 2.0 {
+            break;
+        }
+    }
+    state.pos[0] += acc;
+    state.mask[1] |= 0x80u32;
+}
+
+#[test]
+fn m7_shader_vectors_loops_and_persistent_query_gpu_dispatch() {
+    use crate::QueryBuilder;
+
+    let desc = integrate_vec3_with_loops_and_bits.descriptor();
+    let compiled = compile_and_validate_pipeline(desc)
+        .expect("Vector/array + for/while/continue/break kernel must pass Naga validation");
+    assert!(compiled.shader_validated);
+
+    let mut store_hw = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    for i in 0..64u128 {
+        store_hw
+            .insert((
+                EntityId::from_u128(i + 1),
+                (SimVec3State {
+                    pos: [1.0, 2.0, 3.0],
+                    vel: [10.0, 20.0, 30.0],
+                    // Enable axis 0 and axis 2 (binary 0b101 = 5), skip axis 1
+                    mask: [5, 0],
+                    steps: 6,
+                },),
+            ))
+            .unwrap();
+    }
+    let mut store_cpu = store_hw.clone();
+
+    let mut hw_engine = MetalComputeEngine::new();
+    let mut cpu_engine = MetalComputeEngine::new_cpu_fallback();
+
+    let q_persistent_hw = QueryBuilder::<&mut SimVec3State>::new()
+        .build(&store_hw)
+        .unwrap();
+    let q_persistent_cpu = QueryBuilder::<&mut SimVec3State>::new()
+        .build(&store_cpu)
+        .unwrap();
+
+    // Cross-store dispatch on a persistent Query handle must fail with StoreMismatch
+    assert!(matches!(
+        q_persistent_hw.gpu_for_each_on(&mut store_cpu, &mut cpu_engine, integrate_vec3_with_loops_and_bits),
+        Err(crate::error::StateError::StoreMismatch { .. })
+    ));
+
+    let stats_hw = q_persistent_hw
+        .gpu_for_each_on(&mut store_hw, &mut hw_engine, integrate_vec3_with_loops_and_bits)
+        .unwrap();
+    let stats_cpu = q_persistent_cpu
+        .gpu_for_each_on(&mut store_cpu, &mut cpu_engine, integrate_vec3_with_loops_and_bits)
+        .unwrap();
+    assert_eq!(stats_hw.total_rows, 64);
+    assert_eq!(stats_cpu.total_rows, 64);
+
+    // Axis 0: 1.0 + 10.0 + 2.0 (while loop broken at acc=2.0) = 13.0
+    // Axis 1: skipped via `continue` -> remains 2.0
+    // Axis 2: 3.0 + 30.0 = 33.0
+    for i in 0..64u128 {
+        let e = EntityId::from_u128(i + 1);
+        let s_hw = *store_hw.get::<SimVec3State>(e).unwrap();
+        let s_cpu = *store_cpu.get::<SimVec3State>(e).unwrap();
+        assert_eq!(s_hw, s_cpu, "Hardware GPU and CPU fallback must be bit-exact on row {i}");
+        assert_eq!(s_hw.pos, [13.0, 2.0, 33.0]);
+        assert_eq!(s_hw.mask, [5, 0x80]);
+    }
+
+    // Row-filtered persistent Query must be rejected by gpu_for_each_on with zero side effects
+    let epoch_before = store_hw.epoch();
+    let q_row_filtered = QueryBuilder::<&mut SimVec3State>::new()
+        .with_flag::<0>()
+        .build(&store_hw)
+        .unwrap();
+    assert!(
+        q_row_filtered
+            .gpu_for_each_on(&mut store_hw, &mut hw_engine, integrate_vec3_with_loops_and_bits)
+            .is_err()
+    );
+    assert_eq!(store_hw.epoch(), epoch_before);
+}
+
+const TEST_SUBSTEP_DT: f32 = 0.25;
+const TEST_MAX_SPEED: f32 = 8.0;
+
+#[gpu]
+pub fn helper_clamp_symmetric(val: f32, limit: f32) -> f32 {
+    if val > limit {
+        limit
+    } else if val < -limit {
+        -limit
+    } else {
+        val
+    }
+}
+
+#[gpu]
+pub fn helper_damped_delta(v: f32, damping: f32) -> f32 {
+    let bounded = helper_clamp_symmetric(v, TEST_MAX_SPEED);
+    bounded * TEST_SUBSTEP_DT * damping
+}
+
+#[gpu]
+pub fn integrate_with_ir_consts_and_helpers(state: &mut SimVec3State) {
+    const INLINE_DAMPING: f32 = 0.5;
+    // Notice `0..state.mask[0]` uses an unsuffixed `0`! `ShaderTypeEnv` automatically infers
+    // `state.mask[0]` is `u32` from `SimVec3State::FIELDS` and promotes `0` -> `0u`, step -> `1u`.
+    for _step in 0..state.mask[0] {
+        state.pos[0] += helper_damped_delta(state.vel[0], INLINE_DAMPING);
+        state.pos[1] += helper_damped_delta(state.vel[1], std::f32::consts::FRAC_1_SQRT_2 * 0.0 + 1.0);
+    }
+}
+
+#[test]
+fn m8_typed_shader_ir_external_consts_and_composable_helpers() {
+    let desc = integrate_with_ir_consts_and_helpers.descriptor();
+    // Topological helper order: `helper_clamp_symmetric` must appear before `helper_damped_delta`
+    let msl = desc.msl_source();
+    let wgsl = desc.wgsl_source();
+    let msl_pos_clamp = msl.find("inline float helper_clamp_symmetric").expect("MSL helper 1");
+    let msl_pos_damped = msl.find("inline float helper_damped_delta").expect("MSL helper 2");
+    assert!(
+        msl_pos_clamp < msl_pos_damped,
+        "Callee helper must be emitted before caller helper in MSL"
+    );
+
+    let wgsl_pos_clamp = wgsl.find("fn helper_clamp_symmetric").expect("WGSL helper 1");
+    let wgsl_pos_damped = wgsl.find("fn helper_damped_delta").expect("WGSL helper 2");
+    assert!(
+        wgsl_pos_clamp < wgsl_pos_damped,
+        "Callee helper must be emitted before caller helper in WGSL"
+    );
+    assert!(
+        wgsl.contains("for (var _step = 0u; _step < state.mask[0]; _step += 1u)"),
+        "ShaderTypeEnv must infer `state.mask[0]` as u32 and promote `0` to `0u`: {wgsl}"
+    );
+
+    let compiled = compile_and_validate_pipeline(desc)
+        .expect("Typed IR with external consts and composable helpers must pass Naga validation");
+    assert!(compiled.shader_validated);
+
+    let mut store_gpu = Store::new().with_layout_optimization(LayoutOptimization::PageAlignedGpu);
+    let e1 = EntityId::from_u128(1);
+    store_gpu
+        .insert((
+            e1,
+            (SimVec3State {
+                pos: [2.0, 5.0, 0.0],
+                vel: [20.0, -4.0, 0.0], // 20.0 clamped to 8.0; -4.0 stays -4.0
+                mask: [4, 0],
+                steps: 4,
+            },),
+        ))
+        .unwrap();
+    let mut store_cpu = store_gpu.clone();
+
+    store_gpu
+        .query_mut::<&mut SimVec3State>()
+        .unwrap()
+        .gpu()
+        .for_each(integrate_with_ir_consts_and_helpers)
+        .unwrap();
+
+    store_cpu
+        .query_mut::<&mut SimVec3State>()
+        .unwrap()
+        .run(integrate_with_ir_consts_and_helpers);
+
+    // 4 steps:
+    // pos[0]: 2.0 + 4 * (8.0 * 0.25 * 0.5) = 2.0 + 4.0 = 6.0
+    // pos[1]: 5.0 + 4 * (-4.0 * 0.25 * 1.0) = 5.0 - 4.0 = 1.0
+    let s_gpu = *store_gpu.get::<SimVec3State>(e1).unwrap();
+    let s_cpu = *store_cpu.get::<SimVec3State>(e1).unwrap();
+    assert_eq!(s_gpu, s_cpu);
+    assert_eq!(s_gpu.pos, [6.0, 1.0, 0.0]);
+}
+
+
 
