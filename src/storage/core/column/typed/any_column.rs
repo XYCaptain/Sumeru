@@ -114,18 +114,38 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
     }
 
     fn upgrade_archive_capability_from(&mut self, source: &dyn AnyColumn) -> bool {
+        let mut changed = false;
         if !self.archive_vtable.has_capability && source.has_archive_capability() {
             if let Some(src_typed) = source.as_any().downcast_ref::<TypedColumn<T>>() {
                 self.archive_vtable = src_typed.archive_vtable;
-                return true;
+                changed = true;
             }
         }
-        false
+        if !self.backing.is_page_aligned() && source.is_page_aligned() {
+            self.backing.promote_to_page_aligned();
+            changed = true;
+        }
+        changed
     }
 
     #[inline]
     fn physical_version(&self) -> u64 {
         self.backing.physical_version()
+    }
+
+    #[inline]
+    fn is_page_aligned(&self) -> bool {
+        self.backing.is_page_aligned()
+    }
+
+    #[inline]
+    fn promote_to_page_aligned(&mut self) {
+        self.backing.promote_to_page_aligned();
+    }
+
+    #[inline]
+    fn metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        self.backing.as_metal_raw_parts()
     }
 
     #[inline]
@@ -169,10 +189,14 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
                 actual: "frozen column payload".into(),
             }
         })?;
+        let mut backing = ColumnBacking::from_block(typed_block);
+        if self.backing.is_page_aligned() && !backing.is_page_aligned() {
+            backing.promote_to_page_aligned();
+        }
         Ok(Box::new(Self {
             type_id: self.type_id,
             type_name: self.type_name,
-            backing: ColumnBacking::from_block(typed_block),
+            backing,
             archive_vtable: self.archive_vtable,
         }))
     }
@@ -191,10 +215,17 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
             Ok(mut owned) => std::mem::take(&mut owned.values),
             Err(shared) => shared.values.clone(),
         };
+        let backing = if self.backing.is_page_aligned() {
+            ColumnBacking::from_page_aligned(
+                crate::storage::core::column::page_aligned::PageAlignedBuffer::from_vec(values),
+            )
+        } else {
+            ColumnBacking::from_vec(values)
+        };
         Ok(Box::new(Self {
             type_id: self.type_id,
             type_name: self.type_name,
-            backing: ColumnBacking::from_vec(values),
+            backing,
             archive_vtable: self.archive_vtable,
         }))
     }
@@ -224,7 +255,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
                 "Row out of bounds in restore_row".into(),
             ));
         }
-        slice[target_row] = col_block.data[source_idx].clone();
+        slice[target_row] = col_block.as_slice()[source_idx].clone();
         Ok(())
     }
 
@@ -249,7 +280,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
             ));
         }
         slice[target_start..target_start + len]
-            .clone_from_slice(&col_block.data[source_start..source_start + len]);
+            .clone_from_slice(&col_block.as_slice()[source_start..source_start + len]);
         Ok(())
     }
 
@@ -261,7 +292,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
     ) -> Result<(), StateError> {
         let any_box = block.into_any_box();
         let mut data: Vec<T> = match any_box.downcast::<backing::ColumnBlock<T>>() {
-            Ok(mut col_block) => std::mem::take(&mut col_block.data),
+            Ok(col_block) => (*col_block).into_vec(),
             Err(any_box) => match any_box.downcast::<Vec<T>>() {
                 Ok(boxed_vec) => *boxed_vec,
                 Err(any_box) => {
@@ -300,7 +331,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
     ) -> Result<(), StateError> {
         let any_box = block.into_any_box();
         let mut data: Vec<T> = match any_box.downcast::<backing::ColumnBlock<T>>() {
-            Ok(mut typed_block) => std::mem::take(&mut typed_block.data),
+            Ok(typed_block) => (*typed_block).into_vec(),
             Err(any_box) => match any_box.downcast::<Vec<T>>() {
                 Ok(boxed_vec) => *boxed_vec,
                 Err(any_box) => {
@@ -364,7 +395,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
     }
 
     fn new_append_column(&self, capacity: usize) -> Option<(Box<dyn AnyColumn>, *mut u8, usize)> {
-        if capacity == 0 {
+        if capacity == 0 || self.backing.is_page_aligned() {
             return None;
         }
         let mut vec = Vec::<T>::new();
@@ -462,10 +493,17 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> AnyColumn for TypedColumn
                 .ok_or_else(|| StateError::AccessDenied("Reorder row out of bounds".into()))?;
             values.push(val.clone());
         }
+        let backing = if self.backing.is_page_aligned() {
+            backing::ColumnBacking::from_page_aligned(
+                crate::storage::core::column::page_aligned::PageAlignedBuffer::from_vec(values),
+            )
+        } else {
+            backing::ColumnBacking::from_vec(values)
+        };
         Ok(Box::new(Self {
             type_id: self.type_id,
             type_name: self.type_name,
-            backing: backing::ColumnBacking::from_vec(values),
+            backing,
             archive_vtable: self.archive_vtable,
         }))
     }

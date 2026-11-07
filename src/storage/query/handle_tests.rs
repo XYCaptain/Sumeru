@@ -433,17 +433,17 @@ fn test_non_migrating_row_flags_and_structural_preservation() {
         .unwrap();
 
     // Initially all flags are false
-    assert!(!store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
+    assert!(!store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
 
     // Set flag 0 on e1 and e3 (in-place without archetype migration!)
     let gen_before = store.archetype_set_generation();
     store.set_flag::<0>(e1, true).unwrap();
     store.set_flag::<0>(e3, true).unwrap();
     assert_eq!(store.archetype_set_generation(), gen_before);
-    assert!(store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
-    assert!(store.has_flag::<0>(e3).unwrap());
+    assert!(store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
+    assert!(store.has_flag::<0>(e3));
 
     // Query with_flag::<0> and without_flag::<0>
     let q_flagged = QueryBuilder::<&Pos>::new()
@@ -457,28 +457,28 @@ fn test_non_migrating_row_flags_and_structural_preservation() {
 
     let mut flagged_xs = Vec::new();
     q_flagged
-        .for_each(&store, |pos| flagged_xs.push(pos.x))
+        .for_each(&store, |(_id, pos)| flagged_xs.push(pos.x))
         .unwrap();
     assert_eq!(flagged_xs, vec![1, 3]);
 
     let mut unflagged_xs = Vec::new();
     q_unflagged
-        .for_each(&store, |pos| unflagged_xs.push(pos.x))
+        .for_each(&store, |(_id, pos)| unflagged_xs.push(pos.x))
         .unwrap();
     assert_eq!(unflagged_xs, vec![2]);
 
     // Structural migration: add TagActive to e1 -> e1 moves to a new archetype,
     // and e3 swap-removes into e1's old row 0! Both e1 and e3 must preserve their flags!
-    store.add_component_typed(e1, TagActive).unwrap();
-    assert!(store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
-    assert!(store.has_flag::<0>(e3).unwrap());
+    store.add(e1, TagActive).unwrap();
+    assert!(store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
+    assert!(store.has_flag::<0>(e3));
 
     let mut iter_flagged: Vec<i32> = store
         .query::<&Pos>()
         .with_flag::<0>()
-        .into_iter()
-        .map(|p| p.x)
+        .iter()
+        .map(|(_id, p)| p.x)
         .collect();
     iter_flagged.sort_unstable();
     assert_eq!(iter_flagged, vec![1, 3]);
@@ -506,7 +506,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     let baseline_epoch = store.epoch();
 
     // No writes after baseline_epoch -> changed_since returns 0 rows
-    let q_changed = QueryBuilder::<(EntityId, &Pos)>::new()
+    let q_changed = QueryBuilder::<&Pos>::new()
         .changed_since::<Pos>(baseline_epoch)
         .build(&store)
         .unwrap();
@@ -519,7 +519,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     // Modify entity at index 70 (in chunk 1: rows 64..128)
     let e70 = EntityId::from_u128(2000 + 70);
     store
-        .modify_component_typed::<Pos, _>(e70, |p| p.y += 10)
+        .modify::<Pos, _>(e70, |p| p.y += 10)
         .unwrap();
 
     // Now only chunk 1 (64 rows: 64..128) should be visited by changed_since::<Pos>(baseline_epoch)!
@@ -535,7 +535,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     let visited_vel: usize = store
         .query::<&Vel>()
         .changed_since::<Vel>(baseline_epoch)
-        .into_iter()
+        .iter()
         .count();
     assert_eq!(visited_vel, 0);
 }
@@ -545,6 +545,8 @@ fn test_pair_target_index_and_with_pair_query() {
     let mut store = Store::new();
     let parent_a = EntityId::from_u128(9001);
     let parent_b = EntityId::from_u128(9002);
+    store.spawn_with_id(parent_a).unwrap();
+    store.spawn_with_id(parent_b).unwrap();
 
     for i in 0..50u128 {
         let target = if i % 5 == 0 { parent_a } else { parent_b };
@@ -563,7 +565,7 @@ fn test_pair_target_index_and_with_pair_query() {
     }
 
     // Query via persistent Query with_pair
-    let q_children_a = QueryBuilder::<(EntityId, &Pos)>::new()
+    let q_children_a = QueryBuilder::<&Pos>::new()
         .with_pair::<ChildOf>(parent_a)
         .build(&store)
         .unwrap();
@@ -582,6 +584,7 @@ fn test_pair_target_index_and_with_pair_query() {
         .query_mut::<&mut Pos>()
         .unwrap()
         .with_pair::<ChildOf>(parent_a)
+        .iter()
     {
         pos.y = 999;
     }

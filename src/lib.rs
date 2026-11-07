@@ -8,6 +8,8 @@
 //!   [`Pair`]、[`Tag`]、[`Singleton`]、[`SelectBuilder`]、[`QueryBuilder`]、[`QueryMutBuilder`]、
 //!   [`Query`]、[`CommandBuffer`]、[`CommitReceipt`]、[`PageAlignedBuffer`]、[`ColumnarStoreSnapshot`]
 
+extern crate self as sumeru;
+
 pub mod al;
 pub mod binding;
 pub mod context;
@@ -22,3 +24,13 @@ pub use error::*;
 pub use id::*;
 pub use schema::*;
 pub use storage::*;
+#[cfg(feature = "gpu")]
+pub use sumeru_macros::{gpu, gpu_component, gpu_kernel, GpuComponent, GpuShaderStruct};
+
+#[doc(hidden)]
+pub mod __private {
+    pub use bytemuck;
+    pub use rkyv;
+    pub use serde;
+}
+

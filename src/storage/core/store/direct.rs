@@ -278,6 +278,7 @@ macro_rules! impl_typed_direct_batch {
                     entities: *const $crate::binding::EntityId,
                     entities_len: usize,
                     cols: ($(*mut $T,)+),
+                    chunk_epochs: [*mut u64; ARITY],
                 }
 
                 let mut cache: Option<ArchetypeCache<$($T),+>> = None;
@@ -301,9 +302,9 @@ macro_rules! impl_typed_direct_batch {
                     let current_arch_id = location.archetype_id;
 
                     // 检查局部缓存命中：相同 Archetype 连续命中时零 B 树查询
-                    let (entities_ptr, entities_len, cols) = match &cache {
+                    let (entities_ptr, entities_len, cols, chunk_epochs) = match &cache {
                         Some(c) if c.arch_id == current_arch_id => {
-                            (c.entities, c.entities_len, c.cols)
+                            (c.entities, c.entities_len, c.cols, c.chunk_epochs)
                         }
                         _ => {
                             let arch = store
@@ -322,10 +323,6 @@ macro_rules! impl_typed_direct_batch {
                                         $crate::id::ComponentTypeId::of::<$T>(),
                                         entity,
                                     )?;
-                                    arch.mark_column_all_chunks_epoch(
-                                        $crate::id::ComponentTypeId::of::<$T>(),
-                                        next_epoch,
-                                    );
                                     let col_slice = unsafe { (*typed_col).as_mut_slice() };
                                     if col_slice.len() != entities_len {
                                         return Err($crate::error::StateError::AccessDenied(format!(
@@ -336,13 +333,21 @@ macro_rules! impl_typed_direct_batch {
                                     col_slice.as_mut_ptr()
                                 },)+
                             );
+                            let chunk_epochs = [
+                                $(
+                                    arch.prepare_column_chunk_epochs_mut_ptr(
+                                        $crate::id::ComponentTypeId::of::<$T>(),
+                                    )
+                                ),+
+                            ];
                             cache = Some(ArchetypeCache {
                                 arch_id: current_arch_id,
                                 entities: entities_ptr,
                                 entities_len,
                                 cols,
+                                chunk_epochs,
                             });
-                            (entities_ptr, entities_len, cols)
+                            (entities_ptr, entities_len, cols, chunk_epochs)
                         }
                     };
 
@@ -354,7 +359,15 @@ macro_rules! impl_typed_direct_batch {
                         )));
                     }
 
-                    // 物理写入 / 置换
+                    // 物理写入 / 置换并精确更新所属 64 行块纪元
+                    let chunk_idx = row >> 6;
+                    unsafe {
+                        $(
+                            if !chunk_epochs[$idx].is_null() {
+                                *chunk_epochs[$idx].add(chunk_idx) = next_epoch;
+                            }
+                        )+
+                    }
                     if KEEP {
                         let old_tuple = unsafe {
                             (

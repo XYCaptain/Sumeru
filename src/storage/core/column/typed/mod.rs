@@ -92,6 +92,33 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> TypedColumn<T> {
     }
 
     #[inline]
+    pub fn with_page_aligned(mut self) -> Self {
+        self.backing.promote_to_page_aligned();
+        self
+    }
+
+    #[inline]
+    pub fn is_page_aligned(&self) -> bool {
+        self.backing.is_page_aligned()
+    }
+
+    #[inline]
+    pub fn promote_to_page_aligned(&mut self) {
+        self.backing.promote_to_page_aligned();
+    }
+
+    #[inline]
+    pub fn as_metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        self.backing.as_metal_raw_parts()
+    }
+
+    #[inline]
+    pub fn share_root_block(&mut self) -> std::sync::Arc<super::backing::ColumnBlock<T>> {
+        let ColumnBacking::Direct(block) = &mut self.backing;
+        block.freeze()
+    }
+
+    #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.backing.reserve(additional);
     }
@@ -186,7 +213,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> TypedColumn<T> {
         Self {
             type_id: self.type_id,
             type_name: self.type_name,
-            backing: ColumnBacking::new(),
+            backing: self.backing.empty_with_origin(),
             archive_vtable: self.archive_vtable,
         }
     }
@@ -195,7 +222,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> TypedColumn<T> {
     pub fn merge_from(&mut self, other: &Self) {
         let src = other.as_slice();
         if !src.is_empty() {
-            self.backing.make_contiguous_owned().extend_from_slice(src);
+            self.backing.extend_from_slice(src);
         }
     }
 
@@ -373,9 +400,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ColumnLayout for TypedCol
                 .ok_or_else(|| {
                     StateError::AccessDenied("Destination column type mismatch".into())
                 })?;
-            let vec = dst_typed.backing_mut().as_vec_mut();
             let base = unsafe { p.cast::<T>().add(start_row) };
-            vec.extend((0..count).map(|i| unsafe { (&*base.add(i)).clone() }));
+            dst_typed
+                .backing_mut()
+                .extend((0..count).map(|i| unsafe { (&*base.add(i)).clone() }));
             Ok(())
         }
         Some(push_clone_range::<T>)

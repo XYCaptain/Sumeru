@@ -70,6 +70,16 @@ impl ComponentDefinition {
         self.prototype.has_archive_capability()
     }
 
+    #[inline]
+    pub fn is_page_aligned(&self) -> bool {
+        self.prototype.is_page_aligned()
+    }
+
+    #[inline]
+    pub fn promote_to_page_aligned(&mut self) {
+        self.prototype.promote_to_page_aligned();
+    }
+
     /// 克隆一份用于新 Archetype 的空列 (零组件数据拷贝)
     #[inline]
     pub fn create_empty_column(&self) -> Box<dyn AnyColumn> {
@@ -105,18 +115,59 @@ impl ComponentDefinition {
         Ok(())
     }
 
-    /// 升级已有纯内存定义的归档能力为具备快照归档能力的实现
+    /// 核验分区合并时外部原型与当前注册定义是否兼容（允许纯内存分区自动升级至已归档定义）
+    pub fn check_merge_compatibility(&self, other: &dyn AnyColumn) -> Result<(), StateError> {
+        if self.rust_type_id != other.rust_type_id() || self.type_name != other.type_name() {
+            return Err(StateError::AccessDenied(format!(
+                "Component prototype {} conflicts with existing registered type",
+                self.type_id
+            )));
+        }
+        if self.codec != other.codec()
+            && !(self.codec == ColumnCodecId::None && other.has_archive_capability())
+            && !(other.codec() == ColumnCodecId::None && self.has_archive_capability())
+        {
+            return Err(StateError::AccessDenied(format!(
+                "Component prototype {} codec {:?} conflicts with existing registered codec {:?}",
+                self.type_id,
+                other.codec(),
+                self.codec,
+            )));
+        }
+        if self.codec != ColumnCodecId::None
+            && other.codec() != ColumnCodecId::None
+            && self.schema_version != other.schema_version()
+        {
+            return Err(StateError::AccessDenied(format!(
+                "Component prototype {} schema version {} conflicts with existing registered version {}",
+                self.type_id,
+                other.schema_version(),
+                self.schema_version,
+            )));
+        }
+        Ok(())
+    }
+
+    /// 升级已有纯内存定义的归档能力或 16KB 页对齐能力
     pub fn upgrade_archive_capability(&mut self, new_prototype: &dyn AnyColumn) -> Result<(), StateError> {
-        if !self.has_archive_capability() && new_prototype.has_archive_capability() {
-            if self.rust_type_id != new_prototype.rust_type_id() || self.type_name != new_prototype.type_name() {
-                return Err(StateError::AccessDenied(format!(
-                    "Cannot upgrade archive capability for {} due to type mismatch",
-                    self.type_id
-                )));
+        if self.rust_type_id != new_prototype.rust_type_id() || self.type_name != new_prototype.type_name() {
+            return Err(StateError::AccessDenied(format!(
+                "Cannot upgrade archive capability for {} due to type mismatch",
+                self.type_id
+            )));
+        }
+        let can_upgrade_archive = !self.has_archive_capability() && new_prototype.has_archive_capability();
+        let can_upgrade_paged = !self.is_page_aligned() && new_prototype.is_page_aligned();
+        if can_upgrade_archive || can_upgrade_paged {
+            let was_paged = self.is_page_aligned() || new_prototype.is_page_aligned();
+            if can_upgrade_archive {
+                self.codec = new_prototype.codec();
+                self.schema_version = new_prototype.schema_version();
+                self.prototype = new_prototype.empty_clone();
             }
-            self.codec = new_prototype.codec();
-            self.schema_version = new_prototype.schema_version();
-            self.prototype = new_prototype.empty_clone();
+            if was_paged {
+                self.prototype.promote_to_page_aligned();
+            }
             Ok(())
         } else {
             Err(StateError::AccessDenied(format!(
@@ -224,6 +275,17 @@ impl ComponentRegistry {
         self.definitions.get(&type_id).map(|d| d.create_empty_column())
     }
 
+    /// 将当前注册表中所有原型提升为 16KB 页对齐模式
+    pub fn promote_all_to_page_aligned(&mut self) {
+        if self.definitions.values().all(|d| d.is_page_aligned()) {
+            return;
+        }
+        let defs = Arc::make_mut(&mut self.definitions);
+        for def in defs.values_mut() {
+            def.promote_to_page_aligned();
+        }
+    }
+
     /// 暂存并校验组件原型批次 (All-or-Nothing 只读暂存)
     ///
     /// 完整继承现有安全校验防线，绝不直接变更内部注册状态：
@@ -261,16 +323,30 @@ impl ComponentRegistry {
             // 4. 单批次内防重与一致性比对
             if let Some(staged) = staging.get_mut(&type_id) {
                 staged.check_compatibility(column.as_ref())?;
+                let was_paged = staged.is_page_aligned() || column.is_page_aligned();
                 if !staged.has_archive_capability() && column.has_archive_capability() {
                     *staged = ComponentDefinition::new(column);
+                }
+                if was_paged {
+                    staged.promote_to_page_aligned();
                 }
                 continue;
             }
             // 5. 与正式注册表中已有定义比对冲突
             if let Some(existing) = self.definitions.get(&type_id) {
                 existing.check_compatibility(column.as_ref())?;
-                if !existing.has_archive_capability() && column.has_archive_capability() {
-                    staging.insert(type_id, ComponentDefinition::new(column));
+                let upgrade_archive = !existing.has_archive_capability() && column.has_archive_capability();
+                let upgrade_paged = !existing.is_page_aligned() && column.is_page_aligned();
+                if upgrade_archive || upgrade_paged {
+                    let mut def = if upgrade_archive {
+                        ComponentDefinition::new(column)
+                    } else {
+                        existing.clone()
+                    };
+                    if existing.is_page_aligned() || upgrade_paged {
+                        def.promote_to_page_aligned();
+                    }
+                    staging.insert(type_id, def);
                 }
                 continue;
             }
@@ -307,7 +383,10 @@ impl ComponentRegistry {
         }
         let needs_mutation = new_defs.iter().any(|(type_id, def)| {
             match self.definitions.get(type_id) {
-                Some(existing) => !existing.has_archive_capability() && def.has_archive_capability(),
+                Some(existing) => {
+                    (!existing.has_archive_capability() && def.has_archive_capability())
+                        || (!existing.is_page_aligned() && def.is_page_aligned())
+                }
                 None => true,
             }
         });
@@ -317,7 +396,9 @@ impl ComponentRegistry {
         let defs = Arc::make_mut(&mut self.definitions);
         for (type_id, def) in new_defs {
             if let Some(existing) = defs.get_mut(&type_id) {
-                if !existing.has_archive_capability() && def.has_archive_capability() {
+                if (!existing.has_archive_capability() && def.has_archive_capability())
+                    || (!existing.is_page_aligned() && def.is_page_aligned())
+                {
                     existing
                         .upgrade_archive_capability(def.prototype())
                         .expect("pre-validated staging definitions must upgrade successfully");

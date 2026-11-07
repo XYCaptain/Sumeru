@@ -13,9 +13,12 @@ pub use entity_mut::EntityMut;
 pub use entity_ref::{ComponentRef, EntityData, EntityRef};
 pub use handle::{MatchedTableBinding, Query, QueryBuilder, QueryEntityRequest};
 pub use spec::{
-    merged_access_descriptors, All, BusinessFilter, ChangedSince, ColumnChunkProbe, ComponentField,
-    FilterEq, QueryChunks, QueryChunksIter, QueryData, QueryFilter, QueryIter, QueryMutBuilder,
-    QueryMutData, QueryMutParamShape, QueryMutShape, SelectBuilder, With, WithFlag, WithPairTarget,
-    Without, WithoutFlag,
+    merged_access_descriptors, All, BusinessFilter, ChangedSince, ClosureOpMarker,
+    ColumnChunkProbe, ComponentField, FilterEq, KernelOpMarker, QueryChunks, QueryChunksIter,
+    QueryData, QueryFilter, QueryForEachOp, QueryIter, QueryMutBuilder, QueryMutData,
+    QueryMutParamShape, QueryMutShape, QueryParForEachOp, QueryParMutRunner, QueryRowItem,
+    SelectBuilder, SelectParRunner, With, WithFlag, WithPairTarget, Without, WithoutFlag,
 };
+#[cfg(feature = "gpu")]
+pub use spec::QueryGpuRunner;
 pub use crate::storage::archetype::RowBitMask;

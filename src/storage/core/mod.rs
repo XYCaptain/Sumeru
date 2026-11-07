@@ -34,6 +34,14 @@ pub use store::{
 };
 
 #[cfg(test)]
+pub(crate) use allocator::{EntityAllocator, EntityLocation};
+#[cfg(test)]
+pub(crate) use archetype::Archetype;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use column::InPlaceReplacements;
+
+#[cfg(test)]
 mod allocator_tests;
 #[cfg(test)]
 mod archetype_tests;

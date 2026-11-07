@@ -454,21 +454,27 @@ impl StateSpace for Store {
         &mut self,
         mut f: impl FnMut(&[Self::Entity], &mut [A]),
     ) {
+        let cid_a = ComponentTypeId::of::<A>();
+        let next_epoch = self.epoch.wrapping_add(1);
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !arch.component_types_slice().contains(&cid_a)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
             if let Some(col_a) = unsafe { flat_col_slice_mut::<A>(arch, len) } {
                 let entities = unsafe { std::slice::from_raw_parts(entities_ptr, len) };
                 f(entities, col_a);
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 touched = true;
             }
         }
         if touched {
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = next_epoch;
         }
     }
 
@@ -477,15 +483,23 @@ impl StateSpace for Store {
         &mut self,
         mut f: impl FnMut(&[Self::Entity], &mut [A], &[B]),
     ) {
+        let cid_a = ComponentTypeId::of::<A>();
+        let cid_b = ComponentTypeId::of::<B>();
         assert_ne!(
-            ComponentTypeId::of::<A>(),
-            ComponentTypeId::of::<B>(),
+            cid_a,
+            cid_b,
             "Cannot borrow the same component type A and B as both mutable and immutable"
         );
+        let next_epoch = self.epoch.wrapping_add(1);
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
@@ -497,11 +511,12 @@ impl StateSpace for Store {
                 let entities = unsafe { std::slice::from_raw_parts(entities_ptr, len) };
                 let col_b = unsafe { std::slice::from_raw_parts(col_b_ptr, len) };
                 f(entities, col_a, col_b);
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 touched = true;
             }
         }
         if touched {
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = next_epoch;
         }
     }
 
@@ -517,10 +532,22 @@ impl StateSpace for Store {
             cid_a != cid_b && cid_a != cid_c && cid_b != cid_c,
             "Cannot alias component types in for_each_chunk_mut3"
         );
+        let next_epoch = self.epoch.wrapping_add(1);
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+                || !comp_slice.contains(&cid_c)
+            {
+                continue;
+            }
+            if arch.get_column::<A>().is_none_or(|c| c.len() < len)
+                || arch.get_column::<B>().is_none_or(|c| c.len() < len)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
@@ -543,10 +570,12 @@ impl StateSpace for Store {
                 let col_c = std::slice::from_raw_parts(col_c_ptr, len);
                 f(entities, col_a, col_b, col_c);
             }
+            arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
+            arch.mark_column_all_chunks_epoch(cid_b, next_epoch);
             touched = true;
         }
         if touched {
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = next_epoch;
         }
     }
 
@@ -555,15 +584,21 @@ impl StateSpace for Store {
         f: impl Fn(&[Self::Entity], &mut [A]) + Send + Sync,
     ) {
         const SUBCHUNK: usize = 4096;
+        let cid_a = ComponentTypeId::of::<A>();
+        let next_epoch = self.epoch.wrapping_add(1);
         let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !arch.component_types_slice().contains(&cid_a)
+            {
                 continue;
             }
             let ent_ptr = arch.entities().as_ptr() as usize;
             if let Some(col_a) = unsafe { flat_col_slice_mut::<A>(arch, len) } {
                 let a_ptr = col_a.as_mut_ptr() as usize;
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 let mut offset = 0;
                 while offset < len {
                     let take = (len - offset).min(SUBCHUNK);
@@ -582,7 +617,7 @@ impl StateSpace for Store {
                 let col_a = std::slice::from_raw_parts_mut(a_addr as *mut A, len);
                 f(ents, col_a);
             });
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = next_epoch;
         }
     }
 
@@ -594,10 +629,16 @@ impl StateSpace for Store {
         let cid_a = ComponentTypeId::of::<A>();
         let cid_b = ComponentTypeId::of::<B>();
         assert_ne!(cid_a, cid_b, "Cannot alias A and B in par_for_each_chunk_mut2");
+        let next_epoch = self.epoch.wrapping_add(1);
         let mut tasks: Vec<(usize, usize, usize, usize)> = Vec::new();
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+            {
                 continue;
             }
             let ent_ptr = arch.entities().as_ptr() as usize;
@@ -607,6 +648,7 @@ impl StateSpace for Store {
             };
             if let Some(col_a) = unsafe { flat_col_slice_mut::<A>(arch, len) } {
                 let a_ptr = col_a.as_mut_ptr() as usize;
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 let mut offset = 0;
                 while offset < len {
                     let take = (len - offset).min(SUBCHUNK);
@@ -629,7 +671,7 @@ impl StateSpace for Store {
                     let col_b = std::slice::from_raw_parts(b_addr as *const B, len);
                     f(ents, col_a, col_b);
                 });
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = next_epoch;
         }
     }
 }

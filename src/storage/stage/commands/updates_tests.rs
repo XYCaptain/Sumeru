@@ -104,7 +104,9 @@ fn linked_targets_do_not_inherit_compact_lane_index_limit() {
         validated_archetypes: ArchetypeValidationCache::default(),
         touched_archetypes: vec![0; u16::MAX as usize + 1],
         pointer_scratch: Vec::new(),
+        epoch_pointer_scratch: Vec::new(),
         linked_bound_ptr: AtomicPtr::new(std::ptr::null_mut()),
+        linked_chunk_ep_ptr: AtomicPtr::new(std::ptr::null_mut()),
     };
     let arch = &store.archetypes[location.archetype_id as usize];
     assert!(values.plan_linked(0, id, location, arch).is_ok());

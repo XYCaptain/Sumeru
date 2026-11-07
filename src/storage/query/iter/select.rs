@@ -187,6 +187,202 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectBuilder<'a, Q, F> {
             marker: PhantomData,
         }
     }
+
+    /// **① CPU 单线程只读顺序遍历（闭包）**：对所有匹配实体逐行执行闭包，完整支持 `|(pos, vel)| { ... }` 自动类型推断。
+    #[inline]
+    pub fn for_each<Op>(self, mut op: Op)
+    where
+        Q::Item: super::QueryRowItem,
+        Op: FnMut(<Q::Item as super::QueryRowItem>::Comps),
+    {
+        use super::QueryRowItem;
+        for item in self.iter() {
+            op(item.into_comps());
+        }
+    }
+
+    /// **① CPU 单线程只读顺序遍历（带 `EntityId`）**：对所有匹配实体逐行执行 `|(entity, comps)|` 闭包。
+    #[inline]
+    pub fn for_each_with_entity<Op: FnMut(Q::Item)>(self, mut op: Op) {
+        for item in self.iter() {
+            op(item);
+        }
+    }
+
+    /// **① CPU 单线程只读算子直传执行**：直接传入实现 [`super::QueryForEachOp`] 的算子逐行执行。
+    #[inline]
+    pub fn run<M, Op: super::QueryForEachOp<Q::Item, M>>(self, mut op: Op) {
+        for item in self.iter() {
+            op.call_row(item);
+        }
+    }
+
+    /// 进入 **② CPU 多核并行 (Rayon)** 只读执行模式。
+    #[inline]
+    pub fn par(self) -> SelectParRunner<'a, Q, F> {
+        SelectParRunner { builder: self }
+    }
+
+    /// **② CPU 多核只读并行遍历（闭包）**：在多核线程池上并行执行只读闭包（完整支持闭包参数类型自动推断）。
+    #[inline]
+    pub fn par_for_each<Op>(self, op: Op)
+    where
+        Q::Item: Send + super::QueryRowItem,
+        Op: Fn(<Q::Item as super::QueryRowItem>::Comps) + Send + Sync,
+    {
+        self.par().for_each(op);
+    }
+
+    /// **② CPU 多核只读并行算子直传执行**：在多核线程池上并行执行算子。
+    #[inline]
+    pub fn par_run<M, Op: super::QueryParForEachOp<Q::Item, M>>(self, op: Op)
+    where
+        Q::Item: Send,
+    {
+        self.par().run(op);
+    }
+}
+
+/// CPU 多核只读并行查询执行器（由 [`SelectBuilder::par`] 创建，采用 1024 行 Morsel-Driven 连续切片并行，零行级堆分配）。
+#[must_use = "a parallel query runner does no work until .for_each(...) or .run(...) is called"]
+pub struct SelectParRunner<'a, Q: QueryData<'a>, F: QueryFilter = All> {
+    builder: SelectBuilder<'a, Q, F>,
+}
+
+const SELECT_PAR_MORSEL_ROWS: usize = 1024;
+
+struct ParReadTable<'a> {
+    archetype: &'a Archetype,
+    mask: Option<crate::storage::archetype::RowBitMask>,
+}
+
+impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectParRunner<'a, Q, F> {
+    fn for_each_item_par<V>(self, visit: V)
+    where
+        Q::Item: Send,
+        V: Fn(Q::Item) + Send + Sync,
+    {
+        use rayon::prelude::*;
+        let mut tables = Vec::new();
+        for archetype in self.builder.archetypes.iter() {
+            let arch_len = archetype.len();
+            if arch_len == 0 || !self.builder.filter.matches_archetype(archetype) {
+                continue;
+            }
+            if Q::prepare(archetype, 0).is_none() {
+                continue;
+            }
+            let mask = if F::IS_ROW_FILTERED {
+                let m = self.builder.filter.collect_matched_row_mask(archetype);
+                if m.as_ref().is_some_and(|b| b.is_all_zero()) {
+                    continue;
+                }
+                m
+            } else {
+                None
+            };
+            tables.push(ParReadTable { archetype, mask });
+        }
+
+        tables.par_iter().for_each(|table| {
+            let arch_len = table.archetype.len();
+            let num_morsels = (arch_len + SELECT_PAR_MORSEL_ROWS - 1) / SELECT_PAR_MORSEL_ROWS;
+            (0..num_morsels).into_par_iter().for_each(|morsel_idx| {
+                let morsel_start = morsel_idx * SELECT_PAR_MORSEL_ROWS;
+                let morsel_end = (morsel_start + SELECT_PAR_MORSEL_ROWS).min(arch_len);
+                if morsel_start >= morsel_end {
+                    return;
+                }
+                if let Some(mask) = &table.mask {
+                    let first_word = morsel_start >> 6;
+                    let last_word = (morsel_end - 1) >> 6;
+                    if (first_word..=last_word)
+                        .all(|w| mask.words().get(w).copied().unwrap_or(0) == 0)
+                    {
+                        return;
+                    }
+                }
+                let entities_all = table.archetype.entities();
+                let mut seg_start = morsel_start;
+                while seg_start < morsel_end {
+                    let Some((mut state, avail_end)) = Q::prepare(table.archetype, seg_start)
+                    else {
+                        break;
+                    };
+                    let seg_end = avail_end.min(morsel_end);
+                    if seg_end <= seg_start {
+                        break;
+                    }
+                    if let Some(mask) = &table.mask {
+                        let mut cur = seg_start;
+                        while cur < seg_end {
+                            let w_idx = cur >> 6;
+                            let bit_idx = cur & 63;
+                            let word = mask.words().get(w_idx).copied().unwrap_or(0) >> bit_idx;
+                            if word == 0 {
+                                let next_cur = ((w_idx + 1) << 6).min(seg_end);
+                                let skip = next_cur - cur;
+                                if skip > 0 {
+                                    Q::skip_rows(&mut state, skip);
+                                }
+                                cur = next_cur;
+                                continue;
+                            }
+                            let tz = word.trailing_zeros() as usize;
+                            let target = (cur + tz).min(seg_end);
+                            let skip = target - cur;
+                            if skip > 0 {
+                                Q::skip_rows(&mut state, skip);
+                            }
+                            if target >= seg_end {
+                                break;
+                            }
+                            let item = Q::next(&mut state, entities_all[target]);
+                            visit(item);
+                            cur = target + 1;
+                        }
+                    } else {
+                        for &entity in &entities_all[seg_start..seg_end] {
+                            let item = Q::next(&mut state, entity);
+                            visit(item);
+                        }
+                    }
+                    seg_start = seg_end;
+                }
+            });
+        });
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行对所有匹配实体执行只读闭包（完整支持闭包参数类型自动推断）。
+    pub fn for_each<Op>(self, op: Op)
+    where
+        Q::Item: Send + super::QueryRowItem,
+        Op: Fn(<Q::Item as super::QueryRowItem>::Comps) + Send + Sync,
+    {
+        use super::QueryRowItem;
+        self.for_each_item_par(|item| {
+            op(item.into_comps());
+        });
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行对所有匹配实体执行 `|(entity, comps)|` 闭包。
+    pub fn for_each_with_entity<Op>(self, op: Op)
+    where
+        Q::Item: Send,
+        Op: Fn(Q::Item) + Send + Sync,
+    {
+        self.for_each_item_par(op);
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行对所有匹配实体直接执行算子。
+    pub fn run<M, Op: super::QueryParForEachOp<Q::Item, M>>(self, op: Op)
+    where
+        Q::Item: Send,
+    {
+        self.for_each_item_par(|item| {
+            op.call_row_par(item);
+        });
+    }
 }
 
 impl<'a, Q: QueryData<'a>, F: QueryFilter> IntoIterator for SelectBuilder<'a, Q, F> {
@@ -351,6 +547,12 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> Iterator for QueryChunksIter<'a, Q, F
                 continue;
             }
             if self.filter.matches_archetype(archetype) {
+                if F::IS_ROW_FILTERED {
+                    let m = self.filter.collect_matched_row_mask(archetype);
+                    if m.as_ref().is_some_and(|b| b.is_all_zero()) {
+                        continue;
+                    }
+                }
                 if let Some((chunk, end)) = Q::chunk(archetype, 0) {
                     assert!(end > 0 && end <= archetype.len(), "query segment must advance");
                     if end < archetype.len() {

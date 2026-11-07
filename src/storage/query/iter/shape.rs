@@ -1004,10 +1004,14 @@ pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
                 wanted.len(),
             );
         let mut ok = true;
-        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+        for (i, (id, _, is_write)) in wanted.into_iter().enumerate() {
             let is_req = (req_mask & (1u16 << i)) != 0;
             if let Some(col) = cols.get_mut(&id) {
-                let desc = ColumnDescriptor::from_column(&mut **col);
+                let desc = if is_write {
+                    ColumnDescriptor::from_column(&mut **col)
+                } else {
+                    ColumnDescriptor::from_column_ref(&**col)
+                };
                 if desc.len != entities.len() {
                     ok = false;
                     break;
@@ -1205,10 +1209,14 @@ pub(crate) fn for_each_matched_mut<'store, Q, F>(
                 wanted.len(),
             );
         let mut ok = true;
-        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+        for (i, (id, _, is_write)) in wanted.into_iter().enumerate() {
             let is_req = (req_mask & (1u16 << i)) != 0;
             if let Some(col) = cols.get_mut(&id) {
-                let desc = ColumnDescriptor::from_column(&mut **col);
+                let desc = if is_write {
+                    ColumnDescriptor::from_column(&mut **col)
+                } else {
+                    ColumnDescriptor::from_column_ref(&**col)
+                };
                 if desc.len != entities.len() {
                     ok = false;
                     break;

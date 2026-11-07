@@ -7,19 +7,30 @@
 //! 4. 完美兼容 Metal `newBufferWithBytesNoCopy` 零拷贝显存包装；
 //! 5. 纯标准库实现，零第三方依赖，安全处理 ZST（零大小类型）与异常丢弃（Panic/Drop Safety）。
 
-use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
 use std::fmt;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 硬件物理页大小常数：Apple Silicon (ARM64) 默认采用 16KB 虚拟内存页
 pub const PAGE_SIZE: usize = 16384;
+/// 硬件页大小别名（16,384 字节）
+pub const HARDWARE_PAGE_SIZE: usize = PAGE_SIZE;
+
+static NEXT_PAGE_BUFFER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_page_buffer_generation() -> u64 {
+    NEXT_PAGE_BUFFER_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// 专为 Apple Silicon GPU 零拷贝与 CPU SIMD 硬件对齐设计的平坦连续缓冲区
 pub struct PageAlignedBuffer<T> {
     ptr: NonNull<T>,
     len: usize,
     capacity: usize,
+    generation: u64,
 }
 
 #[allow(dead_code)]
@@ -31,6 +42,7 @@ impl<T> PageAlignedBuffer<T> {
             ptr: NonNull::dangling(),
             len: 0,
             capacity: 0,
+            generation: 0,
         }
     }
 
@@ -41,6 +53,54 @@ impl<T> PageAlignedBuffer<T> {
             buf.reserve(capacity);
         }
         buf
+    }
+
+    /// 从现有 `Vec<T>` 按位搬移构造 16KB 页对齐缓冲区（不触发 `T: Clone`，原 `Vec` 缓冲释放）
+    pub fn from_vec(mut vec: Vec<T>) -> Self {
+        let len = vec.len();
+        if len == 0 {
+            return Self::new();
+        }
+        let mut buf = Self::with_capacity(len);
+        if std::mem::size_of::<T>() > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(vec.as_ptr(), buf.ptr.as_ptr(), len);
+                vec.set_len(0);
+            }
+        } else {
+            unsafe {
+                vec.set_len(0);
+            }
+        }
+        buf.len = len;
+        buf
+    }
+
+    /// 将页对齐缓冲区按位搬移转换为标准 `Vec<T>`
+    pub fn into_vec(mut self) -> Vec<T> {
+        let len = self.len;
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(len);
+        if std::mem::size_of::<T>() > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), out.as_mut_ptr(), len);
+                out.set_len(len);
+            }
+        } else {
+            unsafe {
+                out.set_len(len);
+            }
+        }
+        self.len = 0;
+        out
+    }
+
+    /// 当前物理缓冲分配代际号（每次分配或重分配时递增，未分配时为 0）
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 当前有效元素个数
@@ -61,6 +121,29 @@ impl<T> PageAlignedBuffer<T> {
         self.capacity
     }
 
+    /// 当前有效元素占用的字节数
+    #[inline]
+    pub fn active_bytes(&self) -> usize {
+        self.len.saturating_mul(std::mem::size_of::<T>())
+    }
+
+    /// 当前有效元素覆盖的 16KB 物理页数
+    #[inline]
+    pub fn page_count(&self) -> usize {
+        let active = self.active_bytes();
+        if active == 0 {
+            0
+        } else {
+            (active + PAGE_SIZE - 1) / PAGE_SIZE
+        }
+    }
+
+    /// 当前已分配的 16KB 物理页总数
+    #[inline]
+    pub fn allocated_page_count(&self) -> usize {
+        self.allocated_bytes() / PAGE_SIZE
+    }
+
     /// 物理分配的真实字节总容量（保证为 16KB 的整数倍）
     #[inline]
     pub fn allocated_bytes(&self) -> usize {
@@ -79,6 +162,9 @@ impl<T> PageAlignedBuffer<T> {
         if elem_size == 0 {
             // ZST (零大小类型) 处理：无需物理分配，容量视为无限
             self.capacity = usize::MAX;
+            if self.generation == 0 {
+                self.generation = next_page_buffer_generation();
+            }
             return;
         }
 
@@ -90,7 +176,7 @@ impl<T> PageAlignedBuffer<T> {
         // 扩容策略：至少翻倍成长，且必须满足 min_cap
         let target_cap = std::cmp::max(self.capacity.saturating_mul(2), min_cap);
         let raw_bytes = target_cap.checked_mul(elem_size).expect("byte overflow");
-        
+
         // 向上圆整为 16KB 页边界的整数倍
         let page_bytes = (raw_bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let actual_cap = page_bytes / elem_size;
@@ -99,15 +185,24 @@ impl<T> PageAlignedBuffer<T> {
             .expect("Valid page-aligned layout");
 
         let new_ptr = if self.capacity == 0 {
-            unsafe { alloc(new_layout) as *mut T }
+            unsafe { alloc_zeroed(new_layout) as *mut T }
         } else {
             let old_page_bytes = self.allocated_bytes();
             let old_layout = Layout::from_size_align(old_page_bytes, PAGE_SIZE).unwrap();
-            unsafe { realloc(self.ptr.as_ptr() as *mut u8, old_layout, page_bytes) as *mut T }
+            let ptr = unsafe {
+                realloc(self.ptr.as_ptr() as *mut u8, old_layout, page_bytes)
+            };
+            if !ptr.is_null() && page_bytes > old_page_bytes {
+                unsafe {
+                    std::ptr::write_bytes(ptr.add(old_page_bytes), 0, page_bytes - old_page_bytes);
+                }
+            }
+            ptr as *mut T
         };
 
         self.ptr = NonNull::new(new_ptr).expect("Allocation failed");
         self.capacity = actual_cap;
+        self.generation = next_page_buffer_generation();
     }
 
     /// 追加单个元素到末尾
@@ -122,18 +217,25 @@ impl<T> PageAlignedBuffer<T> {
         }
     }
 
-    /// 弹出末尾元素
+    /// 弹出末尾元素（并将腾出的尾部槽位清零以维持 16KB 页零尾部不变量）
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             None
         } else {
             self.len -= 1;
-            unsafe { Some(std::ptr::read(self.ptr.as_ptr().add(self.len))) }
+            unsafe {
+                let slot = self.ptr.as_ptr().add(self.len);
+                let val = std::ptr::read(slot);
+                if std::mem::size_of::<T>() > 0 {
+                    std::ptr::write_bytes(slot as *mut u8, 0, std::mem::size_of::<T>());
+                }
+                Some(val)
+            }
         }
     }
 
-    /// 以 O(1) 尾部互换方式删除指定下标元素（ECS 密集列存的核心删除算法）
+    /// 以 O(1) 尾部互换方式删除指定下标元素（并将腾出的尾部槽位清零以维持 16KB 页零尾部不变量）
     #[inline]
     pub fn swap_remove(&mut self, index: usize) -> Option<T> {
         if index >= self.len {
@@ -141,13 +243,99 @@ impl<T> PageAlignedBuffer<T> {
         }
         unsafe {
             let last_idx = self.len - 1;
+            let last_ptr = self.ptr.as_ptr().add(last_idx);
             let val = std::ptr::read(self.ptr.as_ptr().add(index));
             if index != last_idx {
-                std::ptr::copy(self.ptr.as_ptr().add(last_idx), self.ptr.as_ptr().add(index), 1);
+                std::ptr::copy(last_ptr, self.ptr.as_ptr().add(index), 1);
+            }
+            if std::mem::size_of::<T>() > 0 {
+                std::ptr::write_bytes(last_ptr as *mut u8, 0, std::mem::size_of::<T>());
             }
             self.len -= 1;
             Some(val)
         }
+    }
+
+    /// 截断到指定长度，原位析构多余元素并保持后续字节清零
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        let old_len = self.len;
+        self.len = new_len;
+        unsafe {
+            let tail = std::slice::from_raw_parts_mut(
+                self.ptr.as_ptr().add(new_len),
+                old_len - new_len,
+            );
+            std::ptr::drop_in_place(tail);
+            if std::mem::size_of::<T>() > 0 {
+                std::ptr::write_bytes(
+                    self.ptr.as_ptr().add(new_len) as *mut u8,
+                    0,
+                    (old_len - new_len) * std::mem::size_of::<T>(),
+                );
+            }
+        }
+    }
+
+    /// 批量克隆追加切片元素
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        if other.is_empty() {
+            return;
+        }
+        self.reserve(other.len());
+        for item in other {
+            self.push(item.clone());
+        }
+    }
+
+    /// 从迭代器批量追加元素
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > 0 {
+            self.reserve(lower);
+        }
+        for item in iter {
+            self.push(item);
+        }
+    }
+
+    /// 移出指定范围的元素并返回 `Vec<T>`，其后元素前移并将腾出的尾部区间清零
+    pub fn drain(&mut self, range: Range<usize>) -> Vec<T> {
+        assert!(range.start <= range.end && range.end <= self.len, "drain range out of bounds");
+        let count = range.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count);
+        unsafe {
+            for idx in range.clone() {
+                out.push(std::ptr::read(self.ptr.as_ptr().add(idx)));
+            }
+            let tail_count = self.len - range.end;
+            if tail_count > 0 {
+                std::ptr::copy(
+                    self.ptr.as_ptr().add(range.end),
+                    self.ptr.as_ptr().add(range.start),
+                    tail_count,
+                );
+            }
+            let new_len = self.len - count;
+            if std::mem::size_of::<T>() > 0 {
+                std::ptr::write_bytes(
+                    self.ptr.as_ptr().add(new_len) as *mut u8,
+                    0,
+                    count * std::mem::size_of::<T>(),
+                );
+            }
+            self.len = new_len;
+        }
+        out
     }
 
     /// 安全读取指定下标元素
@@ -170,35 +358,33 @@ impl<T> PageAlignedBuffer<T> {
         }
     }
 
+    /// 返回底层 16KB 页对齐缓冲区首地址只读裸指针
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+
+    /// 返回底层 16KB 页对齐缓冲区首地址可变裸指针
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+
     /// 原生只读切片透传（零开销）
     #[inline]
     pub fn as_slice(&self) -> &[T] {
-        if self.len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-        }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// 原生可变切片透传（直接供 Rayon / SIMD 直写）
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        if self.len == 0 {
-            &mut []
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// 清空所有活跃元素，保留已分配物理容量
     pub fn clear(&mut self) {
-        if self.len > 0 {
-            unsafe {
-                let slice = std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len);
-                self.len = 0;
-                std::ptr::drop_in_place(slice);
-            }
-        }
+        self.truncate(0);
     }
 
     /// 导出专供 Apple Metal `newBufferWithBytesNoCopy` 使用的原始指针与页整倍数字节长度
@@ -243,11 +429,11 @@ impl<T> DerefMut for PageAlignedBuffer<T> {
 
 impl<T> Drop for PageAlignedBuffer<T> {
     fn drop(&mut self) {
-        if self.capacity > 0 && std::mem::size_of::<T>() > 0 {
-            unsafe {
-                // 1. 原位析构所有存活元素
+        unsafe {
+            if self.len > 0 && std::mem::needs_drop::<T>() {
                 std::ptr::drop_in_place(self.as_mut_slice());
-                // 2. 释放 16KB 对齐的整块物理内存
+            }
+            if self.capacity > 0 && std::mem::size_of::<T>() > 0 {
                 let page_bytes = self.allocated_bytes();
                 let layout = Layout::from_size_align(page_bytes, PAGE_SIZE).unwrap();
                 dealloc(self.ptr.as_ptr() as *mut u8, layout);

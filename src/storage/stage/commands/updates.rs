@@ -103,9 +103,11 @@ struct Values<T> {
     // begins. AtomicPtr keeps the owned plan Send + Sync without unsafe impls.
     // All access uses get_mut(), so there are no atomic loads/stores in the loop.
     pointer_scratch: Vec<AtomicPtr<T>>,
-    // NativeMultiple 路径中用于预绑定列切片指针。
+    epoch_pointer_scratch: Vec<AtomicPtr<u64>>,
+    // NativeMultiple 路径中用于预绑定列切片指针与块纪元指针。
     // bind_linked_column 设置非空值，unbind_linked_column 清零。
     linked_bound_ptr: AtomicPtr<T>,
+    linked_chunk_ep_ptr: AtomicPtr<u64>,
 }
 
 impl<T> Values<T> {
@@ -121,7 +123,9 @@ impl<T> Values<T> {
             validated_archetypes: ArchetypeValidationCache::default(),
             touched_archetypes: Vec::new(),
             pointer_scratch: Vec::new(),
+            epoch_pointer_scratch: Vec::new(),
             linked_bound_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            linked_chunk_ep_ptr: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -143,11 +147,13 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
         self.targets.clear();
         self.touched_archetypes.clear();
         self.pointer_scratch.clear();
+        self.epoch_pointer_scratch.clear();
         let cap = 65_536;
         if self.rows.capacity() > cap { self.rows = Vec::new(); }
         if self.targets.capacity() > cap { self.targets = Vec::new(); }
         if self.touched_archetypes.capacity() > cap { self.touched_archetypes = Vec::new(); }
         if self.pointer_scratch.capacity() > cap { self.pointer_scratch = Vec::new(); }
+        if self.epoch_pointer_scratch.capacity() > cap { self.epoch_pointer_scratch = Vec::new(); }
         self.type_verified = false;
         self.last_arch_id = u32::MAX;
         self.last_lane_arch_idx = 0;
@@ -155,6 +161,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
         self.validated_archetypes.mask_hi = 0;
         self.validated_archetypes.overflow = None;
         *self.linked_bound_ptr.get_mut() = std::ptr::null_mut();
+        *self.linked_chunk_ep_ptr.get_mut() = std::ptr::null_mut();
     }
 
     fn cached_bytes(&self) -> usize {
@@ -163,6 +170,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
             + self.targets.capacity() * std::mem::size_of::<NativeTarget>()
             + self.touched_archetypes.capacity() * std::mem::size_of::<u32>()
             + self.pointer_scratch.capacity() * std::mem::size_of::<AtomicPtr<T>>()
+            + self.epoch_pointer_scratch.capacity() * std::mem::size_of::<AtomicPtr<u64>>()
     }
     fn metadata(&self) -> NativeType {
         NativeType {
@@ -255,18 +263,18 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
     fn replace_linked(&mut self, value_row: usize, row: usize, archetype: &mut Archetype)
         -> ErasedComponentValue
     {
-        let dst = archetype.columns_mut().get_mut(&self.type_id)
-            .expect("validated native column").as_any_mut()
-            .downcast_mut::<TypedColumn<T>>().expect("validated native type");
+        let dst = archetype
+            .get_column_mut::<T>()
+            .expect("validated native column");
         let new = self.rows[value_row].value.take().expect("owned native value");
         let old = std::mem::replace(&mut dst.as_mut_slice()[row], new);
         ErasedComponentValue::with_component_type_id(self.type_id, old)
     }
 
     fn assign_linked(&mut self, value_row: usize, row: usize, archetype: &mut Archetype) {
-        let dst = archetype.columns_mut().get_mut(&self.type_id)
-            .expect("validated native column").as_any_mut()
-            .downcast_mut::<TypedColumn<T>>().expect("validated native type");
+        let dst = archetype
+            .get_column_mut::<T>()
+            .expect("validated native column");
         if !std::mem::needs_drop::<T>() {
             let val_ref = self.rows[value_row].value.as_ref().expect("owned native value");
             unsafe {
@@ -281,10 +289,9 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
     }
 
     fn bind_linked_column(&mut self, archetype: &mut Archetype) {
-        let column = archetype.columns_mut().get_mut(&self.type_id)
-            .expect("validated native column");
-        let data = column.as_any_mut()
-            .downcast_mut::<TypedColumn<T>>()
+        let ep_ptr = archetype.prepare_column_chunk_epochs_mut_ptr(self.type_id);
+        let data = archetype
+            .get_column_mut::<T>()
             .expect("validated typed batch column")
             .as_mut_slice();
         // SAFETY: 裸指针存储到 AtomicPtr，在 unbind 前有效。
@@ -294,16 +301,19 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
         // - 各实体操作互不相交的 row_index，行级物理隔离无别名冲突；
         // - 所有访问使用 get_mut() 在独占借用下完成，无原子开销。
         *self.linked_bound_ptr.get_mut() = data.as_mut_ptr();
+        *self.linked_chunk_ep_ptr.get_mut() = ep_ptr;
     }
 
     fn unbind_linked_column(&mut self) {
         *self.linked_bound_ptr.get_mut() = std::ptr::null_mut();
+        *self.linked_chunk_ep_ptr.get_mut() = std::ptr::null_mut();
     }
 
     fn direct_ops(&mut self) -> NativeDirectOps {
         NativeDirectOps {
             col_ptr: *self.linked_bound_ptr.get_mut() as *mut (),
             rows_ptr: self.rows.as_mut_ptr() as *mut (),
+            chunk_ep_ptr: *self.linked_chunk_ep_ptr.get_mut(),
             type_id: self.type_id,
             assign_fn: Self::raw_assign_discard_impl,
             replace_fn: Self::raw_replace_keep_impl,
@@ -316,8 +326,8 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> NativeLane for Values<T> 
 
     fn planned_archetypes(&self) -> &[u32] { &self.touched_archetypes }
 
-    fn commit_discard(&mut self, archetypes: &mut [Archetype]) {
-        self.commit_values(archetypes);
+    fn commit_discard(&mut self, archetypes: &mut [Archetype], commit_epoch: u64) {
+        self.commit_values(archetypes, commit_epoch);
     }
 
     fn mark_type_verified(&mut self) {
@@ -441,6 +451,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> Values<T> {
                         .try_reserve(touched_len - self.pointer_scratch.len())
                         .map_err(|e| StateError::CapacityExhausted(e.to_string()))?;
                     self.pointer_scratch.resize_with(touched_len, || AtomicPtr::new(std::ptr::null_mut()));
+                    self.epoch_pointer_scratch
+                        .try_reserve(touched_len - self.epoch_pointer_scratch.len())
+                        .map_err(|e| StateError::CapacityExhausted(e.to_string()))?;
+                    self.epoch_pointer_scratch.resize_with(touched_len, || AtomicPtr::new(std::ptr::null_mut()));
                 }
                 self.touched_archetypes.push(location.archetype_id);
                 self.validated_archetypes.register_validated(location.archetype_id, u32::from(idx));
@@ -455,6 +469,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> Values<T> {
     fn commit_values(
         &mut self,
         archetypes: &mut [Archetype],
+        commit_epoch: u64,
     ) {
         let touched_len = self.touched_archetypes.len();
         if self.targets.is_empty() {
@@ -463,13 +478,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> Values<T> {
 
         if touched_len == 1 {
             let arch_id = self.touched_archetypes[0] as usize;
-            let column = archetypes[arch_id]
-                .columns_mut()
-                .get_mut(&self.type_id)
-                .expect("validated native column");
-            let data = column
-                .as_any_mut()
-                .downcast_mut::<TypedColumn<T>>()
+            let arch = &mut archetypes[arch_id];
+            let chunk_ep_ptr = arch.prepare_column_chunk_epochs_mut_ptr(self.type_id);
+            let data = arch
+                .get_column_mut::<T>()
                 .expect("validated typed batch column")
                 .as_mut_slice();
 
@@ -480,32 +492,38 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> Values<T> {
                     .take()
                     .expect("owned native value");
                 data[row] = new;
+                if !chunk_ep_ptr.is_null() {
+                    unsafe {
+                        *chunk_ep_ptr.add(row >> 6) = commit_epoch;
+                    }
+                }
             }
             return;
         }
 
         let mut stack_ptrs = [const { AtomicPtr::<T>::new(std::ptr::null_mut()) }; 64];
-        let col_ptrs: &mut [AtomicPtr<T>] = if touched_len <= 64 {
-            &mut stack_ptrs[..touched_len]
+        let mut stack_ep_ptrs = [const { AtomicPtr::<u64>::new(std::ptr::null_mut()) }; 64];
+        let (col_ptrs, ep_ptrs): (&mut [AtomicPtr<T>], &mut [AtomicPtr<u64>]) = if touched_len <= 64 {
+            (&mut stack_ptrs[..touched_len], &mut stack_ep_ptrs[..touched_len])
         } else {
-            &mut self.pointer_scratch[..touched_len]
+            (&mut self.pointer_scratch[..touched_len], &mut self.epoch_pointer_scratch[..touched_len])
         };
 
         for (lane_idx, &arch_id) in self.touched_archetypes.iter().enumerate() {
-            let column = archetypes[arch_id as usize]
-                .columns_mut()
-                .get_mut(&self.type_id)
-                .expect("validated native column");
-            let data = column
-                .as_any_mut()
-                .downcast_mut::<TypedColumn<T>>()
+            let arch = &mut archetypes[arch_id as usize];
+            let ep_ptr = arch.prepare_column_chunk_epochs_mut_ptr(self.type_id);
+            let data = arch
+                .get_column_mut::<T>()
                 .expect("validated typed batch column")
                 .as_mut_slice();
             *col_ptrs[lane_idx].get_mut() = data.as_mut_ptr();
+            *ep_ptrs[lane_idx].get_mut() = ep_ptr;
         }
 
         for target in self.targets.drain(..) {
-            let ptr = *col_ptrs[target.lane_arch_idx as usize].get_mut();
+            let lane_idx = target.lane_arch_idx as usize;
+            let ptr = *col_ptrs[lane_idx].get_mut();
+            let ep_ptr = *ep_ptrs[lane_idx].get_mut();
             let row = target.row_index as usize;
             let new = self.rows[target.value_row as usize]
                 .value
@@ -514,6 +532,9 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> Values<T> {
             unsafe {
                 let dst = ptr.add(row);
                 *dst = new;
+                if !ep_ptr.is_null() {
+                    *ep_ptr.add(row >> 6) = commit_epoch;
+                }
             }
         }
     }

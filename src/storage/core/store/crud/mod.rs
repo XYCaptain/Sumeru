@@ -135,7 +135,7 @@ impl Store {
         let view = <T as crate::storage::modify::sealed::ModifyFetch<'_>>::fetch_mut(arch, row, entity)?;
         self.epoch = next_epoch;
         let res = modify_fn(view);
-        arch.mark_all_columns_row_epoch(row, next_epoch);
+        <T as crate::storage::modify::sealed::ModifyFetch<'_>>::mark_row_epoch(arch, row, next_epoch);
         Ok(res)
     }
 
@@ -258,7 +258,7 @@ impl Store {
         };
         let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         let _moved = self.archetypes[location.archetype_id as usize]
-            .swap_remove_infallible(row);
+            .swap_remove_infallible_at_epoch(row, next_epoch);
         if let Some(tail_slot) = moved_tail {
             self.allocator
                 .set_location_by_slot_infallible(tail_slot, location);
@@ -346,7 +346,7 @@ impl Store {
         }
 
         let arch_len = arch.len();
-        let Some(col) = arch.columns_mut().get_mut(&type_id) else {
+        let Some(col) = arch.get_erased_column_mut(type_id) else {
             if !arch.columns().is_empty()
                 && arch.component_types_slice().binary_search(&type_id).is_ok()
             {
@@ -357,7 +357,7 @@ impl Store {
 
         let Some(typed) = col.as_any_mut().downcast_mut::<TypedColumn<T>>() else {
             if col.len() != arch_len
-                || col.as_ref().type_id() != type_id
+                || col.type_id() != type_id
                 || !matches_name(col.type_name())
                 || col.rust_type_id().is_none()
             {
@@ -633,7 +633,7 @@ impl Store {
         };
         src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
         dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
-        src_arch.swap_remove_entity_only(src_row);
+        src_arch.swap_remove_entity_only_at_epoch(src_row, next_epoch);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -748,14 +748,14 @@ impl Store {
                 || src_arch.component_types_slice().contains(&type_id))
         {
             let arch_len = src_arch.len();
-            if let Some(col) = src_arch.columns_mut().get_mut(&type_id) {
+            if let Some(col) = src_arch.get_erased_column_mut(type_id) {
                 let matches_name = |name: &'static str| {
                     name == std::any::type_name::<T>()
                         || ComponentTypeId::from_name(name) == type_id
                 };
                 let Some(typed) = col.as_any_mut().downcast_mut::<TypedColumn<T>>() else {
                     if col.len() != arch_len
-                        || col.as_ref().type_id() != type_id
+                        || col.type_id() != type_id
                         || !matches_name(col.type_name())
                         || col.rust_type_id().is_none()
                     {
@@ -985,7 +985,7 @@ impl Store {
         };
         src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
         dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
-        src_arch.swap_remove_entity_only(src_row);
+        src_arch.swap_remove_entity_only_at_epoch(src_row, next_epoch);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -1256,7 +1256,7 @@ impl Store {
         };
         src_arch.copy_row_flags_to(src_row, dst_arch, dst_row as usize);
         dst_arch.mark_all_columns_row_epoch(dst_row as usize, next_epoch);
-        src_arch.swap_remove_entity_only(src_row);
+        src_arch.swap_remove_entity_only_at_epoch(src_row, next_epoch);
         let new_location = EntityLocation::new(dst_arch_id, dst_row);
 
         if let Some(tail_slot) = moved_tail {
@@ -1422,10 +1422,8 @@ impl Store {
         if arch.entities().get(row) != Some(&entity) {
             return Err(StateError::EntityNotFound(entity));
         }
-        arch.mark_column_row_epoch(cid, row, next_epoch);
-        let typed = arch.get_typed_column_mut::<T>(cid, entity)?;
-        let val = typed
-            .get_mut(row)
+        let val = arch
+            .get_typed_column_row_mut_at_epoch::<T>(cid, entity, row, next_epoch)?
             .ok_or(StateError::EntityNotFound(entity))?;
         self.epoch = next_epoch;
         Ok(val)
@@ -1459,9 +1457,9 @@ impl Store {
         if arch.entities().get(row) != Some(&entity) {
             return None;
         }
-        arch.mark_column_row_epoch(cid, row, next_epoch);
-        let typed = arch.get_typed_column_mut::<T>(cid, entity).ok()?;
-        let val = typed.get_mut(row)?;
+        let val = arch
+            .get_typed_column_row_mut_at_epoch::<T>(cid, entity, row, next_epoch)
+            .ok()??;
         self.epoch = next_epoch;
         Some(val)
     }
@@ -1720,6 +1718,7 @@ impl Store {
 
     /// 按给定实体顺序重排其所在原型的物理行顺序，返回发生位置移动的实体数量。
     pub fn reorder_entities(&mut self, entities: &[EntityId]) -> Result<usize, StateError> {
+        self.check_poisoned()?;
         let Some(&first) = entities.first() else {
             return Ok(0);
         };
@@ -1761,23 +1760,30 @@ impl Store {
             .filter(|&(i, &row)| i != row)
             .count();
         let slots_aligned = self.allocator.are_entities_consecutive_slots(&original);
-        let arch = &mut self.archetypes[arch_id as usize];
+        let arch = &self.archetypes[arch_id as usize];
         if moved_entities == 0 && slots_aligned && !arch.may_be_segmented_or_unaligned() {
             return Ok(0);
         }
 
-        for col in arch.columns_mut().values_mut() {
-            *col = col.reordered_column(&order, None)?;
+        let next_epoch = self.next_epoch()?;
+        let mut prepared_cols = Vec::with_capacity(arch.columns().len());
+        for (&cid, col) in arch.columns() {
+            prepared_cols.push((cid, col.reordered_column(&order, None)?));
         }
         let new_entities: Vec<EntityId> = order.iter().map(|&row| original[row]).collect();
+
+        let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         self.allocator
             .align_archetype_slots(arch_id, &original, &new_entities);
-        let next_epoch = self.epoch.saturating_add(1);
         let arch = &mut self.archetypes[arch_id as usize];
+        for (cid, new_col) in prepared_cols {
+            arch.replace_column_preserving_edges(cid, new_col);
+        }
         *arch.entities_mut() = new_entities;
         arch.reorder_row_metadata(&order, next_epoch);
         arch.rebuild_flat_columns();
         self.epoch = next_epoch;
+        poison_guard.disarm();
 
         Ok(moved_entities)
     }
