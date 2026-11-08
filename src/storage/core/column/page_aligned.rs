@@ -201,6 +201,47 @@ impl<T> PageAlignedBuffer<T> {
         }
     }
 
+    /// 当前有效元素占用的实际字节数（`len * size_of::<T>()`）
+    #[inline]
+    pub fn used_bytes(&self) -> usize {
+        self.len.saturating_mul(std::mem::size_of::<T>())
+    }
+
+    /// 尾页未使用的空闲填充字节数（`allocated_bytes() - used_bytes()`）
+    #[inline]
+    pub fn tail_padding_bytes(&self) -> usize {
+        self.allocated_bytes().saturating_sub(self.used_bytes())
+    }
+
+    /// 将有效元素末尾至 16KB 物理页边界之间的尾页空闲字节全部清零。
+    ///
+    /// 在 UMA 零拷贝提交给 GPU Compute Kernel 前调用，确保 Threadgroup / SIMD 越界预取
+    /// 读取到确定性的全 0 字节，避免未初始化内存读取。
+    #[inline]
+    pub fn zero_pad_tail(&mut self) {
+        let total = self.allocated_bytes();
+        let used = self.used_bytes();
+        if total > used {
+            unsafe {
+                let tail_ptr = (self.ptr.as_ptr() as *mut u8).add(used);
+                std::ptr::write_bytes(tail_ptr, 0, total - used);
+            }
+        }
+    }
+
+    /// 从连续切片构造 16KB 硬件页对齐且尾页零填充的缓冲区
+    pub fn from_slice_zero_padded(slice: &[T]) -> Self
+    where
+        T: Clone,
+    {
+        let mut buf = Self::with_capacity(slice.len());
+        for item in slice {
+            buf.push(item.clone());
+        }
+        buf.zero_pad_tail();
+        buf
+    }
+
     /// 导出专供 Apple Metal `newBufferWithBytesNoCopy` 使用的原始指针与页整倍数字节长度
     ///
     /// # 契约保证

@@ -13,6 +13,7 @@ pub mod binding;
 pub mod context;
 pub mod error;
 pub mod id;
+pub mod schedule;
 pub mod schema;
 pub mod storage;
 
@@ -20,5 +21,6 @@ pub use binding::*;
 pub use context::*;
 pub use error::*;
 pub use id::*;
+pub use schedule::*;
 pub use schema::*;
 pub use storage::*;

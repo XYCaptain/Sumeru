@@ -40,6 +40,8 @@ pub use crate::al as contracts;
 pub(crate) mod batch;
 pub(crate) mod core;
 pub(crate) mod entity;
+pub mod gpu;
+pub mod primitives;
 pub(crate) mod query;
 pub(crate) mod stage;
 
@@ -51,9 +53,12 @@ pub use self::core::*;
 pub(crate) use self::core::{
     allocator, archetype, column, entity_index, modify, registry, store, AnyColumn,
     ColumnBacking, ColumnBlock, ColumnDescriptor, ColumnIter, ColumnValueOps, DirectBlock,
+    EntityAllocator, EntityLocation, InPlaceReplacements, PlannedInPlacePatch,
     RawColumn, TypedColumn,
 };
 pub use self::entity::*;
+pub use self::gpu::*;
+pub use self::primitives::*;
 pub use self::query::*;
 pub use self::stage::*;
 

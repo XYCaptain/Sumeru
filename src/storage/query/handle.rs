@@ -305,7 +305,7 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
 
     /// 独占刷新缓存：持有 &mut self 时直接通过 get_mut 绕过 RwLock，彻底消除原子锁争用。
     #[inline]
-    pub(crate) fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {
+    pub fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {
         self.check_session()?;
         if store.store_id() != self.store_id {
             return Err(StateError::StoreMismatch {
@@ -317,6 +317,12 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
         cache.refresh_for_store::<Q, F>(store, &self.filter);
         Ok(())
+    }
+
+    /// 独占刷新缓存的同义方法。
+    #[inline]
+    pub fn ensure_cache_current(&mut self, store: &Store) -> Result<(), StateError> {
+        self.ensure_cache_current_mut(store)
     }
 
     /// Refresh/check the cache under its lock, then invoke the callback WITHOUT
@@ -472,6 +478,15 @@ impl<Q: QueryMutShape> Default for QueryBuilder<Q, All> {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
+    /// 使用指定的过滤器创建查询构建器。
+    #[inline]
+    pub fn with_filter(filter: F) -> Self {
+        Self {
+            filter,
+            marker: PhantomData,
+        }
+    }
+
     /// 增加包含组件 T 的硬边界过滤条件（仅校验表级原型元数据）。
     #[inline]
     pub fn with<T: 'static>(self) -> QueryBuilder<Q, With<T, F>> {
@@ -608,6 +623,46 @@ impl Store {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
+    /// 检测当前查询计划与另一查询计划是否存在组件级读写冲突（Read-Write 或 Write-Write）。
+    ///
+    /// 基于预归并的有序访问描述符列表 `(ComponentTypeId, &'static str, is_write)`（包含查询形状与过滤器读取依赖）
+    /// 执行双指针线性归并扫描，供上层多系统 DAG 并行调度器判定能否在同一并行阶段并发执行。
+    #[inline]
+    pub fn conflicts_with<Q2: QueryMutShape, F2: QueryFilter + Clone>(
+        &self,
+        other: &Query<Q2, F2>,
+    ) -> bool {
+        let a = self.descriptors();
+        let b = other.descriptors();
+        let mut i = 0;
+        let mut j = 0;
+        while i < a.len() && j < b.len() {
+            let (cid_a, _, write_a) = a[i];
+            let (cid_b, _, write_b) = b[j];
+            if cid_a == cid_b {
+                if write_a || write_b {
+                    return true;
+                }
+                i += 1;
+                j += 1;
+            } else if cid_a < cid_b {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        false
+    }
+
+    /// 判定当前查询计划与另一查询计划是否兼容（可无冲突并发执行）。
+    #[inline]
+    pub fn is_compatible_with<Q2: QueryMutShape, F2: QueryFilter + Clone>(
+        &self,
+        other: &Query<Q2, F2>,
+    ) -> bool {
+        !self.conflicts_with(other)
+    }
+
     /// 基于预编译的匹配原型表与 Level-2 槽位绑定缓存遍历只读元素。
     pub fn for_each<'store>(
         &self,
@@ -647,7 +702,7 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
     {
         let bindings = self.resolved_bindings_arc(store)?;
-        super::spec::iter::for_each_matched_chunk_ro::<Q>(store, &bindings, f);
+        super::spec::iter::for_each_matched_chunk_ro::<Q, F>(store, &bindings, &self.filter, f);
         Ok(())
     }
 
@@ -662,7 +717,75 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         store.next_epoch()?;
         let bindings = self.resolved_bindings_arc(store)?;
         store.bump_epoch();
-        super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &bindings, f);
+        super::spec::iter::for_each_matched_chunk_mut::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行只读行遍历（按 4096 行 = 64 个掩码字对齐子块切分，支持 `RowBitMask` 字级跳跃过滤）。
+    pub fn par_for_each<'store>(
+        &self,
+        store: &'store Store,
+        f: impl Fn(Q::Item<'store>) + Send + Sync,
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Item = Q::Item<'a>>,
+    {
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::par_for_each_matched_ro::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行可变行遍历（主线程统一完成 COW 解耦与 64 行脏块纪元标记，工作线程无锁并行写互不重叠的 4096 行子块）。
+    pub fn par_for_each_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl Fn(Q::Item<'store>) + Send + Sync,
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let bindings = self.resolved_bindings_arc(store)?;
+        store.bump_epoch();
+        super::spec::iter::par_for_each_matched_mut::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行只读连续切片块遍历（按 4096 行子块切分，支持 `ChangedSince` 与行级掩码连续段）。
+    pub fn par_for_each_chunk<'store>(
+        &self,
+        store: &'store Store,
+        f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
+    {
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::par_for_each_matched_chunk_ro::<Q, F>(
+            store,
+            &bindings,
+            &self.filter,
+            f,
+        );
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行可变连续切片块遍历（按 4096 行子块切分，支持 `ChangedSince` 与行级掩码连续段）。
+    pub fn par_for_each_chunk_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let bindings = self.resolved_bindings_arc(store)?;
+        store.bump_epoch();
+        super::spec::iter::par_for_each_matched_chunk_mut::<Q, F>(
+            store,
+            &bindings,
+            &self.filter,
+            f,
+        );
         Ok(())
     }
 }

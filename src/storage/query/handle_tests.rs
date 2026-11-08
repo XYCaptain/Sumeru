@@ -433,17 +433,17 @@ fn test_non_migrating_row_flags_and_structural_preservation() {
         .unwrap();
 
     // Initially all flags are false
-    assert!(!store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
+    assert!(!store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
 
     // Set flag 0 on e1 and e3 (in-place without archetype migration!)
     let gen_before = store.archetype_set_generation();
     store.set_flag::<0>(e1, true).unwrap();
     store.set_flag::<0>(e3, true).unwrap();
     assert_eq!(store.archetype_set_generation(), gen_before);
-    assert!(store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
-    assert!(store.has_flag::<0>(e3).unwrap());
+    assert!(store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
+    assert!(store.has_flag::<0>(e3));
 
     // Query with_flag::<0> and without_flag::<0>
     let q_flagged = QueryBuilder::<&Pos>::new()
@@ -457,28 +457,28 @@ fn test_non_migrating_row_flags_and_structural_preservation() {
 
     let mut flagged_xs = Vec::new();
     q_flagged
-        .for_each(&store, |pos| flagged_xs.push(pos.x))
+        .for_each(&store, |(_id, pos)| flagged_xs.push(pos.x))
         .unwrap();
     assert_eq!(flagged_xs, vec![1, 3]);
 
     let mut unflagged_xs = Vec::new();
     q_unflagged
-        .for_each(&store, |pos| unflagged_xs.push(pos.x))
+        .for_each(&store, |(_id, pos)| unflagged_xs.push(pos.x))
         .unwrap();
     assert_eq!(unflagged_xs, vec![2]);
 
     // Structural migration: add TagActive to e1 -> e1 moves to a new archetype,
     // and e3 swap-removes into e1's old row 0! Both e1 and e3 must preserve their flags!
-    store.add_component_typed(e1, TagActive).unwrap();
-    assert!(store.has_flag::<0>(e1).unwrap());
-    assert!(!store.has_flag::<0>(e2).unwrap());
-    assert!(store.has_flag::<0>(e3).unwrap());
+    store.add(e1, TagActive).unwrap();
+    assert!(store.has_flag::<0>(e1));
+    assert!(!store.has_flag::<0>(e2));
+    assert!(store.has_flag::<0>(e3));
 
     let mut iter_flagged: Vec<i32> = store
         .query::<&Pos>()
         .with_flag::<0>()
         .into_iter()
-        .map(|p| p.x)
+        .map(|(_id, p)| p.x)
         .collect();
     iter_flagged.sort_unstable();
     assert_eq!(iter_flagged, vec![1, 3]);
@@ -519,7 +519,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     // Modify entity at index 70 (in chunk 1: rows 64..128)
     let e70 = EntityId::from_u128(2000 + 70);
     store
-        .modify_component_typed::<Pos, _>(e70, |p| p.y += 10)
+        .modify::<Pos, _>(e70, |p| p.y += 10)
         .unwrap();
 
     // Now only chunk 1 (64 rows: 64..128) should be visited by changed_since::<Pos>(baseline_epoch)!
@@ -543,8 +543,8 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
 #[test]
 fn test_pair_target_index_and_with_pair_query() {
     let mut store = Store::new();
-    let parent_a = EntityId::from_u128(9001);
-    let parent_b = EntityId::from_u128(9002);
+    let parent_a = store.spawn_at(EntityId::from_u128(9001)).unwrap();
+    let parent_b = store.spawn_at(EntityId::from_u128(9002)).unwrap();
 
     for i in 0..50u128 {
         let target = if i % 5 == 0 { parent_a } else { parent_b };
@@ -591,5 +591,156 @@ fn test_pair_target_index_and_with_pair_query() {
         .unwrap();
     assert!(ys_a.iter().all(|&y| y == 999));
 }
+
+#[test]
+fn test_query_par_for_each_and_par_chunks_with_row_masks() {
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+    let mut store = Store::new();
+    // Spawn 10,000 entities spanning 3 4096-row subchunks (0..4096, 4096..8192, 8192..10000)
+    for i in 0..10_000u128 {
+        let e = EntityId::from_u128(10_000 + i);
+        store
+            .insert((
+                e,
+                (
+                    Pos {
+                        x: i as i32,
+                        y: 1,
+                    },
+                    Vel { dx: 2, dy: 3 },
+                ),
+            ))
+            .unwrap();
+        if i % 10 == 0 {
+            store.set_flag::<0>(e, true).unwrap();
+        }
+    }
+
+    let q_flagged_mut = QueryBuilder::<(&mut Pos, &Vel)>::new()
+        .with_flag::<0>()
+        .build(&store)
+        .unwrap();
+    let baseline_epoch = store.epoch();
+
+    let updated_count = AtomicUsize::new(0);
+    q_flagged_mut
+        .par_for_each_mut(&mut store, |(_id, (pos, vel))| {
+            pos.x += vel.dx;
+            pos.y += vel.dy;
+            updated_count.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+    assert_eq!(updated_count.load(Ordering::Relaxed), 1000);
+
+    // Parallel read-only verification with flag filter
+    let q_flagged_ro = QueryBuilder::<&Pos>::new()
+        .with_flag::<0>()
+        .build(&store)
+        .unwrap();
+    let sum_y = AtomicI64::new(0);
+    q_flagged_ro
+        .par_for_each(&store, |(_id, pos)| {
+            assert_eq!(pos.y, 4);
+            sum_y.fetch_add(pos.y as i64, Ordering::Relaxed);
+        })
+        .unwrap();
+    assert_eq!(sum_y.load(Ordering::Relaxed), 4000);
+
+    // Parallel chunk mutation across all 10,000 rows (dynamically planned by SubchunkPlanner:
+    // for 16-byte row width (8B Pos + 8B Vel), 32KB / 16B = 2048 rows -> 5 subchunks)
+    let q_all_chunk_mut = QueryBuilder::<(&mut Pos, &Vel)>::new()
+        .build(&store)
+        .unwrap();
+    let subchunk_calls = AtomicUsize::new(0);
+    let total_chunk_rows = AtomicUsize::new(0);
+    q_all_chunk_mut
+        .par_for_each_chunk_mut(&mut store, |(ents, (pos_slice, vel_slice))| {
+            assert_eq!(ents.len(), pos_slice.len());
+            assert_eq!(ents.len(), vel_slice.len());
+            subchunk_calls.fetch_add(1, Ordering::Relaxed);
+            total_chunk_rows.fetch_add(ents.len(), Ordering::Relaxed);
+            for (p, v) in pos_slice.iter_mut().zip(vel_slice.iter()) {
+                p.y += v.dy;
+            }
+        })
+        .unwrap();
+    let expected_subchunks = crate::storage::primitives::SubchunkPlanner::default()
+        .plan_subchunks(std::mem::size_of::<Pos>() + std::mem::size_of::<Vel>(), 10_000)
+        .len();
+    assert_eq!(subchunk_calls.load(Ordering::Relaxed), expected_subchunks);
+    assert_eq!(total_chunk_rows.load(Ordering::Relaxed), 10_000);
+
+    // Parallel chunk read-only verification with ChangedSince
+    let q_changed_ro = QueryBuilder::<&Pos>::new()
+        .changed_since::<Pos>(baseline_epoch)
+        .build(&store)
+        .unwrap();
+    let total_changed_rows = AtomicUsize::new(0);
+    q_changed_ro
+        .par_for_each_chunk(&store, |(ents, pos_slice)| {
+            assert_eq!(ents.len(), pos_slice.len());
+            total_changed_rows.fetch_add(ents.len(), Ordering::Relaxed);
+        })
+        .unwrap();
+    assert_eq!(total_changed_rows.load(Ordering::Relaxed), 10_000);
+}
+
+#[test]
+fn test_query_conflicts_with_and_al_par_chunk_epoch_tracking() {
+    use crate::al::traits::{All, StateSpace};
+
+    let mut store = Store::new();
+    for i in 0..200u128 {
+        store
+            .insert((
+                EntityId::from_u128(50_000 + i),
+                (
+                    Pos { x: i as i32, y: 0 },
+                    Vel { dx: 1, dy: 2 },
+                ),
+            ))
+            .unwrap();
+    }
+
+    let q_read_pos = QueryBuilder::<&Pos>::new().build(&store).unwrap();
+    let q_read_pos_vel = QueryBuilder::<(&Pos, &Vel)>::new().build(&store).unwrap();
+    let q_write_pos = QueryBuilder::<&mut Pos>::new().build(&store).unwrap();
+    let q_write_vel = QueryBuilder::<&mut Vel>::new().build(&store).unwrap();
+    let q_write_vel_filter_pos = QueryBuilder::<&mut Vel>::new()
+        .changed_since::<Pos>(0)
+        .build(&store)
+        .unwrap();
+
+    // Read-Read on same component is compatible
+    assert!(q_read_pos.is_compatible_with(&q_read_pos_vel));
+    // Write-Write on disjoint components is compatible
+    assert!(q_write_pos.is_compatible_with(&q_write_vel));
+    // Read-Write on Pos conflicts
+    assert!(q_read_pos.conflicts_with(&q_write_pos));
+    // Write(Pos) conflicts with Write(Vel) + FilterRead(Pos)
+    assert!(q_write_pos.conflicts_with(&q_write_vel_filter_pos));
+
+    // Verify AL StateSpace::par_for_each_chunk_mut2 stamps 64-row chunk epochs for ChangedSince
+    let epoch_before = store.epoch();
+    <Store as StateSpace>::par_for_each_chunk_mut2::<Pos, Vel, All>(
+        &mut store,
+        |_ents, pos_slice, vel_slice| {
+            for (p, v) in pos_slice.iter_mut().zip(vel_slice.iter()) {
+                p.x += v.dx;
+                p.y += v.dy;
+            }
+        },
+    );
+    assert!(store.epoch() > epoch_before);
+
+    let changed_pos_count = store
+        .query::<&Pos>()
+        .changed_since::<Pos>(epoch_before)
+        .into_iter()
+        .count();
+    assert_eq!(changed_pos_count, 200);
+}
+
 
 

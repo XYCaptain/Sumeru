@@ -37,32 +37,12 @@ pub enum LayoutOptimization {
 static NEXT_STORE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn next_store_instance_id() -> u64 {
     NEXT_STORE_INSTANCE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("Store instance identity exhausted")
 }
 
 /// 组件所属 Archetype 的倒排位图索引（每 64 个 Archetype 1 个 `u64` 字）
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct ArchetypeBitSet {
-    words: smallvec::SmallVec<[u64; 2]>,
-}
-
-impl ArchetypeBitSet {
-    #[inline]
-    pub(crate) fn insert(&mut self, arch_id: u32) {
-        let idx = (arch_id as usize) >> 6;
-        let bit = (arch_id as usize) & 63;
-        if idx >= self.words.len() {
-            self.words.resize(idx + 1, 0);
-        }
-        self.words[idx] |= 1u64 << bit;
-    }
-
-    #[inline(always)]
-    pub(crate) fn words(&self) -> &[u64] {
-        &self.words
-    }
-}
+pub(crate) use crate::storage::primitives::ArchetypeBitSet;
 
 /// 统一列式状态存储核心 (Store)。
 ///

@@ -26,146 +26,7 @@ unsafe impl Send for FlatColumnEntry {}
 unsafe impl Sync for FlatColumnEntry {}
 
 /// 行级位图掩码（每 64 行 1 个 `u64` 字），用于查询过滤的 SIMD/字级位与交集与 `trailing_zeros` 跳跃迭代
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowBitMask {
-    words: smallvec::SmallVec<[u64; 4]>,
-    row_len: usize,
-}
-
-impl RowBitMask {
-    /// 创建长度为 `row_len`、所有位均置 0 的空位图
-    #[inline]
-    pub fn new_empty(row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        Self {
-            words: smallvec::smallvec![0u64; num_words],
-            row_len,
-        }
-    }
-
-    /// 创建长度为 `row_len`、所有有效行位均置 1 的满位图
-    #[inline]
-    pub fn new_all_set(row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        let mut words = smallvec::smallvec![!0u64; num_words];
-        let rem = row_len & 63;
-        if rem != 0 {
-            if let Some(last) = words.last_mut() {
-                *last = (1u64 << rem) - 1;
-            }
-        }
-        Self { words, row_len }
-    }
-
-    /// 从已有字切片构造位图，并自动裁剪超出 `row_len` 的尾部高位
-    #[inline]
-    pub fn from_words(words_slice: &[u64], row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        let mut words = smallvec::SmallVec::<[u64; 4]>::with_capacity(num_words);
-        for i in 0..num_words {
-            words.push(words_slice.get(i).copied().unwrap_or(0));
-        }
-        let rem = row_len & 63;
-        if rem != 0 {
-            if let Some(last) = words.last_mut() {
-                *last &= (1u64 << rem) - 1;
-            }
-        }
-        Self { words, row_len }
-    }
-
-    #[inline(always)]
-    pub fn row_len(&self) -> usize {
-        self.row_len
-    }
-
-    #[inline(always)]
-    pub fn words(&self) -> &[u64] {
-        &self.words
-    }
-
-    #[inline(always)]
-    pub fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.words
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, row: usize) {
-        if row < self.row_len {
-            self.words[row >> 6] |= 1u64 << (row & 63);
-        }
-    }
-
-    #[inline(always)]
-    pub fn clear_bit(&mut self, row: usize) {
-        if row < self.row_len {
-            self.words[row >> 6] &= !(1u64 << (row & 63));
-        }
-    }
-
-    #[inline(always)]
-    pub fn test(&self, row: usize) -> bool {
-        if row >= self.row_len {
-            return false;
-        }
-        (self.words[row >> 6] & (1u64 << (row & 63))) != 0
-    }
-
-    #[inline]
-    pub fn is_all_zero(&self) -> bool {
-        self.words.iter().all(|&w| w == 0)
-    }
-
-    #[inline]
-    pub fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// 与另一位图或字切片按位求交（`self &= other`）
-    #[inline]
-    pub fn intersect_words(&mut self, other_words: &[u64]) {
-        for (i, w) in self.words.iter_mut().enumerate() {
-            *w &= other_words.get(i).copied().unwrap_or(0);
-        }
-    }
-
-    /// 与另一位图按位求交（`self &= other`）
-    #[inline]
-    pub fn intersect_with(&mut self, other: &RowBitMask) {
-        self.intersect_words(&other.words);
-    }
-
-    /// 与另一位图或字切片按位求差（`self &= !other`）
-    #[inline]
-    pub fn difference_words(&mut self, other_words: &[u64]) {
-        let rem = self.row_len & 63;
-        let num_words = self.words.len();
-        for (i, w) in self.words.iter_mut().enumerate() {
-            let ow = other_words.get(i).copied().unwrap_or(0);
-            *w &= !ow;
-            if i + 1 == num_words && rem != 0 {
-                *w &= (1u64 << rem) - 1;
-            }
-        }
-    }
-
-    /// 利用硬件 `trailing_zeros` 指令跳跃遍历所有置 1 的行索引
-    #[inline]
-    pub fn for_each_set_row<F: FnMut(usize)>(&self, mut f: F) {
-        for (word_idx, &word) in self.words.iter().enumerate() {
-            let mut w = word;
-            let base = word_idx << 6;
-            while w != 0 {
-                let bit = w.trailing_zeros() as usize;
-                let row = base + bit;
-                if row < self.row_len {
-                    f(row);
-                }
-                w &= w - 1;
-            }
-        }
-    }
-}
+pub use crate::storage::primitives::RowBitMask;
 
 /// 关系对目标实体的表内二级倒排位图缓存（按 `columns_version` 自动惰性同步）
 #[derive(Default)]
@@ -859,23 +720,13 @@ impl Archetype {
         }
         let col = self.get_column::<crate::al::Pair<R>>()?;
         let mut target_map: BTreeMap<EntityId, RowBitMask> = BTreeMap::new();
-        if let Some(slice) = col.as_slice() {
-            for (row, pair) in slice.iter().enumerate() {
-                if row < row_len {
-                    target_map
-                        .entry(pair.target)
-                        .or_insert_with(|| RowBitMask::new_empty(row_len))
-                        .set(row);
-                }
-            }
-        } else {
-            for (row, pair) in col.iter().enumerate() {
-                if row < row_len {
-                    target_map
-                        .entry(pair.target)
-                        .or_insert_with(|| RowBitMask::new_empty(row_len))
-                        .set(row);
-                }
+        let slice = col.as_slice();
+        for (row, pair) in slice.iter().enumerate() {
+            if row < row_len {
+                target_map
+                    .entry(pair.target)
+                    .or_insert_with(|| RowBitMask::new_empty(row_len))
+                    .set(row);
             }
         }
         let result = target_map

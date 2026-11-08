@@ -10,9 +10,11 @@ pub(crate) mod modify;
 pub(crate) mod registry;
 pub(crate) mod store;
 
+pub(crate) use allocator::{EntityAllocator, EntityLocation};
+pub(crate) use archetype::Archetype;
 pub(crate) use column::{
     AnyColumn, ColumnBacking, ColumnBlock, ColumnDescriptor, ColumnIter, ColumnValueOps,
-    DirectBlock, RawColumn, TypedColumn,
+    DirectBlock, InPlaceReplacements, PlannedInPlacePatch, RawColumn, TypedColumn,
 };
 pub use column::{
     archived_column_to_opaque_binary_array, archived_column_to_typed_arrow_array,

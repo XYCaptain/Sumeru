@@ -121,7 +121,7 @@ pub(crate) trait RowColumnAccessor {
     }
 
     #[inline]
-    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<&[u64]> {
+    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<(&[u64], u64)> {
         let _ = cid;
         None
     }
@@ -165,7 +165,7 @@ impl RowColumnAccessor for Archetype {
     }
 
     #[inline]
-    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<&[u64]> {
+    fn column_chunk_epochs(&self, cid: ComponentTypeId) -> Option<(&[u64], u64)> {
         self.column_chunk_epochs(cid)
     }
 
@@ -1728,7 +1728,7 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for
             let end = start + slice.len();
             return Some(((&archetype.entities()[start..end], slice), end));
         }
-        Self::chunk(archetype, start)
+        <Self as sealed::Fetch<'a>>::chunk(archetype, start)
     }
 }
 
