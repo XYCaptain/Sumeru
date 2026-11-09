@@ -40,6 +40,7 @@ pub use crate::al as contracts;
 pub(crate) mod batch;
 pub(crate) mod core;
 pub(crate) mod entity;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod primitives;
 pub(crate) mod query;
@@ -52,11 +53,12 @@ pub use self::core::*;
 #[allow(unused_imports)]
 pub(crate) use self::core::{
     allocator, archetype, column, entity_index, modify, registry, store, AnyColumn,
-    ColumnBacking, ColumnBlock, ColumnDescriptor, ColumnIter, ColumnValueOps, DirectBlock,
+    Archetype, ColumnBacking, ColumnBlock, ColumnDescriptor, ColumnIter, ColumnValueOps, DirectBlock,
     EntityAllocator, EntityLocation, InPlaceReplacements, PlannedInPlacePatch,
     RawColumn, TypedColumn,
 };
 pub use self::entity::*;
+#[cfg(feature = "gpu")]
 pub use self::gpu::*;
 pub use self::primitives::*;
 pub use self::query::*;

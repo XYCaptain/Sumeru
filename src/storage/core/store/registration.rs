@@ -15,9 +15,14 @@ impl Store {
 
     pub(crate) fn register_component_prototypes(
         &mut self,
-        prototypes: Vec<Box<dyn AnyColumn>>,
+        mut prototypes: Vec<Box<dyn AnyColumn>>,
     ) -> Result<(), StateError> {
         self.check_poisoned()?;
+        if self.layout_optimization == super::LayoutOptimization::PageAlignedGpu {
+            for proto in &mut prototypes {
+                proto.promote_to_page_aligned();
+            }
+        }
         // 1. 全局版本容量与代际预检 (提前检查，任何溢出零副作用、零注册表污染)
         self.check_archetype_set_generation_capacity()?;
         self.next_epoch()?;
@@ -32,10 +37,10 @@ impl Store {
 
         // 4. 物理列升级兼容性只读预检：确保若需要升级，所有现有物理列均与升级原型类型兼容
         for (type_id, def) in &staged {
-            if def.has_archive_capability() {
+            if def.has_archive_capability() || def.is_page_aligned() {
                 for archetype in &self.archetypes {
                     if let Some(col) = archetype.columns().get(type_id) {
-                        if !col.has_archive_capability()
+                        if (!col.has_archive_capability() || !col.is_page_aligned())
                             && (col.rust_type_id() != def.prototype().rust_type_id()
                                 || col.type_name() != def.prototype().type_name())
                         {
@@ -52,16 +57,23 @@ impl Store {
 
         // 5. 全部预检 100% 通过后，升级已有 Archetype 物理列能力并原子合并入正式注册表
         for (type_id, def) in &staged {
-            if def.has_archive_capability() {
+            if def.has_archive_capability() || def.is_page_aligned() {
                 for archetype in &mut self.archetypes {
-                    if let Some(col) = archetype.columns_mut().get_mut(type_id) {
-                        if !col.has_archive_capability() {
+                    let mut changed = false;
+                    if let Some(col) = archetype.get_erased_column_mut(*type_id) {
+                        if (!col.has_archive_capability() && def.has_archive_capability())
+                            || (!col.is_page_aligned() && def.is_page_aligned())
+                        {
                             let upgraded = col.upgrade_archive_capability_from(def.prototype());
                             assert!(
                                 upgraded,
-                                "pre-validated physical column for {type_id} must successfully upgrade archive capability"
+                                "pre-validated physical column for {type_id} must successfully upgrade capability"
                             );
+                            changed = true;
                         }
+                    }
+                    if changed {
+                        archetype.rebuild_flat_columns();
                     }
                 }
             }

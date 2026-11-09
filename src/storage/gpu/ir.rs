@@ -1,1253 +1,1035 @@
-//! 异构计算着色器与算子中间表示 (GPU Kernel IR & Multi-Backend Codegen)
+//! 强类型着色器中间表示 (Typed Shader IR)、符号表类型推导与多后端代码生成器 (`GpuIrCompiler`)
 //!
-//! 突破传统“单行隔离（Point-wise）+ 仅 32 位标量”限制，支持：
-//! 1. **全精度标量体系 (`GpuScalarKind`)**：原生支持 `F16`、`BF16`、`F32`、`F64`（科学计算双精度）、
-//!    `I32`、`U32`、`I64`、`U64` 与 `Bool`；
-//! 2. **行级位平面谓词掩码 (`PredicationMask`)**：直接绑定 `RowBitMask` / `RowFlags` 的 64 位机器字数组，
-//!    在 GPU 线程入口单周期跳过未激活行；
-//! 3. **跨行随机读取与关系目标收集 (`GatherLoad` & `PairTargetRow`)**：支持通过 `Pair<R>` 目标行查找表
-//!    （LUT）或邻域索引跨行安全读取目标实体组件（带边界与 `u32::MAX` 空目标守卫）；
-//! 4. **原子散射归约与线程组共享内存归约 (`AtomicReduce` & `ThreadgroupReduceSum`)**：支持跨行力累加、
-//!    能量统计与全局归约；
-//! 5. **三后端代码生成**：一键编译输出 **WebGPU WGSL**、**Apple Metal (MSL)** 与 **NVIDIA CUDA C++**。
+//! 本模块提供目标无关的着色器 AST/IR 树（[`GpuBlock`]、[`GpuStmt`]、[`GpuExpr`]）：
+//! 1. **零字符串模板宏展开**：`crates/sumeru-macros` 仅负责将 Rust `syn` AST 展开为本模块的强类型 IR 构造调用；
+//! 2. **借力 `rustc` 编译期常量求值 ([`GpuConstValue`])**：核函数内引用的外部 `const` 常量（如 `DT`、`std::f32::consts::PI`）
+//!    直接由 Rust 编译器求值并内联为强类型字面量 [`GpuLit`]；
+//! 3. **可组合 `#[gpu]` 纯计算辅助函数 ([`GpuHelperFnDescriptor`])**：支持定义带返回值的纯计算设备辅助函数，
+//!    自动按调用依赖拓扑序链接至目标 WGSL 与 MSL 模块；
+//! 4. **符号表驱动的类型推导 ([`ShaderTypeEnv`])**：结合 [`GpuShaderStruct::FIELDS`] 元数据自动推导组件字段、
+//!    数组下标、局部变量与 `for i in 0..cfg.steps` 循环边界的有符号/无符号类型。
 
-use std::fmt::Write;
+use super::kernel::{GpuFieldType, GpuKernelBindingSpec, GpuStructField};
+use std::collections::HashMap;
 
-/// GPU 标量数据类型枚举（覆盖半精度、单精度、HPC 双精度与 32/64 位整型）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// 着色器标量基础类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuScalarKind {
-    F16,
-    BF16,
     F32,
-    F64,
     I32,
     U32,
-    I64,
-    U64,
     Bool,
 }
 
 impl GpuScalarKind {
-    /// 标量类型的物理字节宽度
-    #[inline]
-    pub const fn byte_size(self) -> usize {
-        match self {
-            Self::Bool => 1,
-            Self::F16 | Self::BF16 => 2,
-            Self::F32 | Self::I32 | Self::U32 => 4,
-            Self::F64 | Self::I64 | Self::U64 => 8,
-        }
-    }
-
-    /// 是否为 64 位宽标量（HPC 双精度或 64 位整数）
-    #[inline]
-    pub const fn is_64bit(self) -> bool {
-        matches!(self, Self::F64 | Self::I64 | Self::U64)
-    }
-
-    /// 是否为浮点标量
-    #[inline]
-    pub const fn is_float(self) -> bool {
-        matches!(self, Self::F16 | Self::BF16 | Self::F32 | Self::F64)
-    }
-
-    /// 映射为 WebGPU WGSL 类型名
-    #[inline]
-    pub const fn wgsl_type(self) -> &'static str {
-        match self {
-            Self::F16 | Self::BF16 => "f16",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-            Self::I32 => "i32",
-            Self::U32 => "u32",
-            Self::I64 => "i64",
-            Self::U64 => "u64",
-            Self::Bool => "bool",
-        }
-    }
-
-    /// 映射为 Apple Metal Shading Language (MSL) 类型名
+    /// 映射为 Apple Metal Shading Language (MSL) 标量类型名。
     #[inline]
     pub const fn msl_type(self) -> &'static str {
         match self {
-            Self::F16 => "half",
-            Self::BF16 => "bfloat",
             Self::F32 => "float",
-            Self::F64 => "double",
             Self::I32 => "int",
             Self::U32 => "uint",
-            Self::I64 => "long",
-            Self::U64 => "ulong",
             Self::Bool => "bool",
         }
     }
 
-    /// 映射为 NVIDIA CUDA C++ 类型名
+    /// 映射为 WebGPU Shading Language (WGSL) 标量类型名。
     #[inline]
-    pub const fn cuda_type(self) -> &'static str {
+    pub const fn wgsl_type(self) -> &'static str {
         match self {
-            Self::F16 => "__half",
-            Self::BF16 => "__nv_bfloat16",
-            Self::F32 => "float",
-            Self::F64 => "double",
-            Self::I32 => "int32_t",
-            Self::U32 => "uint32_t",
-            Self::I64 => "int64_t",
-            Self::U64 => "uint64_t",
+            Self::F32 => "f32",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
             Self::Bool => "bool",
         }
     }
 }
 
-/// 缓冲区访问权限与拓扑角色
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BufferAccess {
-    /// 只读组件列或数据源（支持同列本行读取与跨行 Gather）
-    ReadOnly,
-    /// 可读写目标组件列
-    ReadWrite,
-    /// 原子归约输出或散射累加缓冲区
-    AtomicReadWrite,
-    /// 64 位机器字谓词掩码缓冲区（直接绑定 `RowBitMask::words()`）
-    PredicationMask,
-    /// 关系对 `Pair<R>` 目标行索引查找表（每行一个 `u32` 目标行号，`u32::MAX` 表示无效）
-    PairTargetLut,
-}
-
-/// GPU 内核缓冲区绑定描述符
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BufferBinding {
-    pub binding_index: u32,
-    pub name: String,
-    pub scalar: GpuScalarKind,
-    /// 每个逻辑行包含的基础标量个数（如 `Vec3<f64>` 为 3，标量组件为 1）
-    pub stride_elems: usize,
-    pub access: BufferAccess,
-}
-
-/// 一元算术与数学算子
+/// 符号表推导出的表达式值类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
-    Neg,
-    Abs,
-    Sqrt,
-    Rsqrt,
-    Sin,
-    Cos,
-    Exp,
+pub enum GpuValueType {
+    Scalar(GpuScalarKind),
+    Array(GpuScalarKind, usize),
+    Struct(&'static str),
+    Unknown,
 }
 
-/// 二元算术与比较算子
+impl GpuValueType {
+    /// 从组件结构体字段类型 [`GpuFieldType`] 转换为 [`GpuValueType`]。
+    #[inline]
+    pub const fn from_field_type(ft: GpuFieldType) -> Self {
+        match ft {
+            GpuFieldType::F32 => Self::Scalar(GpuScalarKind::F32),
+            GpuFieldType::I32 => Self::Scalar(GpuScalarKind::I32),
+            GpuFieldType::U32 => Self::Scalar(GpuScalarKind::U32),
+            GpuFieldType::Vec2F32 => Self::Array(GpuScalarKind::F32, 2),
+            GpuFieldType::Vec3F32 => Self::Array(GpuScalarKind::F32, 3),
+            GpuFieldType::Vec4F32 => Self::Array(GpuScalarKind::F32, 4),
+            GpuFieldType::Vec2U32 => Self::Array(GpuScalarKind::U32, 2),
+            GpuFieldType::Vec3U32 => Self::Array(GpuScalarKind::U32, 3),
+            GpuFieldType::Vec4U32 => Self::Array(GpuScalarKind::U32, 4),
+            GpuFieldType::Vec2I32 => Self::Array(GpuScalarKind::I32, 2),
+            GpuFieldType::Vec3I32 => Self::Array(GpuScalarKind::I32, 3),
+            GpuFieldType::Vec4I32 => Self::Array(GpuScalarKind::I32, 4),
+        }
+    }
+}
+
+/// 强类型着色器字面量节点。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuLit {
+    /// 源码内联浮点字面量（保留原始十进制文本，如 `"100.0"`、`"1e-5"`）
+    FloatRaw(&'static str),
+    /// 由外部 Rust `const` 常量求值得到的 `f32` 字面量
+    F32(f32),
+    /// 源码内未带类型后缀的整数字面量（在 `U32` 上下文中可自动提升为 `u` 后缀）
+    UntypedInt(i64),
+    /// 显式有符号 32 位整数字面量 (`i32`)
+    I32(i32),
+    /// 显式无符号 32 位整数字面量 (`u32` / `usize`)
+    U32(u64),
+    /// 布尔字面量 (`bool`)
+    Bool(bool),
+}
+
+impl GpuLit {
+    /// 格式化为着色器源码字面量文本。
+    pub fn format_shader(&self, coerce_unsigned: bool) -> String {
+        match self {
+            Self::FloatRaw(s) => (*s).to_string(),
+            Self::F32(v) => {
+                assert!(
+                    v.is_finite(),
+                    "Non-finite f32 constant `{v}` cannot be embedded into a GPU shader"
+                );
+                let s = format!("{v:?}");
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    s
+                } else {
+                    format!("{s}.0")
+                }
+            }
+            Self::UntypedInt(n) => {
+                if coerce_unsigned && *n >= 0 {
+                    format!("{n}u")
+                } else {
+                    format!("{n}")
+                }
+            }
+            Self::I32(n) => format!("{n}"),
+            Self::U32(n) => format!("{n}u"),
+            Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        }
+    }
+}
+
+/// 将外部 Rust `const` 常量桥接为着色器 IR 表达式 [`GpuExpr`] 的编译期转换契约。
+pub trait GpuConstValue {
+    /// 将当前 Rust 常量值转换为强类型着色器字面量表达式。
+    fn to_gpu_expr(&self) -> GpuExpr;
+}
+
+impl GpuConstValue for f32 {
+    #[inline]
+    fn to_gpu_expr(&self) -> GpuExpr {
+        GpuExpr::Lit(GpuLit::F32(*self))
+    }
+}
+
+impl GpuConstValue for i32 {
+    #[inline]
+    fn to_gpu_expr(&self) -> GpuExpr {
+        GpuExpr::Lit(GpuLit::I32(*self))
+    }
+}
+
+impl GpuConstValue for u32 {
+    #[inline]
+    fn to_gpu_expr(&self) -> GpuExpr {
+        GpuExpr::Lit(GpuLit::U32(*self as u64))
+    }
+}
+
+impl GpuConstValue for usize {
+    #[inline]
+    fn to_gpu_expr(&self) -> GpuExpr {
+        GpuExpr::Lit(GpuLit::U32(*self as u64))
+    }
+}
+
+impl GpuConstValue for bool {
+    #[inline]
+    fn to_gpu_expr(&self) -> GpuExpr {
+        GpuExpr::Lit(GpuLit::Bool(*self))
+    }
+}
+
+/// 着色器二元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
+pub enum GpuBinaryOp {
     Add,
     Sub,
     Mul,
     Div,
-    Min,
-    Max,
+    Rem,
+    And,
+    Or,
+    BitXor,
+    BitAnd,
+    BitOr,
+    Shl,
+    Shr,
     Eq,
     Lt,
     Le,
-    Gt,
+    Ne,
     Ge,
+    Gt,
 }
 
-/// 跨行原子归约算子
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AtomicOp {
-    Add,
-    Min,
-    Max,
-}
-
-/// GPU 着色器表达式 AST
-#[derive(Debug, Clone, PartialEq)]
-pub enum IrExpr {
-    ConstF64(f64, GpuScalarKind),
-    ConstI64(i64, GpuScalarKind),
-    ConstU64(u64, GpuScalarKind),
-    ConstBool(bool),
-    /// 当前线程对应的逻辑行索引 `row`
-    RowIndex,
-    /// 引用局部标量变量
-    Var(String),
-    /// 行内组件字段读取：`buf[row * stride + elem_offset]`
-    RowLoad {
-        binding: u32,
-        elem_offset: usize,
-        scalar: GpuScalarKind,
-    },
-    /// 从关系对目标行查找表（`PairTargetLut`）读取当前实体指向的目标行索引 `u32`
-    PairTargetRow {
-        lut_binding: u32,
-    },
-    /// 跨行随机/邻域/关系目标收集读取：`target_row < target_len ? buf[target_row * stride + elem_offset] : fallback`
-    GatherLoad {
-        binding: u32,
-        target_row: Box<IrExpr>,
-        elem_offset: usize,
-        scalar: GpuScalarKind,
-        fallback: Box<IrExpr>,
-    },
-    /// 一元运算
-    Unary {
-        op: UnaryOp,
-        expr: Box<IrExpr>,
-    },
-    /// 二元运算
-    Binary {
-        op: BinaryOp,
-        lhs: Box<IrExpr>,
-        rhs: Box<IrExpr>,
-    },
-    /// 融合乘加 `a * b + c`
-    Fma {
-        a: Box<IrExpr>,
-        b: Box<IrExpr>,
-        c: Box<IrExpr>,
-    },
-    /// 无分支条件选择 `cond ? then_expr : else_expr`
-    Select {
-        cond: Box<IrExpr>,
-        then_expr: Box<IrExpr>,
-        else_expr: Box<IrExpr>,
-    },
-}
-
-impl IrExpr {
+impl GpuBinaryOp {
     #[inline]
-    pub fn f32_const(v: f32) -> Self {
-        Self::ConstF64(v as f64, GpuScalarKind::F32)
-    }
-
-    #[inline]
-    pub fn f64_const(v: f64) -> Self {
-        Self::ConstF64(v, GpuScalarKind::F64)
-    }
-
-    #[inline]
-    pub fn u32_const(v: u32) -> Self {
-        Self::ConstU64(v as u64, GpuScalarKind::U32)
-    }
-
-    #[inline]
-    pub fn i32_const(v: i32) -> Self {
-        Self::ConstI64(v as i64, GpuScalarKind::I32)
-    }
-
-    #[inline]
-    pub fn add(self, rhs: Self) -> Self {
-        Self::Binary {
-            op: BinaryOp::Add,
-            lhs: Box::new(self),
-            rhs: Box::new(rhs),
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Rem => "%",
+            Self::And => "&&",
+            Self::Or => "||",
+            Self::BitXor => "^",
+            Self::BitAnd => "&",
+            Self::BitOr => "|",
+            Self::Shl => "<<",
+            Self::Shr => ">>",
+            Self::Eq => "==",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Ne => "!=",
+            Self::Ge => ">=",
+            Self::Gt => ">",
         }
     }
 
     #[inline]
-    pub fn sub(self, rhs: Self) -> Self {
-        Self::Binary {
-            op: BinaryOp::Sub,
-            lhs: Box::new(self),
-            rhs: Box::new(rhs),
-        }
-    }
-
-    #[inline]
-    pub fn mul(self, rhs: Self) -> Self {
-        Self::Binary {
-            op: BinaryOp::Mul,
-            lhs: Box::new(self),
-            rhs: Box::new(rhs),
-        }
-    }
-
-    #[inline]
-    pub fn div(self, rhs: Self) -> Self {
-        Self::Binary {
-            op: BinaryOp::Div,
-            lhs: Box::new(self),
-            rhs: Box::new(rhs),
-        }
-    }
-
-    #[inline]
-    pub fn fma(self, b: Self, c: Self) -> Self {
-        Self::Fma {
-            a: Box::new(self),
-            b: Box::new(b),
-            c: Box::new(c),
-        }
-    }
-}
-
-/// GPU 着色器语句 AST
-#[derive(Debug, Clone, PartialEq)]
-pub enum IrStmt {
-    /// 声明局部标量变量
-    Let {
-        name: String,
-        scalar: GpuScalarKind,
-        value: IrExpr,
-    },
-    /// 行内原位写入：`buf[row * stride + elem_offset] = value`
-    RowStore {
-        binding: u32,
-        elem_offset: usize,
-        scalar: GpuScalarKind,
-        value: IrExpr,
-    },
-    /// 条件控制流
-    If {
-        cond: IrExpr,
-        then_body: Vec<IrStmt>,
-        else_body: Vec<IrStmt>,
-    },
-    /// 跨行原子散射归约（如将子粒子力累加到目标父节点，或全局原子累加）
-    AtomicReduce {
-        op: AtomicOp,
-        dst_binding: u32,
-        dst_index: IrExpr,
-        scalar: GpuScalarKind,
-        value: IrExpr,
-    },
-    /// Threadgroup / Warp 级共享内存归约累加至 `dst_binding[0]`
-    ThreadgroupReduceSum {
-        dst_binding: u32,
-        scalar: GpuScalarKind,
-        value: IrExpr,
-    },
-}
-
-/// 异构计算内核中间表示 (KernelIr)
-#[derive(Debug, Clone)]
-pub struct KernelIr {
-    pub name: String,
-    pub workgroup_size: u32,
-    pub bindings: Vec<BufferBinding>,
-    pub body: Vec<IrStmt>,
-    /// 若置为 `Some(binding_idx)`，内核自动在入口处根据 64 位机器字位平面过滤非活跃行
-    pub predication_mask_binding: Option<u32>,
-}
-
-impl KernelIr {
-    pub fn new(name: impl Into<String>, workgroup_size: u32) -> Self {
-        Self {
-            name: name.into(),
-            workgroup_size: workgroup_size.max(1),
-            bindings: Vec::new(),
-            body: Vec::new(),
-            predication_mask_binding: None,
-        }
-    }
-
-    /// 绑定列缓冲区并返回其绑定槽位号
-    pub fn add_binding(
-        &mut self,
-        name: impl Into<String>,
-        scalar: GpuScalarKind,
-        stride_elems: usize,
-        access: BufferAccess,
-    ) -> u32 {
-        let idx = self.bindings.len() as u32;
-        if access == BufferAccess::PredicationMask {
-            self.predication_mask_binding = Some(idx);
-        }
-        self.bindings.push(BufferBinding {
-            binding_index: idx,
-            name: name.into(),
-            scalar,
-            stride_elems: stride_elems.max(1),
-            access,
-        });
-        idx
-    }
-
-    /// 启用 `RowBitMask` / `RowFlags` 行级位平面硬件谓词掩码
-    pub fn enable_bitmask_predication(&mut self) -> u32 {
-        if let Some(existing) = self.predication_mask_binding {
-            return existing;
-        }
-        self.add_binding(
-            "__row_mask",
-            GpuScalarKind::U64,
-            1,
-            BufferAccess::PredicationMask,
+    pub const fn is_comparison_or_logical(self) -> bool {
+        matches!(
+            self,
+            Self::And
+                | Self::Or
+                | Self::Eq
+                | Self::Lt
+                | Self::Le
+                | Self::Ne
+                | Self::Ge
+                | Self::Gt
         )
     }
+}
 
-    /// 追加一条内核语句
-    pub fn push_stmt(&mut self, stmt: IrStmt) {
-        self.body.push(stmt);
+/// 着色器赋值与复合赋值运算符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuAssignOp {
+    Assign,
+    AddAssign,
+    SubAssign,
+    MulAssign,
+    DivAssign,
+    RemAssign,
+    BitXorAssign,
+    BitAndAssign,
+    BitOrAssign,
+    ShlAssign,
+    ShrAssign,
+}
+
+impl GpuAssignOp {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assign => "=",
+            Self::AddAssign => "+=",
+            Self::SubAssign => "-=",
+            Self::MulAssign => "*=",
+            Self::DivAssign => "/=",
+            Self::RemAssign => "%=",
+            Self::BitXorAssign => "^=",
+            Self::BitAndAssign => "&=",
+            Self::BitOrAssign => "|=",
+            Self::ShlAssign => "<<=",
+            Self::ShrAssign => ">>=",
+        }
     }
+}
 
-    /// 是否使用了 64 位双精度浮点或 64 位整数运算
-    pub fn uses_fp64(&self) -> bool {
-        self.bindings
-            .iter()
-            .any(|b| b.scalar == GpuScalarKind::F64)
-            || self.body.iter().any(Self::stmt_uses_fp64)
+/// 着色器一元运算符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuUnaryOp {
+    Neg,
+    Not,
+}
+
+/// 跨平台着色器内建数学函数枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuMathIntrinsic {
+    Abs,
+    Sqrt,
+    Sin,
+    Cos,
+    Tan,
+    Floor,
+    Ceil,
+    Round,
+    Fract,
+    Exp,
+    Ln,
+    Min,
+    Max,
+    Atan2,
+    Powf,
+    Clamp,
+    Fma,
+}
+
+/// 左值表达式节点（支持标识符、结构体字段访问与数组下标索引）。
+#[derive(Debug, Clone)]
+pub enum GpuLValue {
+    Var(&'static str),
+    Field {
+        base: Box<GpuLValue>,
+        field: &'static str,
+    },
+    Index {
+        base: Box<GpuLValue>,
+        index: Box<GpuExpr>,
+    },
+}
+
+/// 可组合 `#[gpu]` 纯计算辅助函数（Device Function）静态描述符。
+#[derive(Debug, Clone)]
+pub struct GpuHelperFnDescriptor {
+    /// 辅助函数名称
+    pub name: &'static str,
+    /// 形参列表 `(param_name, is_mut, scalar_kind)`
+    pub params: Vec<(&'static str, bool, GpuScalarKind)>,
+    /// 返回值标量类型
+    pub return_type: GpuScalarKind,
+    /// 函数体强类型 IR 块
+    pub body: GpuBlock,
+}
+
+/// 强类型着色器右值表达式树节点。
+#[derive(Debug, Clone)]
+pub enum GpuExpr {
+    /// 局部/形参变量引用
+    Var(&'static str),
+    /// 强类型字面量（含编译期求值的外部 `const` 常量）
+    Lit(GpuLit),
+    /// 结构体字段读取 (`base.field`)
+    Field {
+        base: Box<GpuExpr>,
+        field: &'static str,
+    },
+    /// 数组元素下标读取 (`base[index]`)
+    Index {
+        base: Box<GpuExpr>,
+        index: Box<GpuExpr>,
+    },
+    /// 二元运算表达式 (`lhs op rhs`)
+    Binary {
+        op: GpuBinaryOp,
+        lhs: Box<GpuExpr>,
+        rhs: Box<GpuExpr>,
+    },
+    /// 一元运算表达式 (`-expr` / `!expr`)
+    Unary {
+        op: GpuUnaryOp,
+        expr: Box<GpuExpr>,
+    },
+    /// 括号分组表达式 (`(expr)`)
+    Paren(Box<GpuExpr>),
+    /// 标量类型强转 (`expr as ty`)
+    Cast {
+        expr: Box<GpuExpr>,
+        ty: GpuScalarKind,
+    },
+    /// 跨平台数学内建函数调用
+    MathCall {
+        receiver: Box<GpuExpr>,
+        intrinsic: GpuMathIntrinsic,
+        args: Vec<GpuExpr>,
+    },
+    /// 调用另一个 `#[gpu]` 纯计算辅助函数
+    HelperCall {
+        helper: &'static GpuHelperFnDescriptor,
+        args: Vec<GpuExpr>,
+    },
+}
+
+/// 强类型着色器语句节点。
+#[derive(Debug, Clone)]
+pub enum GpuStmt {
+    /// 局部变量声明 (`let [mut] name [: ty] = init;`)
+    Let {
+        name: &'static str,
+        mutable: bool,
+        explicit_ty: Option<GpuScalarKind>,
+        init: GpuExpr,
+    },
+    /// 赋值或复合赋值语句 (`target op= value;`)
+    Assign {
+        op: GpuAssignOp,
+        target: GpuLValue,
+        value: GpuExpr,
+    },
+    /// 条件分支语句 (`if (cond) { then } else { ... }`)
+    If {
+        cond: GpuExpr,
+        then_block: GpuBlock,
+        else_branch: Option<GpuElseBranch>,
+    },
+    /// `while` 条件循环语句
+    While {
+        cond: GpuExpr,
+        body: GpuBlock,
+    },
+    /// `for var in start..end` 范围循环语句
+    ForRange {
+        var: &'static str,
+        start: GpuExpr,
+        end: GpuExpr,
+        inclusive: bool,
+        body: GpuBlock,
+    },
+    /// 嵌套代码块
+    Block(GpuBlock),
+    /// 函数返回语句（核函数为 `None`，纯辅助函数为 `Some(expr)`）
+    Return(Option<GpuExpr>),
+    /// 循环跳出 (`break;`)
+    Break,
+    /// 循环继续 (`continue;`)
+    Continue,
+}
+
+/// `if` 语句的 `else` 分支形态。
+#[derive(Debug, Clone)]
+pub enum GpuElseBranch {
+    ElseIf(Box<GpuStmt>),
+    ElseBlock(GpuBlock),
+}
+
+/// 着色器语句块。
+#[derive(Debug, Clone, Default)]
+pub struct GpuBlock {
+    pub stmts: Vec<GpuStmt>,
+}
+
+impl GpuBlock {
+    #[inline]
+    pub fn new(stmts: Vec<GpuStmt>) -> Self {
+        Self { stmts }
     }
+}
 
-    fn stmt_uses_fp64(stmt: &IrStmt) -> bool {
-        match stmt {
-            IrStmt::Let { scalar, .. }
-            | IrStmt::RowStore { scalar, .. }
-            | IrStmt::AtomicReduce { scalar, .. }
-            | IrStmt::ThreadgroupReduceSum { scalar, .. } => *scalar == GpuScalarKind::F64,
-            IrStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                then_body.iter().any(Self::stmt_uses_fp64)
-                    || else_body.iter().any(Self::stmt_uses_fp64)
-            }
+/// 组件结构体 Schema 符号项（供 [`ShaderTypeEnv`] 查询字段类型）。
+#[derive(Debug, Clone, Copy)]
+pub struct GpuComponentSchema {
+    pub param_name: &'static str,
+    pub struct_name: &'static str,
+    pub fields: &'static [GpuStructField],
+    pub mutable: bool,
+}
+
+/// 词法作用域与组件字段类型推导环境。
+#[derive(Clone)]
+struct ShaderTypeEnv<'a> {
+    schemas: HashMap<&'static str, &'static [GpuStructField]>,
+    scopes: Vec<HashMap<&'static str, GpuValueType>>,
+    mut_params: &'a [&'static str],
+}
+
+impl<'a> ShaderTypeEnv<'a> {
+    fn for_kernel(components: &[GpuComponentSchema], mut_params: &'a [&'static str]) -> Self {
+        let mut schemas = HashMap::with_capacity(components.len());
+        let mut root_scope = HashMap::with_capacity(components.len());
+        for c in components {
+            schemas.insert(c.struct_name, c.fields);
+            root_scope.insert(c.param_name, GpuValueType::Struct(c.struct_name));
+        }
+        Self {
+            schemas,
+            scopes: vec![root_scope],
+            mut_params,
         }
     }
 
-    /// 是否包含跨行 Gather 或 `Pair` 目标查找访存模式
-    pub fn uses_cross_row_gather(&self) -> bool {
-        self.bindings
-            .iter()
-            .any(|b| b.access == BufferAccess::PairTargetLut)
-            || self.body.iter().any(Self::stmt_uses_gather)
-    }
-
-    fn stmt_uses_gather(stmt: &IrStmt) -> bool {
-        match stmt {
-            IrStmt::Let { value, .. }
-            | IrStmt::RowStore { value, .. }
-            | IrStmt::ThreadgroupReduceSum { value, .. } => Self::expr_uses_gather(value),
-            IrStmt::AtomicReduce {
-                dst_index, value, ..
-            } => Self::expr_uses_gather(dst_index) || Self::expr_uses_gather(value),
-            IrStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                Self::expr_uses_gather(cond)
-                    || then_body.iter().any(Self::stmt_uses_gather)
-                    || else_body.iter().any(Self::stmt_uses_gather)
-            }
+    fn for_helper(params: &[(&'static str, bool, GpuScalarKind)]) -> Self {
+        let mut root_scope = HashMap::with_capacity(params.len());
+        for &(name, _, kind) in params {
+            root_scope.insert(name, GpuValueType::Scalar(kind));
+        }
+        Self {
+            schemas: HashMap::new(),
+            scopes: vec![root_scope],
+            mut_params: &[],
         }
     }
 
-    fn expr_uses_gather(expr: &IrExpr) -> bool {
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn define_var(&mut self, name: &'static str, ty: GpuValueType) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, ty);
+        }
+    }
+
+    fn lookup_var(&self, name: &str) -> GpuValueType {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&ty) = scope.get(name) {
+                return ty;
+            }
+        }
+        GpuValueType::Unknown
+    }
+
+    fn lookup_field(&self, struct_name: &str, field_name: &str) -> GpuValueType {
+        if let Some(&fields) = self.schemas.get(struct_name) {
+            if let Some(f) = fields.iter().find(|f| f.name == field_name) {
+                return GpuValueType::from_field_type(f.field_type);
+            }
+        }
+        GpuValueType::Unknown
+    }
+
+    fn infer_expr_type(&self, expr: &GpuExpr) -> GpuValueType {
         match expr {
-            IrExpr::GatherLoad { .. } | IrExpr::PairTargetRow { .. } => true,
-            IrExpr::Unary { expr, .. } => Self::expr_uses_gather(expr),
-            IrExpr::Binary { lhs, rhs, .. } => {
-                Self::expr_uses_gather(lhs) || Self::expr_uses_gather(rhs)
+            GpuExpr::Var(name) => self.lookup_var(name),
+            GpuExpr::Lit(lit) => match lit {
+                GpuLit::FloatRaw(_) | GpuLit::F32(_) => GpuValueType::Scalar(GpuScalarKind::F32),
+                GpuLit::UntypedInt(_) | GpuLit::I32(_) => GpuValueType::Scalar(GpuScalarKind::I32),
+                GpuLit::U32(_) => GpuValueType::Scalar(GpuScalarKind::U32),
+                GpuLit::Bool(_) => GpuValueType::Scalar(GpuScalarKind::Bool),
+            },
+            GpuExpr::Field { base, field } => {
+                if let GpuValueType::Struct(sname) = self.infer_expr_type(base) {
+                    self.lookup_field(sname, field)
+                } else {
+                    GpuValueType::Unknown
+                }
             }
-            IrExpr::Fma { a, b, c } => {
-                Self::expr_uses_gather(a)
-                    || Self::expr_uses_gather(b)
-                    || Self::expr_uses_gather(c)
+            GpuExpr::Index { base, .. } => {
+                if let GpuValueType::Array(elem_kind, _) = self.infer_expr_type(base) {
+                    GpuValueType::Scalar(elem_kind)
+                } else {
+                    GpuValueType::Unknown
+                }
             }
-            IrExpr::Select {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                Self::expr_uses_gather(cond)
-                    || Self::expr_uses_gather(then_expr)
-                    || Self::expr_uses_gather(else_expr)
+            GpuExpr::Binary { op, lhs, rhs } => {
+                if op.is_comparison_or_logical() {
+                    return GpuValueType::Scalar(GpuScalarKind::Bool);
+                }
+                let lt = self.infer_expr_type(lhs);
+                let rt = self.infer_expr_type(rhs);
+                if matches!(lt, GpuValueType::Scalar(GpuScalarKind::U32))
+                    || matches!(rt, GpuValueType::Scalar(GpuScalarKind::U32))
+                {
+                    return GpuValueType::Scalar(GpuScalarKind::U32);
+                }
+                if !matches!(lt, GpuValueType::Unknown) {
+                    lt
+                } else {
+                    rt
+                }
             }
-            _ => false,
+            GpuExpr::Unary { op, expr } => match op {
+                GpuUnaryOp::Not => GpuValueType::Scalar(GpuScalarKind::Bool),
+                GpuUnaryOp::Neg => self.infer_expr_type(expr),
+            },
+            GpuExpr::Paren(inner) => self.infer_expr_type(inner),
+            GpuExpr::Cast { ty, .. } => GpuValueType::Scalar(*ty),
+            GpuExpr::MathCall {
+                receiver,
+                intrinsic,
+                ..
+            } => match intrinsic {
+                GpuMathIntrinsic::Abs
+                | GpuMathIntrinsic::Min
+                | GpuMathIntrinsic::Max
+                | GpuMathIntrinsic::Clamp => self.infer_expr_type(receiver),
+                _ => GpuValueType::Scalar(GpuScalarKind::F32),
+            },
+            GpuExpr::HelperCall { helper, .. } => GpuValueType::Scalar(helper.return_type),
         }
     }
 
-    /// 查找指定绑定索引的缓冲区定义
-    pub fn binding(&self, idx: u32) -> Option<&BufferBinding> {
-        self.bindings.get(idx as usize)
+    fn is_strictly_unsigned_expr(&self, expr: &GpuExpr) -> bool {
+        match expr {
+            GpuExpr::Lit(GpuLit::UntypedInt(_)) => false,
+            _ => matches!(
+                self.infer_expr_type(expr),
+                GpuValueType::Scalar(GpuScalarKind::U32)
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IrBackendTarget {
+    Msl,
+    Wgsl,
+}
+
+struct IrCodeEmitter {
+    target: IrBackendTarget,
+}
+
+impl IrCodeEmitter {
+    fn new(target: IrBackendTarget) -> Self {
+        Self { target }
     }
 
-    /// 编译生成 WebGPU WGSL 计算着色器源码
-    pub fn compile_wgsl(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        if self
-            .bindings
-            .iter()
-            .any(|b| matches!(b.scalar, GpuScalarKind::F16 | GpuScalarKind::BF16))
-        {
-            let _ = writeln!(out, "enable f16;");
-        }
-        if self.uses_fp64() {
-            let _ = writeln!(out, "// HPC Extension: requires shader-f64 capability");
-        }
-        let _ = writeln!(
-            out,
-            "struct DispatchParams {{\n    row_count: u32,\n    target_row_count: u32,\n}};"
-        );
-        let _ = writeln!(
-            out,
-            "@group(0) @binding(0) var<uniform> __params: DispatchParams;"
-        );
-
-        for b in &self.bindings {
-            let slot = b.binding_index + 1;
-            match b.access {
-                BufferAccess::PredicationMask => {
-                    // WGSL 使用 array<u32> 以每 2 个 u32 字承载 64 位 RowBitMask
-                    let _ = writeln!(
-                        out,
-                        "@group(0) @binding({slot}) var<storage, read> {}: array<u32>;",
-                        b.name
-                    );
-                }
-                BufferAccess::PairTargetLut => {
-                    let _ = writeln!(
-                        out,
-                        "@group(0) @binding({slot}) var<storage, read> {}: array<u32>;",
-                        b.name
-                    );
-                }
-                BufferAccess::ReadOnly => {
-                    let _ = writeln!(
-                        out,
-                        "@group(0) @binding({slot}) var<storage, read> {}: array<{}>;",
-                        b.name,
-                        b.scalar.wgsl_type()
-                    );
-                }
-                BufferAccess::ReadWrite => {
-                    let _ = writeln!(
-                        out,
-                        "@group(0) @binding({slot}) var<storage, read_write> {}: array<{}>;",
-                        b.name,
-                        b.scalar.wgsl_type()
-                    );
-                }
-                BufferAccess::AtomicReadWrite => {
-                    let _ = writeln!(
-                        out,
-                        "@group(0) @binding({slot}) var<storage, read_write> {}: array<atomic<{}>>;",
-                        b.name,
-                        b.scalar.wgsl_type()
-                    );
-                }
+    fn emit_block(&self, block: &GpuBlock, env: &mut ShaderTypeEnv<'_>) -> String {
+        env.push_scope();
+        let mut out = String::new();
+        for (idx, stmt) in block.stmts.iter().enumerate() {
+            if idx > 0 {
+                out.push(' ');
             }
+            out.push_str(&self.emit_stmt(stmt, env));
         }
-
-        let _ = writeln!(
-            out,
-            "\n@compute @workgroup_size({}, 1, 1)\nfn {}(@builtin(global_invocation_id) gid: vec3<u32>) {{",
-            self.workgroup_size, self.name
-        );
-        let _ = writeln!(out, "    let row: u32 = gid.x;");
-        let _ = writeln!(
-            out,
-            "    if (row >= __params.row_count) {{\n        return;\n    }}"
-        );
-
-        if let Some(mask_idx) = self.predication_mask_binding {
-            if let Some(mask_b) = self.binding(mask_idx) {
-                let _ = writeln!(
-                    out,
-                    "    let mask_word_u32: u32 = {}[row >> 5u];",
-                    mask_b.name
-                );
-                let _ = writeln!(
-                    out,
-                    "    if (((mask_word_u32 >> (row & 31u)) & 1u) == 0u) {{\n        return;\n    }}"
-                );
-            }
-        }
-
-        for stmt in &self.body {
-            self.emit_wgsl_stmt(&mut out, stmt, 1);
-        }
-        let _ = writeln!(out, "}}");
+        env.pop_scope();
         out
     }
 
-    fn emit_wgsl_stmt(&self, out: &mut String, stmt: &IrStmt, indent: usize) {
-        let pad = "    ".repeat(indent);
+    fn emit_stmt(&self, stmt: &GpuStmt, env: &mut ShaderTypeEnv<'_>) -> String {
         match stmt {
-            IrStmt::Let {
+            GpuStmt::Let {
                 name,
-                scalar,
-                value,
+                mutable,
+                explicit_ty,
+                init,
             } => {
-                let expr_s = self.emit_wgsl_expr(value);
-                let _ = writeln!(out, "{pad}let {name}: {} = {expr_s};", scalar.wgsl_type());
-            }
-            IrStmt::RowStore {
-                binding,
-                elem_offset,
-                value,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let expr_s = self.emit_wgsl_expr(value);
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        let _ = writeln!(out, "{pad}{}[row] = {expr_s};", b.name);
-                    } else {
-                        let _ = writeln!(
-                            out,
-                            "{pad}{}[row * {}u + {}u] = {expr_s};",
-                            b.name, b.stride_elems, elem_offset
-                        );
+                let coerce_u32 = *explicit_ty == Some(GpuScalarKind::U32);
+                let rhs = self.emit_expr(init, env, coerce_u32);
+                let inferred = if let Some(kind) = explicit_ty {
+                    GpuValueType::Scalar(*kind)
+                } else {
+                    env.infer_expr_type(init)
+                };
+                env.define_var(name, inferred);
+                match (self.target, *mutable, explicit_ty) {
+                    (IrBackendTarget::Msl, true, Some(ty)) => {
+                        format!("{} {name} = {rhs};", ty.msl_type())
                     }
+                    (IrBackendTarget::Msl, false, Some(ty)) => {
+                        format!("const {} {name} = {rhs};", ty.msl_type())
+                    }
+                    (IrBackendTarget::Msl, true, None) => format!("auto {name} = {rhs};"),
+                    (IrBackendTarget::Msl, false, None) => format!("const auto {name} = {rhs};"),
+                    (IrBackendTarget::Wgsl, true, Some(ty)) => {
+                        format!("var {name}: {} = {rhs};", ty.wgsl_type())
+                    }
+                    (IrBackendTarget::Wgsl, false, Some(ty)) => {
+                        format!("let {name}: {} = {rhs};", ty.wgsl_type())
+                    }
+                    (IrBackendTarget::Wgsl, true, None) => format!("var {name} = {rhs};"),
+                    (IrBackendTarget::Wgsl, false, None) => format!("let {name} = {rhs};"),
                 }
             }
-            IrStmt::If {
+            GpuStmt::Assign { op, target, value } => {
+                let lhs = self.emit_lvalue(target, env);
+                let rhs = self.emit_expr(value, env, false);
+                format!("{lhs} {} {rhs};", op.as_str())
+            }
+            GpuStmt::If {
                 cond,
-                then_body,
-                else_body,
+                then_block,
+                else_branch,
             } => {
-                let c_s = self.emit_wgsl_expr(cond);
-                let _ = writeln!(out, "{pad}if ({c_s}) {{");
-                for s in then_body {
-                    self.emit_wgsl_stmt(out, s, indent + 1);
-                }
-                if !else_body.is_empty() {
-                    let _ = writeln!(out, "{pad}}} else {{");
-                    for s in else_body {
-                        self.emit_wgsl_stmt(out, s, indent + 1);
+                let cond_str = self.emit_expr(cond, env, false);
+                let then_str = self.emit_block(then_block, env);
+                let mut s = format!("if ({cond_str}) {{ {then_str} }}");
+                if let Some(eb) = else_branch {
+                    match eb {
+                        GpuElseBranch::ElseIf(elif_stmt) => {
+                            let elif_str = self.emit_stmt(elif_stmt, env);
+                            s.push_str(&format!(" else {elif_str}"));
+                        }
+                        GpuElseBranch::ElseBlock(eblock) => {
+                            let else_str = self.emit_block(eblock, env);
+                            s.push_str(&format!(" else {{ {else_str} }}"));
+                        }
                     }
                 }
-                let _ = writeln!(out, "{pad}}}");
+                s
             }
-            IrStmt::AtomicReduce {
-                op,
-                dst_binding,
-                dst_index,
-                value,
-                ..
+            GpuStmt::While { cond, body } => {
+                let cond_str = self.emit_expr(cond, env, false);
+                let body_str = self.emit_block(body, env);
+                format!("while ({cond_str}) {{ {body_str} }}")
+            }
+            GpuStmt::ForRange {
+                var,
+                start,
+                end,
+                inclusive,
+                body,
             } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let idx_s = self.emit_wgsl_expr(dst_index);
-                    let val_s = self.emit_wgsl_expr(value);
-                    let fn_name = match op {
-                        AtomicOp::Add => "atomicAdd",
-                        AtomicOp::Min => "atomicMin",
-                        AtomicOp::Max => "atomicMax",
-                    };
-                    let _ = writeln!(out, "{pad}{fn_name}(&{}[{idx_s}], {val_s});", b.name);
-                }
-            }
-            IrStmt::ThreadgroupReduceSum {
-                dst_binding, value, ..
-            } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let val_s = self.emit_wgsl_expr(value);
-                    let _ = writeln!(
-                        out,
-                        "{pad}// Threadgroup reduction accumulate\n{pad}atomicAdd(&{}[0u], {val_s});",
-                        b.name
-                    );
-                }
-            }
-        }
-    }
+                let is_unsigned =
+                    env.is_strictly_unsigned_expr(start) || env.is_strictly_unsigned_expr(end);
+                let start_str = self.emit_expr(start, env, is_unsigned);
+                let end_str = self.emit_expr(end, env, is_unsigned);
+                let step_str = if is_unsigned { "1u" } else { "1" };
+                let cmp_str = if *inclusive { "<=" } else { "<" };
 
-    fn emit_wgsl_expr(&self, expr: &IrExpr) -> String {
-        match expr {
-            IrExpr::ConstF64(v, kind) => format!("{v:.6}{}", if *kind == GpuScalarKind::F64 { "lf" } else { "f" }),
-            IrExpr::ConstI64(v, _) => format!("{v}i"),
-            IrExpr::ConstU64(v, _) => format!("{v}u"),
-            IrExpr::ConstBool(v) => format!("{v}"),
-            IrExpr::RowIndex => "row".to_string(),
-            IrExpr::Var(name) => name.clone(),
-            IrExpr::RowLoad {
-                binding,
-                elem_offset,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        format!("{}[row]", b.name)
+                env.push_scope();
+                env.define_var(
+                    var,
+                    GpuValueType::Scalar(if is_unsigned {
+                        GpuScalarKind::U32
                     } else {
-                        format!("{}[row * {}u + {}u]", b.name, b.stride_elems, elem_offset)
-                    }
-                } else {
-                    "0".to_string()
-                }
-            }
-            IrExpr::PairTargetRow { lut_binding } => {
-                if let Some(b) = self.binding(*lut_binding) {
-                    format!("{}[row]", b.name)
-                } else {
-                    "4294967295u".to_string()
-                }
-            }
-            IrExpr::GatherLoad {
-                binding,
-                target_row,
-                elem_offset,
-                fallback,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let trow = self.emit_wgsl_expr(target_row);
-                    let fb = self.emit_wgsl_expr(fallback);
-                    let idx_expr = if b.stride_elems == 1 && *elem_offset == 0 {
-                        trow.clone()
-                    } else {
-                        format!("({trow} * {}u + {}u)", b.stride_elems, elem_offset)
-                    };
-                    format!(
-                        "select({fb}, {}[{idx_expr}], ({trow} < __params.target_row_count))",
-                        b.name
-                    )
-                } else {
-                    self.emit_wgsl_expr(fallback)
-                }
-            }
-            IrExpr::Unary { op, expr } => {
-                let inner = self.emit_wgsl_expr(expr);
-                match op {
-                    UnaryOp::Neg => format!("(-{inner})"),
-                    UnaryOp::Abs => format!("abs({inner})"),
-                    UnaryOp::Sqrt => format!("sqrt({inner})"),
-                    UnaryOp::Rsqrt => format!("inverseSqrt({inner})"),
-                    UnaryOp::Sin => format!("sin({inner})"),
-                    UnaryOp::Cos => format!("cos({inner})"),
-                    UnaryOp::Exp => format!("exp({inner})"),
-                }
-            }
-            IrExpr::Binary { op, lhs, rhs } => {
-                let l = self.emit_wgsl_expr(lhs);
-                let r = self.emit_wgsl_expr(rhs);
-                match op {
-                    BinaryOp::Add => format!("({l} + {r})"),
-                    BinaryOp::Sub => format!("({l} - {r})"),
-                    BinaryOp::Mul => format!("({l} * {r})"),
-                    BinaryOp::Div => format!("({l} / {r})"),
-                    BinaryOp::Min => format!("min({l}, {r})"),
-                    BinaryOp::Max => format!("max({l}, {r})"),
-                    BinaryOp::Eq => format!("({l} == {r})"),
-                    BinaryOp::Lt => format!("({l} < {r})"),
-                    BinaryOp::Le => format!("({l} <= {r})"),
-                    BinaryOp::Gt => format!("({l} > {r})"),
-                    BinaryOp::Ge => format!("({l} >= {r})"),
-                }
-            }
-            IrExpr::Fma { a, b, c } => {
-                let a_s = self.emit_wgsl_expr(a);
-                let b_s = self.emit_wgsl_expr(b);
-                let c_s = self.emit_wgsl_expr(c);
-                format!("fma({a_s}, {b_s}, {c_s})")
-            }
-            IrExpr::Select {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let c_s = self.emit_wgsl_expr(cond);
-                let t_s = self.emit_wgsl_expr(then_expr);
-                let e_s = self.emit_wgsl_expr(else_expr);
-                format!("select({e_s}, {t_s}, {c_s})")
-            }
-        }
-    }
-
-    /// 编译生成 Apple Metal Shading Language (MSL) 内核源码（适配 16KB UMA 零拷贝与 Simdgroup 归约）
-    pub fn compile_msl(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        let _ = writeln!(out, "#include <metal_stdlib>\nusing namespace metal;\n");
-        let _ = writeln!(
-            out,
-            "struct DispatchParams {{\n    uint row_count;\n    uint target_row_count;\n}};\n"
-        );
-        let _ = write!(out, "kernel void {}(\n    constant DispatchParams& __params [[buffer(0)]]", self.name);
-
-        for b in &self.bindings {
-            let slot = b.binding_index + 1;
-            match b.access {
-                BufferAccess::PredicationMask => {
-                    let _ = write!(out, ",\n    device const ulong* {} [[buffer({slot})]]", b.name);
-                }
-                BufferAccess::PairTargetLut => {
-                    let _ = write!(out, ",\n    device const uint* {} [[buffer({slot})]]", b.name);
-                }
-                BufferAccess::ReadOnly => {
-                    let _ = write!(
-                        out,
-                        ",\n    device const {}* {} [[buffer({slot})]]",
-                        b.scalar.msl_type(),
-                        b.name
-                    );
-                }
-                BufferAccess::ReadWrite | BufferAccess::AtomicReadWrite => {
-                    let _ = write!(
-                        out,
-                        ",\n    device {}* {} [[buffer({slot})]]",
-                        b.scalar.msl_type(),
-                        b.name
-                    );
-                }
-            }
-        }
-        let _ = writeln!(
-            out,
-            ",\n    uint row [[thread_position_in_grid]],\n    uint simd_lane [[thread_index_in_simdgroup]]\n) {{"
-        );
-        let _ = writeln!(
-            out,
-            "    if (row >= __params.row_count) {{\n        return;\n    }}"
-        );
-
-        if let Some(mask_idx) = self.predication_mask_binding {
-            if let Some(mask_b) = self.binding(mask_idx) {
-                let _ = writeln!(
-                    out,
-                    "    if ((({}[row >> 6u] >> (row & 63u)) & 1ul) == 0ul) {{\n        return;\n    }}",
-                    mask_b.name
+                        GpuScalarKind::I32
+                    }),
                 );
-            }
-        }
+                let body_str = self.emit_block(body, env);
+                env.pop_scope();
 
-        for stmt in &self.body {
-            self.emit_msl_stmt(&mut out, stmt, 1);
+                match self.target {
+                    IrBackendTarget::Msl => format!(
+                        "for (auto {var} = {start_str}; {var} {cmp_str} {end_str}; {var} += {step_str}) {{ {body_str} }}"
+                    ),
+                    IrBackendTarget::Wgsl => format!(
+                        "for (var {var} = {start_str}; {var} {cmp_str} {end_str}; {var} += {step_str}) {{ {body_str} }}"
+                    ),
+                }
+            }
+            GpuStmt::Block(inner) => {
+                let inner_str = self.emit_block(inner, env);
+                format!("{{ {inner_str} }}")
+            }
+            GpuStmt::Return(opt_val) => {
+                if let Some(val) = opt_val {
+                    let val_str = self.emit_expr(val, env, false);
+                    format!("return {val_str};")
+                } else {
+                    match self.target {
+                        IrBackendTarget::Msl => "return;".to_string(),
+                        IrBackendTarget::Wgsl => {
+                            if env.mut_params.is_empty() {
+                                "return;".to_string()
+                            } else {
+                                let mut wb = String::new();
+                                for p in env.mut_params {
+                                    wb.push_str(&format!("sumeru_buf_{p}[gid] = {p}; "));
+                                }
+                                wb.push_str("return;");
+                                wb
+                            }
+                        }
+                    }
+                }
+            }
+            GpuStmt::Break => "break;".to_string(),
+            GpuStmt::Continue => "continue;".to_string(),
         }
-        let _ = writeln!(out, "}}");
-        out
     }
 
-    fn emit_msl_stmt(&self, out: &mut String, stmt: &IrStmt, indent: usize) {
-        let pad = "    ".repeat(indent);
-        match stmt {
-            IrStmt::Let {
-                name,
-                scalar,
-                value,
-            } => {
-                let expr_s = self.emit_msl_expr(value);
-                let _ = writeln!(out, "{pad}{} {name} = {expr_s};", scalar.msl_type());
+    fn emit_lvalue(&self, lv: &GpuLValue, env: &mut ShaderTypeEnv<'_>) -> String {
+        match lv {
+            GpuLValue::Var(name) => (*name).to_string(),
+            GpuLValue::Field { base, field } => {
+                let b = self.emit_lvalue(base, env);
+                format!("{b}.{field}")
             }
-            IrStmt::RowStore {
-                binding,
-                elem_offset,
-                value,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let expr_s = self.emit_msl_expr(value);
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        let _ = writeln!(out, "{pad}{}[row] = {expr_s};", b.name);
-                    } else {
-                        let _ = writeln!(
-                            out,
-                            "{pad}{}[row * {}u + {}u] = {expr_s};",
-                            b.name, b.stride_elems, elem_offset
-                        );
-                    }
-                }
-            }
-            IrStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                let c_s = self.emit_msl_expr(cond);
-                let _ = writeln!(out, "{pad}if ({c_s}) {{");
-                for s in then_body {
-                    self.emit_msl_stmt(out, s, indent + 1);
-                }
-                if !else_body.is_empty() {
-                    let _ = writeln!(out, "{pad}}} else {{");
-                    for s in else_body {
-                        self.emit_msl_stmt(out, s, indent + 1);
-                    }
-                }
-                let _ = writeln!(out, "{pad}}}");
-            }
-            IrStmt::AtomicReduce {
-                op,
-                dst_binding,
-                dst_index,
-                value,
-                ..
-            } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let idx_s = self.emit_msl_expr(dst_index);
-                    let val_s = self.emit_msl_expr(value);
-                    let op_comment = match op {
-                        AtomicOp::Add => "+=",
-                        AtomicOp::Min => "min",
-                        AtomicOp::Max => "max",
-                    };
-                    let _ = writeln!(
-                        out,
-                        "{pad}// Atomic scatter ({op_comment})\n{pad}{}[{idx_s}] += {val_s};",
-                        b.name
-                    );
-                }
-            }
-            IrStmt::ThreadgroupReduceSum {
-                dst_binding,
-                scalar,
-                value,
-            } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let val_s = self.emit_msl_expr(value);
-                    let _ = writeln!(
-                        out,
-                        "{pad}{} __sg_sum = simd_sum({val_s});\n{pad}if (simd_lane == 0u) {{ {}[0] += __sg_sum; }}",
-                        scalar.msl_type(),
-                        b.name
-                    );
-                }
+            GpuLValue::Index { base, index } => {
+                let b = self.emit_lvalue(base, env);
+                let idx = self.emit_expr(index, env, false);
+                format!("{b}[{idx}]")
             }
         }
     }
 
-    fn emit_msl_expr(&self, expr: &IrExpr) -> String {
+    fn emit_expr(
+        &self,
+        expr: &GpuExpr,
+        env: &mut ShaderTypeEnv<'_>,
+        coerce_unsigned: bool,
+    ) -> String {
         match expr {
-            IrExpr::ConstF64(v, kind) => {
-                if *kind == GpuScalarKind::F64 {
-                    format!("{v:.6}")
-                } else {
-                    format!("{v:.6}f")
+            GpuExpr::Var(name) => (*name).to_string(),
+            GpuExpr::Lit(lit) => lit.format_shader(coerce_unsigned),
+            GpuExpr::Field { base, field } => {
+                let b = self.emit_expr(base, env, false);
+                format!("{b}.{field}")
+            }
+            GpuExpr::Index { base, index } => {
+                let b = self.emit_expr(base, env, false);
+                let idx = self.emit_expr(index, env, false);
+                format!("{b}[{idx}]")
+            }
+            GpuExpr::Binary { op, lhs, rhs } => {
+                let l = self.emit_expr(lhs, env, false);
+                let r = self.emit_expr(rhs, env, false);
+                format!("{l} {} {r}", op.as_str())
+            }
+            GpuExpr::Unary { op, expr } => {
+                let inner = self.emit_expr(expr, env, false);
+                match op {
+                    GpuUnaryOp::Neg => format!("-({inner})"),
+                    GpuUnaryOp::Not => format!("!({inner})"),
                 }
             }
-            IrExpr::ConstI64(v, _) => format!("{v}"),
-            IrExpr::ConstU64(v, _) => format!("{v}u"),
-            IrExpr::ConstBool(v) => format!("{v}"),
-            IrExpr::RowIndex => "row".to_string(),
-            IrExpr::Var(name) => name.clone(),
-            IrExpr::RowLoad {
-                binding,
-                elem_offset,
-                ..
+            GpuExpr::Paren(inner) => {
+                let s = self.emit_expr(inner, env, coerce_unsigned);
+                format!("({s})")
+            }
+            GpuExpr::Cast { expr, ty } => {
+                let inner = self.emit_expr(expr, env, false);
+                match self.target {
+                    IrBackendTarget::Msl => format!("{}({inner})", ty.msl_type()),
+                    IrBackendTarget::Wgsl => format!("{}({inner})", ty.wgsl_type()),
+                }
+            }
+            GpuExpr::MathCall {
+                receiver,
+                intrinsic,
+                args,
             } => {
-                if let Some(b) = self.binding(*binding) {
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        format!("{}[row]", b.name)
-                    } else {
-                        format!("{}[row * {}u + {}u]", b.name, b.stride_elems, elem_offset)
+                let recv = self.emit_expr(receiver, env, false);
+                let emitted_args: Vec<String> =
+                    args.iter().map(|a| self.emit_expr(a, env, false)).collect();
+                match intrinsic {
+                    GpuMathIntrinsic::Abs => format!("abs({recv})"),
+                    GpuMathIntrinsic::Sqrt => format!("sqrt({recv})"),
+                    GpuMathIntrinsic::Sin => format!("sin({recv})"),
+                    GpuMathIntrinsic::Cos => format!("cos({recv})"),
+                    GpuMathIntrinsic::Tan => format!("tan({recv})"),
+                    GpuMathIntrinsic::Floor => format!("floor({recv})"),
+                    GpuMathIntrinsic::Ceil => format!("ceil({recv})"),
+                    GpuMathIntrinsic::Round => format!("round({recv})"),
+                    GpuMathIntrinsic::Fract => format!("fract({recv})"),
+                    GpuMathIntrinsic::Exp => format!("exp({recv})"),
+                    GpuMathIntrinsic::Ln => format!("log({recv})"),
+                    GpuMathIntrinsic::Min => format!("min({recv}, {})", emitted_args[0]),
+                    GpuMathIntrinsic::Max => format!("max({recv}, {})", emitted_args[0]),
+                    GpuMathIntrinsic::Atan2 => format!("atan2({recv}, {})", emitted_args[0]),
+                    GpuMathIntrinsic::Powf => format!("pow({recv}, {})", emitted_args[0]),
+                    GpuMathIntrinsic::Clamp => {
+                        format!("clamp({recv}, {}, {})", emitted_args[0], emitted_args[1])
                     }
-                } else {
-                    "0".to_string()
+                    GpuMathIntrinsic::Fma => {
+                        format!("fma({recv}, {}, {})", emitted_args[0], emitted_args[1])
+                    }
                 }
             }
-            IrExpr::PairTargetRow { lut_binding } => {
-                if let Some(b) = self.binding(*lut_binding) {
-                    format!("{}[row]", b.name)
-                } else {
-                    "0xFFFFFFFFu".to_string()
-                }
-            }
-            IrExpr::GatherLoad {
-                binding,
-                target_row,
-                elem_offset,
-                fallback,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let trow = self.emit_msl_expr(target_row);
-                    let fb = self.emit_msl_expr(fallback);
-                    let idx_expr = if b.stride_elems == 1 && *elem_offset == 0 {
-                        trow.clone()
-                    } else {
-                        format!("({trow} * {}u + {}u)", b.stride_elems, elem_offset)
-                    };
-                    format!(
-                        "(({trow} < __params.target_row_count) ? {}[{idx_expr}] : ({fb}))",
-                        b.name
-                    )
-                } else {
-                    self.emit_msl_expr(fallback)
-                }
-            }
-            IrExpr::Unary { op, expr } => {
-                let inner = self.emit_msl_expr(expr);
-                match op {
-                    UnaryOp::Neg => format!("(-{inner})"),
-                    UnaryOp::Abs => format!("abs({inner})"),
-                    UnaryOp::Sqrt => format!("sqrt({inner})"),
-                    UnaryOp::Rsqrt => format!("rsqrt({inner})"),
-                    UnaryOp::Sin => format!("sin({inner})"),
-                    UnaryOp::Cos => format!("cos({inner})"),
-                    UnaryOp::Exp => format!("exp({inner})"),
-                }
-            }
-            IrExpr::Binary { op, lhs, rhs } => {
-                let l = self.emit_msl_expr(lhs);
-                let r = self.emit_msl_expr(rhs);
-                match op {
-                    BinaryOp::Add => format!("({l} + {r})"),
-                    BinaryOp::Sub => format!("({l} - {r})"),
-                    BinaryOp::Mul => format!("({l} * {r})"),
-                    BinaryOp::Div => format!("({l} / {r})"),
-                    BinaryOp::Min => format!("min({l}, {r})"),
-                    BinaryOp::Max => format!("max({l}, {r})"),
-                    BinaryOp::Eq => format!("({l} == {r})"),
-                    BinaryOp::Lt => format!("({l} < {r})"),
-                    BinaryOp::Le => format!("({l} <= {r})"),
-                    BinaryOp::Gt => format!("({l} > {r})"),
-                    BinaryOp::Ge => format!("({l} >= {r})"),
-                }
-            }
-            IrExpr::Fma { a, b, c } => {
-                let a_s = self.emit_msl_expr(a);
-                let b_s = self.emit_msl_expr(b);
-                let c_s = self.emit_msl_expr(c);
-                format!("fma({a_s}, {b_s}, {c_s})")
-            }
-            IrExpr::Select {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let c_s = self.emit_msl_expr(cond);
-                let t_s = self.emit_msl_expr(then_expr);
-                let e_s = self.emit_msl_expr(else_expr);
-                format!("(({c_s}) ? ({t_s}) : ({e_s}))")
+            GpuExpr::HelperCall { helper, args } => {
+                let emitted_args: Vec<String> =
+                    args.iter().map(|a| self.emit_expr(a, env, false)).collect();
+                format!("{}({})", helper.name, emitted_args.join(", "))
             }
         }
     }
 
-    /// 编译生成面向超算（NVIDIA Grace Hopper / Blackwell）的 CUDA C++ 内核源码（原生支持 `double` FP64 与 `atomicAdd`）
-    pub fn compile_cuda(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        let _ = writeln!(out, "#include <stdint.h>\n#include <math.h>\n");
-        let _ = write!(
-            out,
-            "extern \"C\" __global__ void {}(\n    const uint32_t __row_count,\n    const uint32_t __target_row_count",
-            self.name
-        );
-
-        for b in &self.bindings {
-            match b.access {
-                BufferAccess::PredicationMask => {
-                    let _ = write!(out, ",\n    const uint64_t* __restrict__ {}", b.name);
-                }
-                BufferAccess::PairTargetLut => {
-                    let _ = write!(out, ",\n    const uint32_t* __restrict__ {}", b.name);
-                }
-                BufferAccess::ReadOnly => {
-                    let _ = write!(
-                        out,
-                        ",\n    const {}* __restrict__ {}",
-                        b.scalar.cuda_type(),
-                        b.name
-                    );
-                }
-                BufferAccess::ReadWrite | BufferAccess::AtomicReadWrite => {
-                    let _ = write!(
-                        out,
-                        ",\n    {}* __restrict__ {}",
-                        b.scalar.cuda_type(),
-                        b.name
-                    );
-                }
+    fn emit_helper_fn(&self, helper: &GpuHelperFnDescriptor) -> String {
+        let mut env = ShaderTypeEnv::for_helper(&helper.params);
+        match self.target {
+            IrBackendTarget::Msl => {
+                let params_str: Vec<String> = helper
+                    .params
+                    .iter()
+                    .map(|&(name, _, kind)| format!("{} {name}", kind.msl_type()))
+                    .collect();
+                let body_str = self.emit_block(&helper.body, &mut env);
+                format!(
+                    "inline {} {}({}) {{\n    {}\n}}\n",
+                    helper.return_type.msl_type(),
+                    helper.name,
+                    params_str.join(", "),
+                    body_str
+                )
             }
-        }
-        let _ = writeln!(out, "\n) {{");
-        let _ = writeln!(
-            out,
-            "    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;"
-        );
-        let _ = writeln!(
-            out,
-            "    if (row >= __row_count) {{\n        return;\n    }}"
-        );
-
-        if let Some(mask_idx) = self.predication_mask_binding {
-            if let Some(mask_b) = self.binding(mask_idx) {
-                let _ = writeln!(
-                    out,
-                    "    if ((({}[row >> 6u] >> (row & 63u)) & 1ULL) == 0ULL) {{\n        return;\n    }}",
-                    mask_b.name
-                );
-            }
-        }
-
-        for stmt in &self.body {
-            self.emit_cuda_stmt(&mut out, stmt, 1);
-        }
-        let _ = writeln!(out, "}}");
-        out
-    }
-
-    fn emit_cuda_stmt(&self, out: &mut String, stmt: &IrStmt, indent: usize) {
-        let pad = "    ".repeat(indent);
-        match stmt {
-            IrStmt::Let {
-                name,
-                scalar,
-                value,
-            } => {
-                let expr_s = self.emit_cuda_expr(value);
-                let _ = writeln!(out, "{pad}const {} {name} = {expr_s};", scalar.cuda_type());
-            }
-            IrStmt::RowStore {
-                binding,
-                elem_offset,
-                value,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let expr_s = self.emit_cuda_expr(value);
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        let _ = writeln!(out, "{pad}{}[row] = {expr_s};", b.name);
-                    } else {
-                        let _ = writeln!(
-                            out,
-                            "{pad}{}[row * {}u + {}u] = {expr_s};",
-                            b.name, b.stride_elems, elem_offset
-                        );
-                    }
-                }
-            }
-            IrStmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                let c_s = self.emit_cuda_expr(cond);
-                let _ = writeln!(out, "{pad}if ({c_s}) {{");
-                for s in then_body {
-                    self.emit_cuda_stmt(out, s, indent + 1);
-                }
-                if !else_body.is_empty() {
-                    let _ = writeln!(out, "{pad}}} else {{");
-                    for s in else_body {
-                        self.emit_cuda_stmt(out, s, indent + 1);
-                    }
-                }
-                let _ = writeln!(out, "{pad}}}");
-            }
-            IrStmt::AtomicReduce {
-                op,
-                dst_binding,
-                dst_index,
-                value,
-                ..
-            } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let idx_s = self.emit_cuda_expr(dst_index);
-                    let val_s = self.emit_cuda_expr(value);
-                    let fn_name = match op {
-                        AtomicOp::Add => "atomicAdd",
-                        AtomicOp::Min => "atomicMin",
-                        AtomicOp::Max => "atomicMax",
-                    };
-                    let _ = writeln!(out, "{pad}{fn_name}(&{}[{idx_s}], {val_s});", b.name);
-                }
-            }
-            IrStmt::ThreadgroupReduceSum {
-                dst_binding, value, ..
-            } => {
-                if let Some(b) = self.binding(*dst_binding) {
-                    let val_s = self.emit_cuda_expr(value);
-                    let _ = writeln!(out, "{pad}atomicAdd(&{}[0], {val_s});", b.name);
-                }
+            IrBackendTarget::Wgsl => {
+                let mut prelude = String::new();
+                let params_str: Vec<String> = helper
+                    .params
+                    .iter()
+                    .map(|&(name, is_mut, kind)| {
+                        if is_mut {
+                            prelude.push_str(&format!(
+                                "var {name}: {} = __sumeru_arg_{name}; ",
+                                kind.wgsl_type()
+                            ));
+                            format!("__sumeru_arg_{name}: {}", kind.wgsl_type())
+                        } else {
+                            format!("{name}: {}", kind.wgsl_type())
+                        }
+                    })
+                    .collect();
+                let body_str = self.emit_block(&helper.body, &mut env);
+                format!(
+                    "fn {}({}) -> {} {{\n    {}{}\n}}\n",
+                    helper.name,
+                    params_str.join(", "),
+                    helper.return_type.wgsl_type(),
+                    prelude,
+                    body_str
+                )
             }
         }
     }
+}
 
-    fn emit_cuda_expr(&self, expr: &IrExpr) -> String {
-        match expr {
-            IrExpr::ConstF64(v, kind) => {
-                if *kind == GpuScalarKind::F64 {
-                    format!("{v:.12}")
-                } else {
-                    format!("{v:.6}f")
+/// 递归按后序（被调用者在前，调用者在后）收集 `GpuBlock` 中引用的全部 `#[gpu]` 纯计算辅助函数。
+fn collect_helpers_topological(
+    block: &GpuBlock,
+    out: &mut Vec<&'static GpuHelperFnDescriptor>,
+) {
+    for stmt in &block.stmts {
+        collect_helpers_in_stmt(stmt, out);
+    }
+}
+
+fn collect_helpers_in_stmt(stmt: &GpuStmt, out: &mut Vec<&'static GpuHelperFnDescriptor>) {
+    match stmt {
+        GpuStmt::Let { init, .. } => collect_helpers_in_expr(init, out),
+        GpuStmt::Assign { target, value, .. } => {
+            collect_helpers_in_lvalue(target, out);
+            collect_helpers_in_expr(value, out);
+        }
+        GpuStmt::If {
+            cond,
+            then_block,
+            else_branch,
+        } => {
+            collect_helpers_in_expr(cond, out);
+            collect_helpers_topological(then_block, out);
+            if let Some(eb) = else_branch {
+                match eb {
+                    GpuElseBranch::ElseIf(s) => collect_helpers_in_stmt(s, out),
+                    GpuElseBranch::ElseBlock(b) => collect_helpers_topological(b, out),
                 }
             }
-            IrExpr::ConstI64(v, _) => format!("{v}"),
-            IrExpr::ConstU64(v, _) => format!("{v}u"),
-            IrExpr::ConstBool(v) => format!("{v}"),
-            IrExpr::RowIndex => "row".to_string(),
-            IrExpr::Var(name) => name.clone(),
-            IrExpr::RowLoad {
-                binding,
-                elem_offset,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    if b.stride_elems == 1 && *elem_offset == 0 {
-                        format!("{}[row]", b.name)
-                    } else {
-                        format!("{}[row * {}u + {}u]", b.name, b.stride_elems, elem_offset)
-                    }
-                } else {
-                    "0".to_string()
+        }
+        GpuStmt::While { cond, body } => {
+            collect_helpers_in_expr(cond, out);
+            collect_helpers_topological(body, out);
+        }
+        GpuStmt::ForRange {
+            start, end, body, ..
+        } => {
+            collect_helpers_in_expr(start, out);
+            collect_helpers_in_expr(end, out);
+            collect_helpers_topological(body, out);
+        }
+        GpuStmt::Block(b) => collect_helpers_topological(b, out),
+        GpuStmt::Return(Some(e)) => collect_helpers_in_expr(e, out),
+        GpuStmt::Return(None) | GpuStmt::Break | GpuStmt::Continue => {}
+    }
+}
+
+fn collect_helpers_in_lvalue(lv: &GpuLValue, out: &mut Vec<&'static GpuHelperFnDescriptor>) {
+    match lv {
+        GpuLValue::Var(_) => {}
+        GpuLValue::Field { base, .. } => collect_helpers_in_lvalue(base, out),
+        GpuLValue::Index { base, index } => {
+            collect_helpers_in_lvalue(base, out);
+            collect_helpers_in_expr(index, out);
+        }
+    }
+}
+
+fn collect_helpers_in_expr(expr: &GpuExpr, out: &mut Vec<&'static GpuHelperFnDescriptor>) {
+    match expr {
+        GpuExpr::Var(_) | GpuExpr::Lit(_) => {}
+        GpuExpr::Field { base, .. }
+        | GpuExpr::Unary { expr: base, .. }
+        | GpuExpr::Paren(base)
+        | GpuExpr::Cast { expr: base, .. } => collect_helpers_in_expr(base, out),
+        GpuExpr::Index { base, index } => {
+            collect_helpers_in_expr(base, out);
+            collect_helpers_in_expr(index, out);
+        }
+        GpuExpr::Binary { lhs, rhs, .. } => {
+            collect_helpers_in_expr(lhs, out);
+            collect_helpers_in_expr(rhs, out);
+        }
+        GpuExpr::MathCall { receiver, args, .. } => {
+            collect_helpers_in_expr(receiver, out);
+            for a in args {
+                collect_helpers_in_expr(a, out);
+            }
+        }
+        GpuExpr::HelperCall { helper, args } => {
+            for a in args {
+                collect_helpers_in_expr(a, out);
+            }
+            if !out.iter().any(|h| std::ptr::eq(*h, *helper)) {
+                collect_helpers_topological(&helper.body, out);
+                if !out.iter().any(|h| h.name == helper.name) {
+                    out.push(helper);
                 }
-            }
-            IrExpr::PairTargetRow { lut_binding } => {
-                if let Some(b) = self.binding(*lut_binding) {
-                    format!("{}[row]", b.name)
-                } else {
-                    "0xFFFFFFFFu".to_string()
-                }
-            }
-            IrExpr::GatherLoad {
-                binding,
-                target_row,
-                elem_offset,
-                fallback,
-                ..
-            } => {
-                if let Some(b) = self.binding(*binding) {
-                    let trow = self.emit_cuda_expr(target_row);
-                    let fb = self.emit_cuda_expr(fallback);
-                    let idx_expr = if b.stride_elems == 1 && *elem_offset == 0 {
-                        trow.clone()
-                    } else {
-                        format!("({trow} * {}u + {}u)", b.stride_elems, elem_offset)
-                    };
-                    format!(
-                        "(({trow} < __target_row_count) ? {}[{idx_expr}] : ({fb}))",
-                        b.name
-                    )
-                } else {
-                    self.emit_cuda_expr(fallback)
-                }
-            }
-            IrExpr::Unary { op, expr } => {
-                let inner = self.emit_cuda_expr(expr);
-                match op {
-                    UnaryOp::Neg => format!("(-{inner})"),
-                    UnaryOp::Abs => format!("fabs({inner})"),
-                    UnaryOp::Sqrt => format!("sqrt({inner})"),
-                    UnaryOp::Rsqrt => format!("rsqrt({inner})"),
-                    UnaryOp::Sin => format!("sin({inner})"),
-                    UnaryOp::Cos => format!("cos({inner})"),
-                    UnaryOp::Exp => format!("exp({inner})"),
-                }
-            }
-            IrExpr::Binary { op, lhs, rhs } => {
-                let l = self.emit_cuda_expr(lhs);
-                let r = self.emit_cuda_expr(rhs);
-                match op {
-                    BinaryOp::Add => format!("({l} + {r})"),
-                    BinaryOp::Sub => format!("({l} - {r})"),
-                    BinaryOp::Mul => format!("({l} * {r})"),
-                    BinaryOp::Div => format!("({l} / {r})"),
-                    BinaryOp::Min => format!("fmin({l}, {r})"),
-                    BinaryOp::Max => format!("fmax({l}, {r})"),
-                    BinaryOp::Eq => format!("({l} == {r})"),
-                    BinaryOp::Lt => format!("({l} < {r})"),
-                    BinaryOp::Le => format!("({l} <= {r})"),
-                    BinaryOp::Gt => format!("({l} > {r})"),
-                    BinaryOp::Ge => format!("({l} >= {r})"),
-                }
-            }
-            IrExpr::Fma { a, b, c } => {
-                let a_s = self.emit_cuda_expr(a);
-                let b_s = self.emit_cuda_expr(b);
-                let c_s = self.emit_cuda_expr(c);
-                format!("fma({a_s}, {b_s}, {c_s})")
-            }
-            IrExpr::Select {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                let c_s = self.emit_cuda_expr(cond);
-                let t_s = self.emit_cuda_expr(then_expr);
-                let e_s = self.emit_cuda_expr(else_expr);
-                format!("(({c_s}) ? ({t_s}) : ({e_s}))")
             }
         }
     }
+}
+
+/// 从强类型 [`GpuBlock`] IR 与组件 Schema 元数据一次性编译生成完整的 MSL 2.0 与 WGSL 内核源码。
+pub fn compile_kernel_ir_sources(
+    kernel_name: &str,
+    components: &[GpuComponentSchema],
+    msl_struct_defs: &[String],
+    wgsl_struct_defs: &[String],
+    bindings: &[GpuKernelBindingSpec],
+    ir_block: &GpuBlock,
+) -> (String, String) {
+    let mut helpers = Vec::new();
+    collect_helpers_topological(ir_block, &mut helpers);
+
+    let mut_params: Vec<&'static str> = components
+        .iter()
+        .filter(|c| c.mutable)
+        .map(|c| c.param_name)
+        .collect();
+
+    let msl_emitter = IrCodeEmitter::new(IrBackendTarget::Msl);
+    let wgsl_emitter = IrCodeEmitter::new(IrBackendTarget::Wgsl);
+
+    let mut msl_helpers = String::new();
+    let mut wgsl_helpers = String::new();
+    for h in &helpers {
+        msl_helpers.push_str(&msl_emitter.emit_helper_fn(h));
+        msl_helpers.push('\n');
+        wgsl_helpers.push_str(&wgsl_emitter.emit_helper_fn(h));
+        wgsl_helpers.push('\n');
+    }
+
+    let mut msl_env = ShaderTypeEnv::for_kernel(components, &mut_params);
+    let mut wgsl_env = ShaderTypeEnv::for_kernel(components, &mut_params);
+
+    let msl_body = msl_emitter.emit_block(ir_block, &mut msl_env);
+    let wgsl_body = wgsl_emitter.emit_block(ir_block, &mut wgsl_env);
+
+    let mut msl_source = super::kernel::build_msl_kernel_source_with_helpers(
+        kernel_name,
+        msl_struct_defs,
+        bindings,
+        &msl_helpers,
+        &msl_body,
+    );
+    let mut wgsl_source = super::kernel::build_wgsl_kernel_source_with_helpers(
+        kernel_name,
+        wgsl_struct_defs,
+        bindings,
+        &wgsl_helpers,
+        &wgsl_body,
+    );
+    let _ = (&mut msl_source, &mut wgsl_source);
+    (msl_source, wgsl_source)
 }

@@ -19,6 +19,7 @@ impl Store {
     /// 按指定实体 ID 在空组件原型（Archetype 0）中创建空实体。
     #[inline]
     pub fn spawn_with_id(&mut self, id: EntityId) -> Result<EntityId, StateError> {
+        self.check_poisoned()?;
         let next_epoch = self.next_epoch()?;
         let row = u32::try_from(self.archetypes[0].len()).map_err(|_| {
             StateError::CapacityExhausted("Archetype row capacity exceeds u32".into())
@@ -278,8 +279,7 @@ impl Store {
         let next_epoch = self.next_epoch()?;
         let arch = &mut self.archetypes[location.archetype_id as usize];
         let old = arch
-            .columns_mut()
-            .get_mut(&component_type_id)
+            .get_erased_column_mut(component_type_id)
             .expect("validated component column")
             .replace_erased_infallible(location.row_index as usize, value);
         arch.mark_column_row_epoch(component_type_id, location.row_index as usize, next_epoch);
@@ -302,8 +302,7 @@ impl Store {
         let epoch = self.epoch;
         let arch = &mut self.archetypes[location.archetype_id as usize];
         let old = arch
-            .columns_mut()
-            .get_mut(&component_type_id)
+            .get_erased_column_mut(component_type_id)
             .expect("validated component column")
             .replace_erased_infallible(location.row_index as usize, value);
         arch.mark_column_row_epoch(component_type_id, location.row_index as usize, epoch);

@@ -213,13 +213,18 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ColumnSnapshot for TypedC
     }
 
     fn restore_archived_column(&mut self, archived: &ArchivedColumnData) -> Result<(), StateError> {
+        let was_paged = self.backing.is_page_aligned();
         let vec = self.backing.as_vec_mut();
-        (self.archive_vtable.restore)(
+        let res = (self.archive_vtable.restore)(
             self.type_id,
             self.archive_vtable.schema_version,
             archived,
             vec,
-        )
+        );
+        if was_paged && res.is_ok() {
+            self.backing.promote_to_page_aligned();
+        }
+        res
     }
 
     #[inline]

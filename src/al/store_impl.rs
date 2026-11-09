@@ -459,7 +459,10 @@ impl StateSpace for Store {
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !arch.component_types_slice().contains(&cid_a)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
@@ -483,14 +486,20 @@ impl StateSpace for Store {
         let cid_a = ComponentTypeId::of::<A>();
         let cid_b = ComponentTypeId::of::<B>();
         assert_ne!(
-            cid_a, cid_b,
+            cid_a,
+            cid_b,
             "Cannot borrow the same component type A and B as both mutable and immutable"
         );
         let next_epoch = self.epoch.wrapping_add(1);
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
@@ -527,7 +536,18 @@ impl StateSpace for Store {
         let mut touched = false;
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+                || !comp_slice.contains(&cid_c)
+            {
+                continue;
+            }
+            if arch.get_column::<A>().is_none_or(|c| c.len() < len)
+                || arch.get_column::<B>().is_none_or(|c| c.len() < len)
+            {
                 continue;
             }
             let entities_ptr = arch.entities().as_ptr();
@@ -570,12 +590,16 @@ impl StateSpace for Store {
         let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !arch.component_types_slice().contains(&cid_a)
+            {
                 continue;
             }
             let ent_ptr = arch.entities().as_ptr() as usize;
             if let Some(col_a) = unsafe { flat_col_slice_mut::<A>(arch, len) } {
                 let a_ptr = col_a.as_mut_ptr() as usize;
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 let mut offset = 0;
                 while offset < len {
                     let take = (len - offset).min(subchunk);
@@ -621,7 +645,12 @@ impl StateSpace for Store {
         let mut tasks: Vec<(usize, usize, usize, usize)> = Vec::new();
         for arch in &mut self.archetypes {
             let len = arch.len();
-            if len == 0 || !F::matches_chunk(arch) {
+            let comp_slice = arch.component_types_slice();
+            if len == 0
+                || !F::matches_chunk(arch)
+                || !comp_slice.contains(&cid_a)
+                || !comp_slice.contains(&cid_b)
+            {
                 continue;
             }
             let ent_ptr = arch.entities().as_ptr() as usize;
@@ -631,6 +660,7 @@ impl StateSpace for Store {
             };
             if let Some(col_a) = unsafe { flat_col_slice_mut::<A>(arch, len) } {
                 let a_ptr = col_a.as_mut_ptr() as usize;
+                arch.mark_column_all_chunks_epoch(cid_a, next_epoch);
                 let mut offset = 0;
                 while offset < len {
                     let take = (len - offset).min(subchunk);

@@ -32,6 +32,8 @@ pub enum LayoutOptimization {
     Compact,
     /// 快速写入优先布局
     FastWrite,
+    /// 16KB 硬件页对齐零拷贝 GPU 物理布局（Apple Metal UMA / Vulkan / WebGPU）
+    PageAlignedGpu,
 }
 
 static NEXT_STORE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -225,10 +227,42 @@ impl Store {
         self.epoch
     }
 
+    /// 将所有 Archetype 列的归档编码器 (Codec) 与 16KB 页对齐布局规范化至当前 Store 的注册表与布局策略。
+    pub(crate) fn normalize_archetypes_to_registry(&mut self, stamp_epoch: Option<u64>) -> usize {
+        if self.layout_optimization == LayoutOptimization::PageAlignedGpu {
+            self.component_registry.promote_all_to_page_aligned();
+        }
+        let page_aligned_mode = self.layout_optimization == LayoutOptimization::PageAlignedGpu;
+        let mut promoted = 0usize;
+        for arch in &mut self.archetypes {
+            if let Some(epoch) = stamp_epoch {
+                arch.stamp_all_rows_epoch(epoch);
+            }
+            for (&cid, col) in arch.columns_mut().iter_mut() {
+                let mut should_promote = page_aligned_mode;
+                if let Some(reg_def) = self.component_registry.get(&cid) {
+                    col.upgrade_archive_capability_from(reg_def.prototype());
+                    if reg_def.prototype().is_page_aligned() {
+                        should_promote = true;
+                    }
+                }
+                if should_promote && !col.is_page_aligned() {
+                    col.promote_to_page_aligned();
+                    promoted += 1;
+                }
+            }
+            arch.rebuild_flat_columns();
+        }
+        promoted
+    }
+
     /// 配置列存储物理布局优化策略
     #[inline]
     pub fn with_layout_optimization(mut self, opt: LayoutOptimization) -> Self {
         self.layout_optimization = opt;
+        if opt == LayoutOptimization::PageAlignedGpu {
+            self.normalize_archetypes_to_registry(None);
+        }
         self
     }
 
@@ -238,10 +272,13 @@ impl Store {
         self.layout_optimization
     }
 
-    /// 执行物理布局整理（纯连续列模式下恒为连续，无需额外段合并，返回 0）
+    /// 执行物理布局整理（在 `PageAlignedGpu` 模式下将未对齐列提升为 16KB 页对齐，返回提升列数）
     #[inline]
     pub fn optimize_layout(&mut self) -> usize {
-        0
+        if self.layout_optimization != LayoutOptimization::PageAlignedGpu {
+            return 0;
+        }
+        self.normalize_archetypes_to_registry(None)
     }
 
     #[inline]
@@ -693,7 +730,7 @@ impl Store {
         }
         for (&cid, def) in other.component_registry.iter() {
             if let Some(existing) = self.component_registry.get(&cid) {
-                if existing.check_compatibility(def.prototype()).is_err() {
+                if existing.check_merge_compatibility(def.prototype()).is_err() {
                     return false;
                 }
             }
@@ -761,26 +798,46 @@ impl Store {
         let mut other_prototypes = Vec::new();
         for (&cid, def) in other.component_registry.iter() {
             if let Some(existing) = self.component_registry.get(&cid) {
-                existing.check_compatibility(def.prototype())?;
-                if !existing.has_archive_capability() && def.has_archive_capability() {
-                    let proto = def.create_empty_column();
+                existing.check_merge_compatibility(def.prototype())?;
+                if (!existing.has_archive_capability() && def.has_archive_capability())
+                    || (!existing.is_page_aligned() && def.is_page_aligned())
+                {
+                    let mut proto = if def.has_archive_capability() {
+                        def.create_empty_column()
+                    } else {
+                        existing.create_empty_column()
+                    };
+                    if existing.is_page_aligned()
+                        || def.is_page_aligned()
+                        || self.layout_optimization == LayoutOptimization::PageAlignedGpu
+                    {
+                        proto.promote_to_page_aligned();
+                    }
                     other_prototypes.push(proto);
                 }
             } else {
-                let proto = def.create_empty_column();
+                let mut proto = def.create_empty_column();
+                if self.layout_optimization == LayoutOptimization::PageAlignedGpu {
+                    proto.promote_to_page_aligned();
+                }
                 other_prototypes.push(proto);
             }
         }
         if !other_prototypes.is_empty() {
             self.component_registry
                 .register_prototypes(other_prototypes)?;
+            self.normalize_archetypes_to_registry(None);
         }
 
         if other.allocator.is_empty() {
             return Ok(());
         }
 
-        self.next_epoch()?;
+        let merge_epoch = self
+            .epoch
+            .max(other.epoch)
+            .checked_add(1)
+            .ok_or_else(|| StateError::CapacityExhausted("Store revision exhausted".into()))?;
         self.check_archetype_set_generation_capacity()?;
 
         if self.allocator.is_empty()
@@ -792,8 +849,9 @@ impl Store {
             self.archetypes = other.archetypes;
             self.archetype_index = other.archetype_index;
             self.last_created_archetype = None;
+            self.normalize_archetypes_to_registry(Some(merge_epoch));
             self.rebuild_component_archetypes_on_topology_reset();
-            self.bump_epoch();
+            self.epoch = merge_epoch;
             self.bump_archetype_set_generation()?;
             poison_guard.disarm();
             return Ok(());
@@ -818,7 +876,9 @@ impl Store {
                         .columns_mut()
                         .get_mut(&cid)
                         .expect("validated target column");
-                    target_col.upgrade_archive_capability_from(&*other_col);
+                    if let Some(existing_def) = self.component_registry.get(&cid) {
+                        target_col.upgrade_archive_capability_from(existing_def.prototype());
+                    }
                     if let Some(push_range) = other_col.shared_push_clone_range_raw() {
                         let (ptr, len, _writable) = other_col.access_parts();
                         target_col.reserve(len);
@@ -837,6 +897,15 @@ impl Store {
                 target_arch
                     .entities_mut()
                     .extend_from_slice(other_arch.entities());
+                let start_row = base_row as usize;
+                for row in 0..other_len {
+                    other_arch.copy_row_flags_to(row, target_arch, start_row + row);
+                }
+                target_arch.mark_all_columns_row_range_epoch(
+                    start_row..(start_row + other_len),
+                    merge_epoch,
+                );
+                target_arch.rebuild_flat_columns();
                 self.allocator.allocate_batch_with_contiguous_rows(
                     other_arch.entities(),
                     target_arch_id,
@@ -858,6 +927,9 @@ impl Store {
                 );
                 *new_arch.entities_mut() = std::mem::take(other_arch.entities_mut());
                 *new_arch.columns_mut() = std::mem::take(other_arch.columns_mut());
+                new_arch.set_flag_planes(other_arch.take_flag_planes());
+                new_arch.stamp_all_rows_epoch(merge_epoch);
+                new_arch.rebuild_flat_columns();
                 self.archetypes.push(new_arch);
                 self.register_archetype_in_component_index(new_arch_id, &comp_types);
                 self.archetype_index.insert(comp_types, new_arch_id);
@@ -865,8 +937,9 @@ impl Store {
             }
         }
 
+        self.normalize_archetypes_to_registry(None);
         self.last_created_archetype = None;
-        self.bump_epoch();
+        self.epoch = merge_epoch;
         if added_archetypes {
             self.bump_archetype_set_generation()?;
         }

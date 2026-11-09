@@ -75,11 +75,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 运行场景示例
 
-仓库在 [`examples/flecs`](examples/flecs) 下提供了 85 个完整的状态与关系建模示例：
+仓库在 [`examples/flecs`](examples/flecs) 下提供了 85 个完整的状态与关系建模示例，并在 [`examples/gpu`](examples/gpu) 下提供了 13 个 16KB 页对齐零拷贝 GPU 计算、强类型 Shader IR 与三层并行遍历示例：
 
 ```bash
+# 关系型状态建模示例套件（85 个场景）
 cargo run --example flecs
 cargo test --example flecs
+
+# 16KB 页对齐零拷贝 GPU 计算与三层并行示例套件（13 个场景）
+cargo run --example gpu --features gpu
+cargo test --example gpu --features gpu
 ```
 
 ---

@@ -23,6 +23,7 @@ pub(crate) struct NativeType {
 pub(crate) struct NativeDirectOps {
     pub(crate) col_ptr: *mut (),
     pub(crate) rows_ptr: *mut (),
+    pub(crate) chunk_ep_ptr: *mut u64,
     pub(crate) type_id: ComponentTypeId,
     pub(crate) assign_fn:
         unsafe fn(col_ptr: *mut (), rows_ptr: *mut (), value_row: usize, target_row: usize),
@@ -37,9 +38,12 @@ pub(crate) struct NativeDirectOps {
 
 impl NativeDirectOps {
     #[inline(always)]
-    pub(crate) unsafe fn assign(&self, value_row: usize, target_row: usize) {
+    pub(crate) unsafe fn assign(&self, value_row: usize, target_row: usize, commit_epoch: u64) {
         unsafe {
             (self.assign_fn)(self.col_ptr, self.rows_ptr, value_row, target_row);
+            if !self.chunk_ep_ptr.is_null() {
+                *self.chunk_ep_ptr.add(target_row >> 6) = commit_epoch;
+            }
         }
     }
 
@@ -101,7 +105,7 @@ pub(crate) trait NativeLane: std::fmt::Debug + Send + Sync + 'static {
         archetype: &mut Archetype,
     ) -> ErasedComponentValue;
     fn assign_linked(&mut self, value_row: usize, row: usize, archetype: &mut Archetype);
-    fn commit_discard(&mut self, archetypes: &mut [Archetype]);
+    fn commit_discard(&mut self, archetypes: &mut [Archetype], commit_epoch: u64);
 
     /// 预绑定：从目标 Archetype 的目标列获取可变切片裸指针，缓存到 Lane 内部。
     fn bind_linked_column(&mut self, archetype: &mut Archetype);

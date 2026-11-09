@@ -115,7 +115,8 @@ impl Store {
         if !new_definitions.is_empty() {
             self.component_registry.extend(new_definitions);
         }
-        for arch in detached {
+        for mut arch in detached {
+            arch.rebuild_flat_columns();
             let arch_id = arch.id().0;
             let comp_types = arch.component_types().clone();
             self.register_archetype_in_component_index(arch_id, &comp_types);
@@ -157,8 +158,7 @@ impl Store {
                     }
                     let arch = &mut self.archetypes[arch_id];
                     let col = arch
-                        .columns_mut()
-                        .get_mut(&current_type_id)
+                        .get_erased_column_mut(current_type_id)
                         .expect("validated component column");
                     col.discard_in_place_single_chunk(&mut in_place_plans[start..end]);
                     for p in &in_place_plans[start..end] {
@@ -180,8 +180,7 @@ impl Store {
                         in_place_values.for_each_range(replacements, |(type_id, op)| {
                             let value = op.into_value();
                             unsafe {
-                                arch.columns_mut()
-                                    .get_mut(&type_id)
+                                arch.get_erased_column_mut(type_id)
                                     .expect("validated component column")
                                     .assign_exclusive_unchecked(row, value);
                             }
@@ -221,7 +220,7 @@ impl Store {
                             }
                         }
                     } else {
-                        // 多实体段：预绑定所有涉及的 Lane 的列切片指针
+                        // 多实体段：预绑定所有涉及的 Lane 的列切片指针与块纪元指针
                         bound_lanes.clear();
                         let mut seen_lanes = [0u64; 4];
                         for i in start..end {
@@ -247,8 +246,6 @@ impl Store {
                         {
                             let arch = &mut self.archetypes[arch_id];
                             for &lane_idx in &bound_lanes {
-                                let cid = native_plans[lane_idx].metadata().type_id;
-                                arch.mark_column_all_chunks_epoch(cid, commit_epoch);
                                 native_plans[lane_idx].bind_linked_column(arch);
                             }
                         }
@@ -271,7 +268,7 @@ impl Store {
                                     unsafe {
                                         direct_lanes[reference.lane()]
                                             .as_ref().expect("lane bound for current segment")
-                                            .assign(reference.row(), row);
+                                            .assign(reference.row(), row, commit_epoch);
                                     }
                                 }
                             }
@@ -298,13 +295,7 @@ impl Store {
         // Linked targets have already executed in the entity-major loop above.
         // Run before any migration can invalidate their prepared locations.
         for lane in native_plans.iter_mut() {
-            let cid = lane.metadata().type_id;
-            for &arch_id in lane.planned_archetypes() {
-                if let Some(arch) = self.archetypes.get_mut(arch_id as usize) {
-                    arch.mark_column_all_chunks_epoch(cid, commit_epoch);
-                }
-            }
-            lane.commit_discard(&mut self.archetypes);
+            lane.commit_discard(&mut self.archetypes, commit_epoch);
         }
         // Recycle while the poison guard is still armed, including user Drop.
         drop(native_plans);
@@ -436,7 +427,7 @@ impl Store {
                     dst_arch.mark_all_columns_row_epoch(dst_row as usize, commit_epoch);
 
                     let is_last = src_row == src_arch.entities().len() - 1;
-                    src_arch.swap_remove_entity_only(src_row);
+                    src_arch.swap_remove_entity_only_at_epoch(src_row, commit_epoch);
                     if !is_last {
                         let moved = src_arch.entities()[src_row];
                         self.allocator.set_location_infallible(
@@ -468,7 +459,7 @@ impl Store {
                     }
 
                     let is_last = loc.row_index as usize == arch.entities().len() - 1;
-                    arch.swap_remove_entity_only(loc.row_index as usize);
+                    arch.swap_remove_entity_only_at_epoch(loc.row_index as usize, commit_epoch);
                     if !is_last {
                         let moved = arch.entities()[loc.row_index as usize];
                         self.allocator.set_location_infallible(moved, loc);

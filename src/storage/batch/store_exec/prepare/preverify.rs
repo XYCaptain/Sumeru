@@ -56,7 +56,10 @@ impl Store {
                     verified_cache.push((type_id, rust_id, name));
                 }
             } else {
-                let col = value.empty_column();
+                let mut col = value.empty_column();
+                if self.layout_optimization == crate::storage::store::LayoutOptimization::PageAlignedGpu {
+                    col.promote_to_page_aligned();
+                }
                 if let Err(e) = col.validate_erased_for_push(value) {
                     err = Some(e);
                 } else {
@@ -93,7 +96,12 @@ impl Store {
                         ));
                     }
                 } else {
-                    let column = lane.empty_column();
+                    let mut column = lane.empty_column();
+                    if self.layout_optimization
+                        == crate::storage::store::LayoutOptimization::PageAlignedGpu
+                    {
+                        column.promote_to_page_aligned();
+                    }
                     prototypes.insert(meta.type_id, column.empty_clone());
                     new_definitions.insert(
                         meta.type_id,

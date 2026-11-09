@@ -640,6 +640,19 @@ pub(crate) trait AnyColumn:
         0
     }
 
+    /// 检查当前列是否处于 16KB 硬件页对齐模式
+    fn is_page_aligned(&self) -> bool {
+        false
+    }
+
+    /// 将当前列提升为 16KB 硬件页对齐模式（若支持）
+    fn promote_to_page_aligned(&mut self) {}
+
+    /// 导出 16KB 硬件页对齐的 Metal 零拷贝指针与页对齐字节长度
+    fn metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        None
+    }
+
     /// 检查该列当前是否处于分段态（开源连续列恒为 false）
     fn is_segmented(&self) -> bool {
         false

@@ -15,9 +15,12 @@ pub mod planner;
 
 pub use self::bitmask::{for_each_contiguous_mask_run, mask_has_any_in_range, RowBitMask};
 pub use self::bitset::ArchetypeBitSet;
+#[cfg(not(feature = "gpu"))]
 pub use self::dirty::{
     DirtyPageRun, PageDirtyBitmap, GRACE_HOPPER_64K_PAGE_SIZE, HARDWARE_PAGE_SIZE,
 };
+#[cfg(feature = "gpu")]
+pub use self::dirty::{GRACE_HOPPER_64K_PAGE_SIZE, HARDWARE_PAGE_SIZE};
 pub use self::epochs::{AtomicChunkEpochs, ChunkEpochs, CHUNK_ROWS};
 pub use self::planner::{
     SubchunkPlanner, SubchunkRangeIter, DEFAULT_TARGET_BYTES, MAX_SUBCHUNK_ROWS, MIN_SUBCHUNK_ROWS,

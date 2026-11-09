@@ -477,7 +477,7 @@ fn test_non_migrating_row_flags_and_structural_preservation() {
     let mut iter_flagged: Vec<i32> = store
         .query::<&Pos>()
         .with_flag::<0>()
-        .into_iter()
+        .iter()
         .map(|(_id, p)| p.x)
         .collect();
     iter_flagged.sort_unstable();
@@ -506,7 +506,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     let baseline_epoch = store.epoch();
 
     // No writes after baseline_epoch -> changed_since returns 0 rows
-    let q_changed = QueryBuilder::<(EntityId, &Pos)>::new()
+    let q_changed = QueryBuilder::<&Pos>::new()
         .changed_since::<Pos>(baseline_epoch)
         .build(&store)
         .unwrap();
@@ -535,7 +535,7 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
     let visited_vel: usize = store
         .query::<&Vel>()
         .changed_since::<Vel>(baseline_epoch)
-        .into_iter()
+        .iter()
         .count();
     assert_eq!(visited_vel, 0);
 }
@@ -543,8 +543,10 @@ fn test_changed_since_chunk_epoch_dirty_tracking() {
 #[test]
 fn test_pair_target_index_and_with_pair_query() {
     let mut store = Store::new();
-    let parent_a = store.spawn_at(EntityId::from_u128(9001)).unwrap();
-    let parent_b = store.spawn_at(EntityId::from_u128(9002)).unwrap();
+    let parent_a = EntityId::from_u128(9001);
+    let parent_b = EntityId::from_u128(9002);
+    store.spawn_with_id(parent_a).unwrap();
+    store.spawn_with_id(parent_b).unwrap();
 
     for i in 0..50u128 {
         let target = if i % 5 == 0 { parent_a } else { parent_b };
@@ -563,7 +565,7 @@ fn test_pair_target_index_and_with_pair_query() {
     }
 
     // Query via persistent Query with_pair
-    let q_children_a = QueryBuilder::<(EntityId, &Pos)>::new()
+    let q_children_a = QueryBuilder::<&Pos>::new()
         .with_pair::<ChildOf>(parent_a)
         .build(&store)
         .unwrap();
@@ -582,6 +584,7 @@ fn test_pair_target_index_and_with_pair_query() {
         .query_mut::<&mut Pos>()
         .unwrap()
         .with_pair::<ChildOf>(parent_a)
+        .iter()
     {
         pos.y = 999;
     }

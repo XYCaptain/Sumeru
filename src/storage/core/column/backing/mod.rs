@@ -14,62 +14,125 @@ use crate::storage::column::any::{BorrowedArchiveRows, ErasedBlock, ErasedCompon
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::storage::core::column::page_aligned::PageAlignedBuffer;
+
+/// `ColumnBlock` 内部物理载体：兼容常规 `Vec<T>` 与 16KB 硬件页对齐 `PageAlignedBuffer<T>`。
+#[derive(Debug)]
+pub(crate) enum ColumnBlockBacking<T> {
+    Vec(Vec<T>),
+    PageAligned(PageAlignedBuffer<T>),
+}
+
 /// 连续物理列内存块，支持 `Arc<ColumnBlock<T>>` 零拷贝共享与唯一持有者原地复用。
 #[derive(Debug)]
 pub struct ColumnBlock<T> {
-    pub(crate) data: Vec<T>,
+    pub(crate) data: ColumnBlockBacking<T>,
 }
 
 impl<T> ColumnBlock<T> {
     #[inline]
     pub fn new(data: Vec<T>) -> Self {
-        Self { data }
+        Self {
+            data: ColumnBlockBacking::Vec(data),
+        }
+    }
+
+    #[inline]
+    pub fn new_page_aligned(buf: PageAlignedBuffer<T>) -> Self {
+        Self {
+            data: ColumnBlockBacking::PageAligned(buf),
+        }
+    }
+
+    #[inline]
+    pub fn is_page_aligned(&self) -> bool {
+        matches!(self.data, ColumnBlockBacking::PageAligned(_))
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        match &self.data {
+            ColumnBlockBacking::Vec(_) => 0,
+            ColumnBlockBacking::PageAligned(buf) => buf.generation(),
+        }
+    }
+
+    #[inline]
+    pub fn as_metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        match &self.data {
+            ColumnBlockBacking::Vec(_) => None,
+            ColumnBlockBacking::PageAligned(buf) => Some(buf.as_metal_raw_parts()),
+        }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.as_slice().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.as_slice().is_empty()
     }
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.data.capacity()
+        match &self.data {
+            ColumnBlockBacking::Vec(v) => v.capacity(),
+            ColumnBlockBacking::PageAligned(b) => b.capacity(),
+        }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[T] {
-        &self.data
+        match &self.data {
+            ColumnBlockBacking::Vec(v) => v.as_slice(),
+            ColumnBlockBacking::PageAligned(b) => b.as_slice(),
+        }
     }
 
     #[inline]
     pub fn into_vec(self) -> Vec<T> {
+        match self.data {
+            ColumnBlockBacking::Vec(v) => v,
+            ColumnBlockBacking::PageAligned(b) => b.into_vec(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_backing(self) -> ColumnBlockBacking<T> {
         self.data
     }
 
     #[inline]
-    pub(crate) fn get_mut_if_unique(this: &mut Arc<Self>) -> Option<&mut Vec<T>> {
+    pub(crate) fn get_mut_if_unique(this: &mut Arc<Self>) -> Option<&mut ColumnBlockBacking<T>> {
         Arc::get_mut(this).map(|block| &mut block.data)
+    }
+
+    #[inline]
+    pub(crate) fn get_slice_mut_if_unique(this: &mut Arc<Self>) -> Option<&mut [T]> {
+        Arc::get_mut(this).map(|block| match &mut block.data {
+            ColumnBlockBacking::Vec(v) => v.as_mut_slice(),
+            ColumnBlockBacking::PageAligned(b) => b.as_mut_slice(),
+        })
     }
 }
 
 impl<T: Clone> Clone for ColumnBlock<T> {
     #[inline]
     fn clone(&self) -> Self {
-        Self {
-            data: self.data.clone(),
-        }
+        let data = match &self.data {
+            ColumnBlockBacking::Vec(v) => ColumnBlockBacking::Vec(v.clone()),
+            ColumnBlockBacking::PageAligned(b) => ColumnBlockBacking::PageAligned(b.clone()),
+        };
+        Self { data }
     }
 }
 
 impl<T: PartialEq> PartialEq for ColumnBlock<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
+        self.as_slice() == other.as_slice()
     }
 }
 
@@ -80,14 +143,14 @@ impl<T> Deref for ColumnBlock<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.data
+        self.as_slice()
     }
 }
 
 impl<T> AsRef<[T]> for ColumnBlock<T> {
     #[inline]
     fn as_ref(&self) -> &[T] {
-        &self.data
+        self.as_slice()
     }
 }
 
@@ -98,17 +161,23 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
         range: Range<usize>,
     ) -> Result<(), StateError> {
         let values = self
-            .data
+            .as_slice()
             .get(range)
             .ok_or_else(|| StateError::BatchConflict("Invalid native archive range".into()))?;
         rows.push_slice(values)
     }
 
     fn clone_native_range(&self, range: Range<usize>) -> Option<Box<dyn ErasedBlock>> {
-        let source = self.data.get(range)?;
-        Some(Box::new(Self {
-            data: source.to_vec(),
-        }))
+        let source = self.as_slice().get(range)?;
+        let data = match &self.data {
+            ColumnBlockBacking::Vec(_) => ColumnBlockBacking::Vec(source.to_vec()),
+            ColumnBlockBacking::PageAligned(_) => {
+                let mut buf = PageAlignedBuffer::with_capacity(source.len());
+                buf.extend_from_slice(source);
+                ColumnBlockBacking::PageAligned(buf)
+            }
+        };
+        Some(Box::new(Self { data }))
     }
 
     fn internal_controlled_token(&self) -> Option<sealed::InternalControlledToken> {
@@ -124,16 +193,22 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
         component: ComponentTypeId,
         range: Range<usize>,
     ) -> Result<Vec<ErasedComponentValue>, StateError> {
-        if range.start > range.end || range.end > self.data.len() {
+        if range.start > range.end || range.end > self.len() {
             return Err(StateError::BatchConflict(
                 "Invalid owned block range".into(),
             ));
         }
-        Ok(self
-            .data
-            .drain(range)
-            .map(|value| ErasedComponentValue::with_component_type_id(component, value))
-            .collect())
+        match &mut self.data {
+            ColumnBlockBacking::Vec(v) => Ok(v
+                .drain(range)
+                .map(|value| ErasedComponentValue::with_component_type_id(component, value))
+                .collect()),
+            ColumnBlockBacking::PageAligned(b) => Ok(b
+                .drain(range)
+                .into_iter()
+                .map(|value| ErasedComponentValue::with_component_type_id(component, value))
+                .collect()),
+        }
     }
 
     fn clone_value(
@@ -141,7 +216,14 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
         row: usize,
         component: ComponentTypeId,
     ) -> Result<ErasedComponentValue, StateError> {
-        self.data.clone_value(row, component)
+        let value = self
+            .as_slice()
+            .get(row)
+            .ok_or_else(|| StateError::AccessDenied("Inverse block row out of bounds".into()))?;
+        Ok(ErasedComponentValue::with_component_type_id(
+            component,
+            value.clone(),
+        ))
     }
 
     fn take_value(
@@ -149,8 +231,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
         row: usize,
         component: ComponentTypeId,
     ) -> Result<ErasedComponentValue, StateError> {
-        if row < self.data.len() {
-            let val = self.data.swap_remove(row);
+        if row < self.len() {
+            let val = match &mut self.data {
+                ColumnBlockBacking::Vec(v) => v.swap_remove(row),
+                ColumnBlockBacking::PageAligned(b) => b.swap_remove(row).expect("row in bounds"),
+            };
             Ok(ErasedComponentValue::with_component_type_id(component, val))
         } else {
             Err(StateError::BatchConflict(
@@ -161,7 +246,7 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
 
     #[inline]
     fn len(&self) -> usize {
-        self.data.len()
+        ColumnBlock::len(self)
     }
 
     #[inline]
@@ -183,7 +268,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for ColumnBlo
     }
 
     fn estimated_bytes(&self) -> usize {
-        self.data.capacity() * std::mem::size_of::<T>()
+        match &self.data {
+            ColumnBlockBacking::Vec(v) => v.capacity() * std::mem::size_of::<T>(),
+            ColumnBlockBacking::PageAligned(b) => b.allocated_bytes(),
+        }
     }
 
     fn type_info(
@@ -298,10 +386,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> ErasedBlock for Vec<T> {
     }
 }
 
-/// 单块连续内存形态：独占可变向量或引用计数共享块。
+/// 单块连续内存形态：独占可变向量、16KB 页对齐独占缓冲或引用计数共享块。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectBlock<T> {
     Owned(Vec<T>),
+    PageAligned(PageAlignedBuffer<T>),
     Frozen(Arc<ColumnBlock<T>>),
 }
 
@@ -317,31 +406,117 @@ impl<T> DirectBlock<T> {
     }
 
     #[inline]
-    pub fn as_slice(&self) -> &[T] {
+    pub fn is_page_aligned(&self) -> bool {
         match self {
-            DirectBlock::Owned(vec) => vec.as_slice(),
-            DirectBlock::Frozen(block) => block.as_slice(),
+            DirectBlock::Owned(_) => false,
+            DirectBlock::PageAligned(_) => true,
+            DirectBlock::Frozen(block) => block.is_page_aligned(),
         }
     }
 
     #[inline]
-    pub fn make_owned(&mut self) -> &mut Vec<T>
+    pub fn generation(&self) -> u64 {
+        match self {
+            DirectBlock::Owned(_) => 0,
+            DirectBlock::PageAligned(buf) => buf.generation(),
+            DirectBlock::Frozen(block) => block.generation(),
+        }
+    }
+
+    #[inline]
+    pub fn as_metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        match self {
+            DirectBlock::Owned(_) => None,
+            DirectBlock::PageAligned(buf) => Some(buf.as_metal_raw_parts()),
+            DirectBlock::Frozen(block) => block.as_metal_raw_parts(),
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            DirectBlock::Owned(vec) => vec.as_slice(),
+            DirectBlock::PageAligned(buf) => buf.as_slice(),
+            DirectBlock::Frozen(block) => block.as_slice(),
+        }
+    }
+
+    /// 确保当前块处于独占可写状态（保留 `Vec` 或 `PageAligned` 原有物理形态）。
+    #[inline]
+    pub(crate) fn ensure_exclusive(&mut self)
     where
         T: Clone,
     {
         if matches!(self, DirectBlock::Frozen(_)) {
             let prev = std::mem::replace(self, DirectBlock::Owned(Vec::new()));
             if let DirectBlock::Frozen(arc) = prev {
-                let vec = Arc::try_unwrap(arc)
-                    .map(|b| b.into_vec())
-                    .unwrap_or_else(|arc| arc.as_slice().to_vec());
-                *self = DirectBlock::Owned(vec);
+                *self = match Arc::try_unwrap(arc) {
+                    Ok(block) => match block.into_backing() {
+                        ColumnBlockBacking::Vec(v) => DirectBlock::Owned(v),
+                        ColumnBlockBacking::PageAligned(b) => DirectBlock::PageAligned(b),
+                    },
+                    Err(arc) => {
+                        if arc.is_page_aligned() {
+                            let mut buf = PageAlignedBuffer::with_capacity(arc.len());
+                            buf.extend_from_slice(arc.as_slice());
+                            DirectBlock::PageAligned(buf)
+                        } else {
+                            DirectBlock::Owned(arc.as_slice().to_vec())
+                        }
+                    }
+                };
             }
+        }
+    }
+
+    /// 转换为 `Vec<T>` 独占形态并返回 `&mut Vec<T>`（供仅接收 `&mut Vec<T>` 的冷路径恢复接口使用）。
+    #[inline]
+    pub fn make_owned(&mut self) -> &mut Vec<T>
+    where
+        T: Clone,
+    {
+        if !matches!(self, DirectBlock::Owned(_)) {
+            let prev = std::mem::replace(self, DirectBlock::Owned(Vec::new()));
+            let vec = match prev {
+                DirectBlock::Owned(v) => v,
+                DirectBlock::PageAligned(b) => b.into_vec(),
+                DirectBlock::Frozen(arc) => Arc::try_unwrap(arc)
+                    .map(|b| b.into_vec())
+                    .unwrap_or_else(|arc| arc.as_slice().to_vec()),
+            };
+            *self = DirectBlock::Owned(vec);
         }
         match self {
             DirectBlock::Owned(vec) => vec,
-            DirectBlock::Frozen(_) => unreachable!(),
+            _ => unreachable!(),
         }
+    }
+
+    /// 将当前块提升为 16KB 硬件页对齐 `PageAlignedBuffer<T>` 形态。
+    pub fn promote_to_page_aligned(&mut self)
+    where
+        T: Clone,
+    {
+        if matches!(self, DirectBlock::PageAligned(_)) {
+            return;
+        }
+        let prev = std::mem::replace(self, DirectBlock::PageAligned(PageAlignedBuffer::new()));
+        let buf = match prev {
+            DirectBlock::PageAligned(b) => b,
+            DirectBlock::Owned(v) => PageAlignedBuffer::from_vec(v),
+            DirectBlock::Frozen(arc) => match Arc::try_unwrap(arc) {
+                Ok(block) => match block.into_backing() {
+                    ColumnBlockBacking::PageAligned(b) => b,
+                    ColumnBlockBacking::Vec(v) => PageAlignedBuffer::from_vec(v),
+                },
+                Err(arc) => {
+                    let mut b = PageAlignedBuffer::with_capacity(arc.len());
+                    b.extend_from_slice(arc.as_slice());
+                    b
+                }
+            },
+        };
+        *self = DirectBlock::PageAligned(buf);
     }
 
     #[inline]
@@ -353,6 +528,12 @@ impl<T> DirectBlock<T> {
                 *self = DirectBlock::Frozen(Arc::clone(&block));
                 block
             }
+            DirectBlock::PageAligned(buf) => {
+                let taken = std::mem::take(buf);
+                let block = Arc::new(ColumnBlock::new_page_aligned(taken));
+                *self = DirectBlock::Frozen(Arc::clone(&block));
+                block
+            }
             DirectBlock::Frozen(block) => Arc::clone(block),
         }
     }
@@ -360,7 +541,7 @@ impl<T> DirectBlock<T> {
     #[inline]
     pub(crate) fn is_uniquely_writable(&self) -> bool {
         match self {
-            DirectBlock::Owned(_) => true,
+            DirectBlock::Owned(_) | DirectBlock::PageAligned(_) => true,
             DirectBlock::Frozen(block) => {
                 Arc::strong_count(block) == 1 && Arc::weak_count(block) == 0
             }
@@ -376,18 +557,19 @@ impl<T> DirectBlock<T> {
             self,
             DirectBlock::Frozen(block) if Arc::strong_count(block) != 1 || Arc::weak_count(block) != 0
         ) {
-            return self.make_owned().as_mut_slice();
+            self.ensure_exclusive();
         }
         match self {
             DirectBlock::Owned(vec) => vec.as_mut_slice(),
-            DirectBlock::Frozen(block) => ColumnBlock::get_mut_if_unique(block)
-                .expect("unique Arc")
-                .as_mut_slice(),
+            DirectBlock::PageAligned(buf) => buf.as_mut_slice(),
+            DirectBlock::Frozen(block) => {
+                ColumnBlock::get_slice_mut_if_unique(block).expect("unique Arc")
+            }
         }
     }
 }
 
-/// 强类型列物理后备存储（纯连续内存版）。
+/// 强类型列物理后备存储（纯连续内存版，支持标准 Vec 与 16KB 硬件页对齐 PageAlignedBuffer）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnBacking<T> {
     Direct(DirectBlock<T>),
@@ -407,8 +589,20 @@ impl<T> ColumnBacking<T> {
     }
 
     #[inline]
+    pub fn new_page_aligned() -> Self {
+        ColumnBacking::Direct(DirectBlock::PageAligned(PageAlignedBuffer::new()))
+    }
+
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         ColumnBacking::Direct(DirectBlock::Owned(Vec::with_capacity(capacity)))
+    }
+
+    #[inline]
+    pub fn with_page_aligned_capacity(capacity: usize) -> Self {
+        ColumnBacking::Direct(DirectBlock::PageAligned(PageAlignedBuffer::with_capacity(
+            capacity,
+        )))
     }
 
     #[inline]
@@ -417,8 +611,34 @@ impl<T> ColumnBacking<T> {
     }
 
     #[inline]
+    pub fn from_page_aligned(buf: PageAlignedBuffer<T>) -> Self {
+        ColumnBacking::Direct(DirectBlock::PageAligned(buf))
+    }
+
+    #[inline]
     pub fn from_block(block: Arc<ColumnBlock<T>>) -> Self {
         ColumnBacking::Direct(DirectBlock::Frozen(block))
+    }
+
+    #[inline]
+    pub fn is_page_aligned(&self) -> bool {
+        let ColumnBacking::Direct(block) = self;
+        block.is_page_aligned()
+    }
+
+    #[inline]
+    pub fn promote_to_page_aligned(&mut self)
+    where
+        T: Clone,
+    {
+        let ColumnBacking::Direct(block) = self;
+        block.promote_to_page_aligned();
+    }
+
+    #[inline]
+    pub fn as_metal_raw_parts(&self) -> Option<(*mut u8, usize)> {
+        let ColumnBacking::Direct(block) = self;
+        block.as_metal_raw_parts()
     }
 
     #[inline]
@@ -444,7 +664,10 @@ impl<T> ColumnBacking<T> {
 
     #[inline]
     pub fn is_owned(&self) -> bool {
-        matches!(self, ColumnBacking::Direct(DirectBlock::Owned(_)))
+        matches!(
+            self,
+            ColumnBacking::Direct(DirectBlock::Owned(_) | DirectBlock::PageAligned(_))
+        )
     }
 
     #[inline]
@@ -476,7 +699,7 @@ impl<T> ColumnBacking<T> {
     pub fn as_vec(&self) -> Option<&Vec<T>> {
         match self {
             ColumnBacking::Direct(DirectBlock::Owned(vec)) => Some(vec),
-            ColumnBacking::Direct(DirectBlock::Frozen(_)) => None,
+            _ => None,
         }
     }
 
@@ -498,11 +721,13 @@ impl<T> ColumnBacking<T> {
     }
 
     #[inline]
-    pub fn ensure_contiguous(&mut self) -> &mut Vec<T>
+    pub fn ensure_contiguous(&mut self) -> &mut [T]
     where
         T: Clone,
     {
-        self.make_contiguous_owned()
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        block.as_mut_slice()
     }
 
     #[inline]
@@ -512,6 +737,37 @@ impl<T> ColumnBacking<T> {
     {
         let ColumnBacking::Direct(block) = self;
         block.as_mut_slice()
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        if other.is_empty() {
+            return;
+        }
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(v) => v.extend_from_slice(other),
+            DirectBlock::PageAligned(b) => b.extend_from_slice(other),
+            DirectBlock::Frozen(_) => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I)
+    where
+        T: Clone,
+    {
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(v) => v.extend(iter),
+            DirectBlock::PageAligned(b) => b.extend(iter),
+            DirectBlock::Frozen(_) => unreachable!(),
+        }
     }
 
     #[inline]
@@ -596,10 +852,21 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        let vec = self.make_contiguous_owned();
-        let row = vec.len();
-        vec.push(val);
-        row
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(vec) => {
+                let row = vec.len();
+                vec.push(val);
+                row
+            }
+            DirectBlock::PageAligned(buf) => {
+                let row = buf.len();
+                buf.push(val);
+                row
+            }
+            DirectBlock::Frozen(_) => unreachable!(),
+        }
     }
 
     #[inline]
@@ -607,10 +874,15 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        if row < self.len() {
-            Some(self.make_contiguous_owned().swap_remove(row))
-        } else {
-            None
+        if row >= self.len() {
+            return None;
+        }
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(vec) => Some(vec.swap_remove(row)),
+            DirectBlock::PageAligned(buf) => buf.swap_remove(row),
+            DirectBlock::Frozen(_) => unreachable!(),
         }
     }
 
@@ -630,9 +902,20 @@ impl<T> ColumnBacking<T> {
         if sorted_desc_rows.is_empty() {
             return;
         }
-        let vec = self.make_contiguous_owned();
-        for &row in sorted_desc_rows {
-            let _ = vec.swap_remove(row);
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(vec) => {
+                for &row in sorted_desc_rows {
+                    let _ = vec.swap_remove(row);
+                }
+            }
+            DirectBlock::PageAligned(buf) => {
+                for &row in sorted_desc_rows {
+                    let _ = buf.swap_remove(row);
+                }
+            }
+            DirectBlock::Frozen(_) => unreachable!(),
         }
     }
 
@@ -644,7 +927,13 @@ impl<T> ColumnBacking<T> {
         if new_len >= self.len() {
             return;
         }
-        self.make_contiguous_owned().truncate(new_len);
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(vec) => vec.truncate(new_len),
+            DirectBlock::PageAligned(buf) => buf.truncate(new_len),
+            DirectBlock::Frozen(_) => unreachable!(),
+        }
     }
 
     #[inline]
@@ -652,10 +941,22 @@ impl<T> ColumnBacking<T> {
         let ColumnBacking::Direct(block) = self;
         match block {
             DirectBlock::Owned(vec) => vec.clear(),
+            DirectBlock::PageAligned(buf) => buf.clear(),
             DirectBlock::Frozen(arc) => {
-                if let Some(vec) = ColumnBlock::get_mut_if_unique(arc) {
-                    vec.clear();
-                    *block = DirectBlock::Owned(std::mem::take(vec));
+                let is_paged = arc.is_page_aligned();
+                if let Some(backing) = ColumnBlock::get_mut_if_unique(arc) {
+                    match backing {
+                        ColumnBlockBacking::Vec(vec) => {
+                            vec.clear();
+                            *block = DirectBlock::Owned(std::mem::take(vec));
+                        }
+                        ColumnBlockBacking::PageAligned(buf) => {
+                            buf.clear();
+                            *block = DirectBlock::PageAligned(std::mem::take(buf));
+                        }
+                    }
+                } else if is_paged {
+                    *block = DirectBlock::PageAligned(PageAlignedBuffer::new());
                 } else {
                     *block = DirectBlock::Owned(Vec::new());
                 }
@@ -668,17 +969,28 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        self.make_contiguous_owned().reserve(additional);
+        let ColumnBacking::Direct(block) = self;
+        block.ensure_exclusive();
+        match block {
+            DirectBlock::Owned(vec) => vec.reserve(additional),
+            DirectBlock::PageAligned(buf) => buf.reserve(additional),
+            DirectBlock::Frozen(_) => unreachable!(),
+        }
     }
 
     #[inline]
     pub fn empty_with_origin(&self) -> Self {
-        Self::new()
+        if self.is_page_aligned() {
+            Self::new_page_aligned()
+        } else {
+            Self::new()
+        }
     }
 
     #[inline]
     pub fn physical_version(&self) -> u64 {
-        0
+        let ColumnBacking::Direct(block) = self;
+        block.generation()
     }
 
     #[inline]
@@ -691,8 +1003,13 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        let slice = self.as_mut_slice();
-        (slice.as_mut_ptr() as *mut u8, slice.len(), true)
+        if self.is_uniquely_writable() {
+            let slice = self.as_mut_slice();
+            (slice.as_mut_ptr() as *mut u8, slice.len(), true)
+        } else {
+            let slice = self.as_contiguous_slice();
+            (slice.as_ptr() as *mut u8, slice.len(), false)
+        }
     }
 
     #[inline(always)]
@@ -700,7 +1017,7 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        self.make_contiguous_owned().push(value);
+        let _ = self.push(value);
     }
 
     #[inline(always)]
@@ -708,7 +1025,7 @@ impl<T> ColumnBacking<T> {
     where
         T: Clone,
     {
-        self.make_contiguous_owned().swap_remove(row)
+        self.swap_remove(row).expect("validated row")
     }
 
     #[inline]

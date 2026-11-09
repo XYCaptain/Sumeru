@@ -20,6 +20,7 @@ pub(crate) mod sealed {
             row: usize,
             entity: EntityId,
         ) -> Result<Self::View, StateError>;
+        fn mark_row_epoch(arch: &mut Archetype, row: usize, epoch: u64);
     }
 }
 
@@ -45,9 +46,19 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned + 'static> sealed::Mod
     ) -> Result<Self::View, StateError> {
         let cid = ComponentTypeId::of::<T>();
         let col = arch.get_typed_column_mut::<T>(cid, entity)?;
+        if row >= col.len() {
+            return Err(StateError::AccessDenied(format!(
+                "Entity {entity} row {row} out of bounds in archetype"
+            )));
+        }
         col.get_mut(row).ok_or_else(|| {
             StateError::AccessDenied(format!("Entity {entity} row {row} out of bounds in archetype"))
         })
+    }
+
+    #[inline]
+    fn mark_row_epoch(arch: &mut Archetype, row: usize, epoch: u64) {
+        arch.mark_column_row_epoch(ComponentTypeId::of::<T>(), row, epoch);
     }
 }
 
@@ -102,6 +113,13 @@ macro_rules! impl_modify_target_tuple {
                     let $T: *mut crate::storage::column::TypedColumn<$T> =
                         arch.get_typed_column_mut_ptr::<$T>(ComponentTypeId::of::<$T>(), entity)?;
                 )+
+                $(
+                    if unsafe { (*$T).len() } <= row {
+                        return Err(StateError::AccessDenied(format!(
+                            "Entity {entity} row {row} out of bounds in archetype"
+                        )));
+                    }
+                )+
                 // # Safety Invariants
                 // 1. 列类型反别名：`validate_disjoint` 确保元组内任意两个分量的 `ComponentTypeId` 绝对互斥；
                 // 2. 列指针非空有效：`get_typed_column_mut_ptr` 确保原型包含该列，且类型下转型完全匹配强类型容器；
@@ -119,6 +137,13 @@ macro_rules! impl_modify_target_tuple {
                     };
                 )+
                 Ok(($($T,)+))
+            }
+
+            #[inline]
+            fn mark_row_epoch(arch: &mut Archetype, row: usize, epoch: u64) {
+                $(
+                    arch.mark_column_row_epoch(ComponentTypeId::of::<$T>(), row, epoch);
+                )+
             }
         }
 

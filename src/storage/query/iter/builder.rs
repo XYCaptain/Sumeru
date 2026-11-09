@@ -212,6 +212,442 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
     pub fn chunks(self) -> QueryMutChunksIter<'a, Q, F> {
         self.chunks_mut()
     }
+
+    /// **① CPU 单线程顺序遍历（闭包）**：对所有匹配实体逐行执行闭包，完整支持 `|(pos, vel)| { pos.x += vel.vx; }` 自动类型推断。
+    ///
+    /// 若需直接传入 `#[gpu]` 算子函数，请使用 [`Self::run`]（如 `.run(integrate_sim_motion)`）或在闭包内调用。
+    #[inline]
+    pub fn for_each<Op>(self, mut op: Op)
+    where
+        Q::Item: super::QueryRowItem,
+        Op: FnMut(<Q::Item as super::QueryRowItem>::Comps),
+    {
+        use super::QueryRowItem;
+        for item in self.iter_mut() {
+            op(item.into_comps());
+        }
+    }
+
+    /// **① CPU 单线程顺序遍历（带 `EntityId`）**：对所有匹配实体逐行执行 `|(entity, comps)| { ... }` 闭包。
+    #[inline]
+    pub fn for_each_with_entity<Op: FnMut(Q::Item)>(self, mut op: Op) {
+        for item in self.iter_mut() {
+            op(item);
+        }
+    }
+
+    /// **① CPU 单线程算子直传执行**：直接传入 `#[gpu]` 算子或实现 [`super::QueryForEachOp`] 的算子逐行执行。
+    #[inline]
+    pub fn run<M, Op: super::QueryForEachOp<Q::Item, M>>(self, mut op: Op) {
+        for item in self.iter_mut() {
+            op.call_row(item);
+        }
+    }
+
+    /// 进入 **② CPU 多核并行 (Rayon)** 执行模式，通过 `.par().for_each(...)` 或 `.par().run(op)` 并行处理匹配实体。
+    #[inline]
+    pub fn par(self) -> QueryParMutRunner<'a, Q, F> {
+        QueryParMutRunner { builder: self }
+    }
+
+    /// **② CPU 多核并行遍历（闭包）**：在多核线程池上并行执行闭包（`self.par().for_each(op)` 的简写），完整支持闭包参数类型自动推断。
+    #[inline]
+    pub fn par_for_each<Op>(self, op: Op)
+    where
+        Q::Item: Send + super::QueryRowItem,
+        Op: Fn(<Q::Item as super::QueryRowItem>::Comps) + Send + Sync,
+    {
+        self.par().for_each(op);
+    }
+
+    /// **② CPU 多核并行算子直传执行**：在多核线程池上并行执行 `#[gpu]` 算子（`self.par().run(op)` 的简写）。
+    #[inline]
+    pub fn par_run<M, Op: super::QueryParForEachOp<Q::Item, M>>(self, op: Op)
+    where
+        Q::Item: Send,
+    {
+        self.par().run(op);
+    }
+
+    /// 进入 **③ GPU 硬件并行** 执行模式，通过 `.gpu().for_each(kernel)?` 将 16KB 页对齐列零拷贝派发至 GPU。
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu(self) -> QueryGpuRunner<'a, Q, F> {
+        QueryGpuRunner { builder: self }
+    }
+}
+
+/// CPU 多核并行查询执行器（由 [`QueryMutBuilder::par`] 创建，采用 1024 行 Morsel-Driven 连续列块并行，零行级堆分配）。
+#[must_use = "a parallel query runner does no work until .for_each(...) or .run(...) is called"]
+pub struct QueryParMutRunner<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
+    builder: QueryMutBuilder<'a, Q, F>,
+}
+
+const PAR_MORSEL_ROWS: usize = 1024;
+
+struct ParMutTableSegment<'a> {
+    entities: &'a [EntityId],
+    columns: smallvec::SmallVec<[(ComponentTypeId, ColumnDescriptor); 4]>,
+    mask: Option<crate::storage::archetype::RowBitMask>,
+    seg_range: Range<usize>,
+}
+
+impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryParMutRunner<'a, Q, F> {
+    fn for_each_item_par<V>(self, visit: V)
+    where
+        Q::Item: Send,
+        V: Fn(Q::Item) + Send + Sync,
+    {
+        use rayon::prelude::*;
+        Q::validate_query();
+        let mut segments = Vec::new();
+
+        for archetype in self.builder.archetypes.iter_mut() {
+            let arch_len = archetype.len();
+            if arch_len == 0
+                || !self.builder.filter.matches_archetype(archetype)
+                || !archetype_matches_query_mut::<Q>(archetype)
+            {
+                continue;
+            }
+            let mask = if F::IS_ROW_FILTERED {
+                let m = self.builder.filter.collect_matched_row_mask(archetype);
+                if m.as_ref().is_some_and(|b| b.is_all_zero()) {
+                    continue;
+                }
+                m
+            } else {
+                None
+            };
+            Q::mark_written_columns(archetype, mask.as_ref(), self.builder.write_epoch);
+            let Some(mut table) = MutableTable::new::<Q>(archetype) else {
+                continue;
+            };
+            while let Some(seg_range) = table.next_range() {
+                segments.push(ParMutTableSegment {
+                    entities: table.entities,
+                    columns: table.columns.clone(),
+                    mask: mask.clone(),
+                    seg_range,
+                });
+            }
+        }
+
+        segments.par_iter().for_each(|seg| {
+            let seg_len = seg.seg_range.len();
+            let num_morsels = (seg_len + PAR_MORSEL_ROWS - 1) / PAR_MORSEL_ROWS;
+            (0..num_morsels).into_par_iter().for_each(|morsel_idx| {
+                let start = seg.seg_range.start + morsel_idx * PAR_MORSEL_ROWS;
+                let end = (start + PAR_MORSEL_ROWS).min(seg.seg_range.end);
+                if start >= end {
+                    return;
+                }
+                if let Some(mask) = &seg.mask {
+                    let first_word = start >> 6;
+                    let last_word = (end - 1) >> 6;
+                    if (first_word..=last_word)
+                        .all(|w| mask.words().get(w).copied().unwrap_or(0) == 0)
+                    {
+                        return;
+                    }
+                    let Some(mut state) = Q::prepare(&seg.columns, start..end) else {
+                        return;
+                    };
+                    let mut cur = start;
+                    while cur < end {
+                        let w_idx = cur >> 6;
+                        let bit_idx = cur & 63;
+                        let word = mask.words().get(w_idx).copied().unwrap_or(0) >> bit_idx;
+                        if word == 0 {
+                            let next_cur = ((w_idx + 1) << 6).min(end);
+                            let skip = next_cur - cur;
+                            if skip > 0 {
+                                Q::skip_rows(&mut state, skip);
+                            }
+                            cur = next_cur;
+                            continue;
+                        }
+                        let tz = word.trailing_zeros() as usize;
+                        let target = (cur + tz).min(end);
+                        let skip = target - cur;
+                        if skip > 0 {
+                            Q::skip_rows(&mut state, skip);
+                        }
+                        if target >= end {
+                            break;
+                        }
+                        let item = Q::next(&mut state, seg.entities[target]);
+                        visit(item);
+                        cur = target + 1;
+                    }
+                } else {
+                    let Some(mut state) = Q::prepare(&seg.columns, start..end) else {
+                        return;
+                    };
+                    for &entity in &seg.entities[start..end] {
+                        let item = Q::next(&mut state, entity);
+                        visit(item);
+                    }
+                }
+            });
+        });
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行执行闭包（零行级堆分配，完整支持闭包参数类型自动推断）。
+    pub fn for_each<Op>(self, op: Op)
+    where
+        Q::Item: Send + super::QueryRowItem,
+        Op: Fn(<Q::Item as super::QueryRowItem>::Comps) + Send + Sync,
+    {
+        use super::QueryRowItem;
+        self.for_each_item_par(|item| {
+            op(item.into_comps());
+        });
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行执行 `|(entity, comps)|` 闭包。
+    pub fn for_each_with_entity<Op>(self, op: Op)
+    where
+        Q::Item: Send,
+        Op: Fn(Q::Item) + Send + Sync,
+    {
+        self.for_each_item_par(op);
+    }
+
+    /// 在 Rayon 多核线程池上按 1024 行 Morsel 连续切片并行执行 `#[gpu]` 算子。
+    pub fn run<M, Op: super::QueryParForEachOp<Q::Item, M>>(self, op: Op)
+    where
+        Q::Item: Send,
+    {
+        self.for_each_item_par(|item| {
+            op.call_row_par(item);
+        });
+    }
+}
+
+/// GPU 硬件并行查询执行器（由 [`QueryMutBuilder::gpu`] 创建）。
+#[cfg(feature = "gpu")]
+#[must_use = "a GPU query runner does no work until .for_each(...) is called"]
+pub struct QueryGpuRunner<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
+    builder: QueryMutBuilder<'a, Q, F>,
+}
+
+#[cfg(feature = "gpu")]
+impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryGpuRunner<'a, Q, F> {
+    /// 使用默认线程本地 `MetalComputeEngine` 执行 16KB 页对齐零拷贝 GPU 内核派发。
+    #[inline]
+    pub fn for_each<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        thread_local! {
+            static DEFAULT_METAL_ENGINE: std::cell::RefCell<crate::storage::gpu::MetalComputeEngine> =
+                std::cell::RefCell::new(crate::storage::gpu::MetalComputeEngine::new());
+        }
+        DEFAULT_METAL_ENGINE.with(|cell| {
+            let mut engine = cell.borrow_mut();
+            self.for_each_on(&mut engine, kernel)
+        })
+    }
+
+    /// 在指定的 [`MetalComputeEngine`] 实例上执行两阶段原子 16KB 页对齐零拷贝 GPU 内核派发。
+    ///
+    /// - **阶段 0**：校验不存在行级 CPU 谓词过滤器，并预编译/校验内核着色器管线；
+    /// - **阶段 1a**：对所有匹配 Archetype 执行纯只读列完整性与容量溢出校验（失败时零物理列变更）；
+    /// - **阶段 1b**：对匹配 Archetype 执行 16KB 页对齐提升、可变列 COW 独占分离与零拷贝描述符构造；
+    /// - **阶段 2**：全部预检通过后执行硬件/回退派发并统一标记写纪元。
+    pub fn for_each_on<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        engine: &mut crate::storage::gpu::MetalComputeEngine,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        if F::IS_ROW_FILTERED {
+            return Err(StateError::AccessDenied(
+                "GPU whole-column dispatch does not support row-level CPU predicate filters; use archetype filters (.with / .without)".into(),
+            ));
+        }
+        Q::validate_query();
+
+        let desc = kernel.descriptor();
+        engine.ensure_pipeline_compiled(desc)?;
+
+        struct PreparedArchetypeDispatch {
+            arch_idx: usize,
+            arch_id: crate::id::ArchetypeId,
+            active_rows: usize,
+            pages_16k: usize,
+            raw_bindings: Vec<(ComponentTypeId, crate::storage::gpu::MetalNoCopyBufferDescriptor)>,
+        }
+
+        // 阶段 1a：纯只读预校验（确保任意 Archetype 异常时绝不半途解冻或提升其它 Archetype 的列）
+        let mut matched_arch_indices = Vec::new();
+        for (arch_idx, archetype) in self.builder.archetypes.iter().enumerate() {
+            let active_rows = archetype.len();
+            if active_rows == 0 || !self.builder.filter.matches_archetype(archetype) {
+                continue;
+            }
+            let comp_slice = archetype.component_types_slice();
+            if !desc
+                .bindings()
+                .iter()
+                .all(|b| comp_slice.binary_search(&b.type_id).is_ok())
+            {
+                continue;
+            }
+            let arch_id = archetype.id();
+            let cols = archetype.columns();
+            for b in desc.bindings() {
+                let col = cols.get(&b.type_id).ok_or_else(|| {
+                    StateError::ComponentNotFound(format!("{}", b.type_id))
+                })?;
+                if col.len() != active_rows {
+                    return Err(StateError::AccessDenied(format!(
+                        "Column {} length {} does not match archetype {} active_rows {}",
+                        b.struct_name,
+                        col.len(),
+                        arch_id.0,
+                        active_rows
+                    )));
+                }
+                let _active_bytes = active_rows.checked_mul(b.elem_size).ok_or_else(|| {
+                    StateError::CapacityExhausted("GPU column active byte size overflow".into())
+                })?;
+            }
+            matched_arch_indices.push(arch_idx);
+        }
+
+        // 阶段 1b：16KB 页对齐提升、COW 独占分离与零拷贝描述符构造
+        let mut prepared = Vec::with_capacity(matched_arch_indices.len());
+        for arch_idx in matched_arch_indices {
+            let archetype = &mut self.builder.archetypes[arch_idx];
+            let active_rows = archetype.len();
+            let arch_id = archetype.id();
+            let mut changed_any = false;
+            for b in desc.bindings() {
+                let needs_promote = archetype
+                    .columns()
+                    .get(&b.type_id)
+                    .is_some_and(|col| !col.is_page_aligned());
+                if needs_promote || b.mutable {
+                    let col = archetype
+                        .get_erased_column_mut(b.type_id)
+                        .expect("verified in Phase 1a");
+                    if needs_promote {
+                        col.promote_to_page_aligned();
+                    }
+                    if b.mutable {
+                        col.ensure_contiguous()?;
+                    }
+                    changed_any = true;
+                }
+            }
+            if changed_any {
+                archetype.rebuild_flat_columns();
+            }
+
+            let mut raw_bindings = Vec::with_capacity(desc.bindings().len());
+            let mut arch_pages = 0usize;
+            {
+                let cols = archetype.columns();
+                for b in desc.bindings() {
+                    let col = cols.get(&b.type_id).expect("verified in Phase 1a");
+                    let (ptr, allocated_bytes) = col.metal_raw_parts().ok_or_else(|| {
+                        StateError::AccessDenied(format!(
+                            "Column {} in archetype {} is not backed by a 16KB PageAlignedBuffer",
+                            b.struct_name, arch_id.0
+                        ))
+                    })?;
+                    let generation = col.physical_version();
+                    let active_bytes = active_rows * b.elem_size;
+                    let buf_desc =
+                        crate::storage::gpu::MetalNoCopyBufferDescriptor::validate_raw(
+                            ptr,
+                            allocated_bytes,
+                            active_bytes,
+                            generation,
+                        )?;
+                    let geom = crate::storage::gpu::PageGeometry::compute(
+                        b.elem_size,
+                        active_rows,
+                        allocated_bytes,
+                    );
+                    arch_pages += geom.page_count;
+                    raw_bindings.push((b.type_id, buf_desc));
+                }
+            }
+
+            prepared.push(PreparedArchetypeDispatch {
+                arch_idx,
+                arch_id,
+                active_rows,
+                pages_16k: arch_pages,
+                raw_bindings,
+            });
+        }
+
+        // 阶段 2：统一派发并提交列写纪元
+        let mut stats = crate::storage::gpu::GpuDispatchStats {
+            execution_mode: engine.execution_mode(),
+            ..Default::default()
+        };
+        for item in prepared {
+            let (_grid, hits, misses) = unsafe {
+                engine.dispatch_archetype_raw(
+                    item.arch_id,
+                    item.active_rows,
+                    desc,
+                    &item.raw_bindings,
+                )?
+            };
+            let archetype = &mut self.builder.archetypes[item.arch_idx];
+            Q::mark_written_columns(archetype, None, self.builder.write_epoch);
+            stats.dispatched_archetypes += 1;
+            stats.total_rows += item.active_rows;
+            stats.total_pages_16k += item.pages_16k;
+            stats.buffer_cache_hits += hits;
+            stats.buffer_cache_misses += misses;
+        }
+
+        Ok(stats)
+    }
+
+    /// [`QueryGpuRunner::for_each`] 的算子直传别名。
+    #[inline]
+    pub fn run<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        self.for_each(kernel)
+    }
+
+    /// [`QueryGpuRunner::for_each_on`] 的算子直传别名。
+    #[inline]
+    pub fn run_on<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        engine: &mut crate::storage::gpu::MetalComputeEngine,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        self.for_each_on(engine, kernel)
+    }
+
+    /// [`QueryGpuRunner::for_each`] 的显式派发别名。
+    #[inline]
+    pub fn dispatch<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        self.for_each(kernel)
+    }
+
+    /// [`QueryGpuRunner::for_each_on`] 的显式派发别名。
+    #[inline]
+    pub fn dispatch_on<K: crate::storage::gpu::GpuKernel<'a, Query = Q>>(
+        self,
+        engine: &mut crate::storage::gpu::MetalComputeEngine,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError> {
+        self.for_each_on(engine, kernel)
+    }
 }
 
 impl<'a, Q: QueryMutData<'a>, F: QueryFilter> IntoIterator for QueryMutBuilder<'a, Q, F> {
@@ -221,6 +657,30 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> IntoIterator for QueryMutBuilder<'
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
+}
+
+#[inline]
+fn archetype_matches_query_mut<'a, Q: QueryMutData<'a>>(archetype: &Archetype) -> bool {
+    let arch_len = archetype.len();
+    let wanted = Q::access_descriptors();
+    let req_mask = Q::required_mask();
+    let comp_slice = archetype.component_types_slice();
+    for (idx, (cid, _, _)) in wanted.iter().enumerate() {
+        let present = comp_slice.binary_search(cid).is_ok();
+        if !present {
+            if (req_mask & (1u16 << idx)) != 0 {
+                return false;
+            }
+            continue;
+        }
+        let Some(col) = archetype.columns().get(cid) else {
+            return false;
+        };
+        if col.len() != arch_len {
+            return false;
+        }
+    }
+    true
 }
 
 /// Descriptors are captured before lending any reference, then only raw
@@ -239,11 +699,15 @@ impl<'a> MutableTable<'a> {
             archetype.split_for_query_mut();
         let mut columns = smallvec::SmallVec::with_capacity(wanted.len());
         if !may_be_segmented && flat_cols.len() == comp_slice.len() {
-            for (idx, (id, _, _)) in wanted.into_iter().enumerate() {
+            for (idx, (id, _, is_write)) in wanted.into_iter().enumerate() {
                 let is_req = (req_mask & (1u16 << idx)) != 0;
                 if let Some(pos) = comp_slice.iter().position(|&cid| cid == id) {
                     let entry = unsafe { *flat_cols.get_unchecked(pos) };
-                    let desc = ColumnDescriptor::from_column(unsafe { &mut *entry.col_ptr });
+                    let desc = if is_write {
+                        ColumnDescriptor::from_column(unsafe { &mut *entry.col_ptr })
+                    } else {
+                        ColumnDescriptor::from_column_ref(unsafe { &*entry.col_ptr })
+                    };
                     if desc.len != entities.len() {
                         return None;
                     }
@@ -264,10 +728,14 @@ impl<'a> MutableTable<'a> {
                 return None;
             }
         }
-        for (idx, (id, _, _)) in wanted.into_iter().enumerate() {
+        for (idx, (id, _, is_write)) in wanted.into_iter().enumerate() {
             let is_req = (req_mask & (1u16 << idx)) != 0;
             if let Some(col) = cols.get_mut(&id) {
-                let desc = ColumnDescriptor::from_column(&mut **col);
+                let desc = if is_write {
+                    ColumnDescriptor::from_column(&mut **col)
+                } else {
+                    ColumnDescriptor::from_column_ref(&**col)
+                };
                 if desc.len != entities.len() {
                     return None;
                 }
@@ -367,7 +835,10 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutIter<'a, Q, F
             self.filtered_mask = None;
             let archetype = self.archetypes.next()?;
             let arch_len = archetype.len();
-            if arch_len != 0 && self.filter.matches_archetype(archetype) {
+            if arch_len != 0
+                && self.filter.matches_archetype(archetype)
+                && archetype_matches_query_mut::<Q>(archetype)
+            {
                 if F::IS_ROW_FILTERED {
                     let mask = self.filter.collect_matched_row_mask(archetype);
                     if mask.as_ref().is_some_and(|m| m.is_all_zero()) {
@@ -436,7 +907,16 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutChunksIter<'a
             }
             self.current = None;
             let archetype = self.archetypes.next()?;
-            if !archetype.is_empty() && self.filter.matches_archetype(archetype) {
+            if !archetype.is_empty()
+                && self.filter.matches_archetype(archetype)
+                && archetype_matches_query_mut::<Q>(archetype)
+            {
+                if F::IS_ROW_FILTERED {
+                    let m = self.filter.collect_matched_row_mask(archetype);
+                    if m.as_ref().is_some_and(|b| b.is_all_zero()) {
+                        continue;
+                    }
+                }
                 Q::mark_written_columns(archetype, None, self.write_epoch);
                 if !archetype.may_be_segmented_or_unaligned()
                     && archetype.flat_columns().len() == archetype.component_types_slice().len()
