@@ -169,7 +169,7 @@ impl PairTargetGpuLut {
 }
 
 /// 表内行级位图动态过滤器闭包
-type ArchetypeRowMaskFilter = Box<dyn Fn(&Archetype, &mut RowBitMask) -> bool>;
+type ArchetypeRowMaskFilter = Box<dyn Fn(&Archetype, &mut RowBitMask) -> bool + Send + Sync>;
 
 /// 单张原型表在一次 `GpuComputePass` 中的调度遥测与脏页增量清单
 #[derive(Debug, Clone)]
@@ -300,10 +300,7 @@ impl GpuComputePass {
         let cid = ComponentTypeId::of::<T>();
         self.required_components.push(cid);
         self.custom_mask_filters.push(Box::new(move |arch, mask| {
-            let Some((epochs, def_ep)) = arch.column_chunk_epochs(cid) else {
-                mask.words_mut().fill(0);
-                return false;
-            };
+            let (epochs, def_ep) = arch.effective_gpu_chunk_epochs(cid);
             let mut any_active = false;
             for (w_idx, word) in mask.words_mut().iter_mut().enumerate() {
                 if *word == 0 {
@@ -381,6 +378,7 @@ impl GpuComputePass {
         Src: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
         K: FnMut(usize, &mut Dst, &Src),
     {
+        store.check_poisoned()?;
         let dst_cid = ComponentTypeId::of::<Dst>();
         let src_cid = ComponentTypeId::of::<Src>();
         if dst_cid == src_cid {
@@ -418,16 +416,12 @@ impl GpuComputePass {
             let indirect_dispatch =
                 IndirectDispatchArgs::from_active_mask(&mask, self.workgroup_size);
 
-            // 获取只读源列拷贝切片与可变目标列（或通过指针分离同时访问不同列）
-            let src_snapshot: Vec<Src> = arch
-                .get_column::<Src>()
-                .map(|c| c.as_slice().to_vec())
-                .unwrap_or_default();
-
-            if let Some(dst_col) = arch.get_column_mut::<Dst>() {
+            // 直接通过零拷贝无借用冲突双列获取切片执行核函数
+            if let Some((src_col, dst_col)) = arch.get_two_columns_ro_mut::<Src, Dst>() {
+                let src_slice = src_col.as_slice();
                 let dst_slice = dst_col.as_mut_slice();
                 mask.for_each_set_row(|row| {
-                    if let (Some(d), Some(s)) = (dst_slice.get_mut(row), src_snapshot.get(row)) {
+                    if let (Some(d), Some(s)) = (dst_slice.get_mut(row), src_slice.get(row)) {
                         kernel(row, d, s);
                     }
                 });
@@ -436,12 +430,10 @@ impl GpuComputePass {
             // 仅推进掩码非零的 64 行物理块纪元
             arch.mark_column_masked_chunks_epoch(dst_cid, &mask, new_epoch);
 
-            // 计算该列在本次 Pass 后折叠出的硬件脏页段
-            let (epochs, def_ep) = arch
-                .column_chunk_epochs(dst_cid)
-                .unwrap_or((&[], new_epoch));
+            // 计算该列在本次 Pass 后折叠出的硬件脏页段（包含 swap_remove 物理搬迁页）
+            let (epochs, def_ep) = arch.effective_gpu_chunk_epochs(dst_cid);
             let dirty_bitmap = PageDirtyBitmap::from_phys_chunk_epochs_with_page_size(
-                epochs,
+                &epochs,
                 def_ep,
                 prev_epoch,
                 row_len,
@@ -565,11 +557,9 @@ impl GpuComputePass {
 
             arch.mark_column_masked_chunks_epoch(dst_cid, &mask, new_epoch);
 
-            let (epochs, def_ep) = arch
-                .column_chunk_epochs(dst_cid)
-                .unwrap_or((&[], new_epoch));
+            let (epochs, def_ep) = arch.effective_gpu_chunk_epochs(dst_cid);
             let dirty_bitmap = PageDirtyBitmap::from_phys_chunk_epochs_with_page_size(
-                epochs,
+                &epochs,
                 def_ep,
                 prev_epoch,
                 row_len,
@@ -693,11 +683,9 @@ impl GpuComputePass {
         for (t_arch_id, t_mask) in touched_masks {
             if let Some(t_arch) = store.archetypes.get_mut(t_arch_id as usize) {
                 t_arch.mark_column_masked_chunks_epoch(target_cid, &t_mask, new_epoch);
-                let (epochs, def_ep) = t_arch
-                    .column_chunk_epochs(target_cid)
-                    .unwrap_or((&[], new_epoch));
+                let (epochs, def_ep) = t_arch.effective_gpu_chunk_epochs(target_cid);
                 let dirty_bitmap = PageDirtyBitmap::from_phys_chunk_epochs_with_page_size(
-                    epochs,
+                    &epochs,
                     def_ep,
                     prev_epoch,
                     t_arch.len(),

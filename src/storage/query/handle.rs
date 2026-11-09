@@ -629,35 +629,19 @@ impl Store {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
-    /// 检测当前查询计划与另一查询计划是否存在组件级读写冲突（Read-Write 或 Write-Write）。
-    ///
-    /// 基于预归并的有序访问描述符列表 `(ComponentTypeId, &'static str, is_write)`（包含查询形状与过滤器读取依赖）
-    /// 执行双指针线性归并扫描，供上层多系统 DAG 并行调度器判定能否在同一并行阶段并发执行。
+    /// 返回当前查询基于查询形状 `Q` 与过滤器 `F` 完整推导出的调度器访问描述符（包含读写集、原型互斥过滤与行级标志依赖）。
+    #[inline]
+    pub fn access_descriptor(&self) -> crate::schedule::AccessDescriptor {
+        crate::schedule::system::deduce_access::<Q, F>(&self.filter)
+    }
+
+    /// 检测当前查询计划与另一查询计划是否存在组件级或标志位读写冲突（自动考虑 `With<T>`/`Without<T>` 原型不相交剪枝）。
     #[inline]
     pub fn conflicts_with<Q2: QueryMutShape, F2: QueryFilter + Clone>(
         &self,
         other: &Query<Q2, F2>,
     ) -> bool {
-        let a = self.descriptors();
-        let b = other.descriptors();
-        let mut i = 0;
-        let mut j = 0;
-        while i < a.len() && j < b.len() {
-            let (cid_a, _, write_a) = a[i];
-            let (cid_b, _, write_b) = b[j];
-            if cid_a == cid_b {
-                if write_a || write_b {
-                    return true;
-                }
-                i += 1;
-                j += 1;
-            } else if cid_a < cid_b {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-        false
+        self.access_descriptor().conflicts_with(&other.access_descriptor())
     }
 
     /// 判定当前查询计划与另一查询计划是否兼容（可无冲突并发执行）。

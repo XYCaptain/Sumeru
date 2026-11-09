@@ -28,10 +28,10 @@ unsafe impl Sync for FlatColumnEntry {}
 /// 行级位图掩码（每 64 行 1 个 `u64` 字），用于查询过滤的 SIMD/字级位与交集与 `trailing_zeros` 跳跃迭代
 pub use crate::storage::primitives::RowBitMask;
 
-/// 关系对目标实体的表内二级倒排位图缓存（按 `columns_version` 自动惰性同步）
+/// 关系对目标实体的表内二级倒排位图缓存（按 `row_layout_version` 与 `column_write_versions` 自动惰性同步）
 #[derive(Default)]
 pub(crate) struct PairTargetIndexCache {
-    pub by_relation: BTreeMap<ComponentTypeId, (u64, BTreeMap<EntityId, RowBitMask>)>,
+    pub by_relation: BTreeMap<ComponentTypeId, (u64, u64, BTreeMap<EntityId, RowBitMask>)>,
 }
 
 /// Archetype 结构体，持有具有相同组件集合的所有实体及其列数据
@@ -49,6 +49,10 @@ pub(crate) struct Archetype {
     may_be_segmented_or_unaligned: bool,
     /// 列容器结构与可变借用版本号（任何可能替换/移除/分段化或修改列数据的操作均递增）
     columns_version: u64,
+    /// 行布局版本号（仅在实体增删、swap_remove、清空等改变实体槽位索引时递增）
+    row_layout_version: u64,
+    /// 各组件列自身的写入/可变借用版本号
+    column_write_versions: BTreeMap<ComponentTypeId, u64>,
     /// 单组件插入原型转移边缓存 (ComponentTypeId, Rust TypeId -> (Target ArchetypeId, Target Column Index))
     add_edges: smallvec::SmallVec<[(ComponentTypeId, std::any::TypeId, u32, u16); 4]>,
     /// 单组件移除原型转移边缓存 (ComponentTypeId, Rust TypeId -> (Target ArchetypeId, Source Column Index))
@@ -82,6 +86,8 @@ impl Archetype {
             flat_columns: smallvec::SmallVec::new(),
             may_be_segmented_or_unaligned,
             columns_version: 1,
+            row_layout_version: 1,
+            column_write_versions: BTreeMap::new(),
             add_edges: smallvec::SmallVec::new(),
             remove_edges: smallvec::SmallVec::new(),
             flag_planes: BTreeMap::new(),
@@ -109,6 +115,8 @@ impl Archetype {
             flat_columns: smallvec::SmallVec::new(),
             may_be_segmented_or_unaligned: true,
             columns_version: 1,
+            row_layout_version: 1,
+            column_write_versions: BTreeMap::new(),
             add_edges: self.add_edges.clone(),
             remove_edges: self.remove_edges.clone(),
             flag_planes: BTreeMap::new(),
@@ -371,6 +379,7 @@ impl Archetype {
     #[inline]
     pub(crate) fn clear_rows(&mut self) {
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.row_layout_version = self.row_layout_version.wrapping_add(1);
         self.entities.clear();
         self.entity_slots.clear();
         self.flag_planes.clear();
@@ -390,6 +399,7 @@ impl Archetype {
     #[inline]
     pub(crate) fn entities_mut(&mut self) -> &mut Vec<EntityId> {
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.row_layout_version = self.row_layout_version.wrapping_add(1);
         self.entity_slots.clear();
         self.may_be_segmented_or_unaligned = true;
         &mut self.entities
@@ -421,10 +431,47 @@ impl Archetype {
         self.columns_version = self.columns_version.wrapping_add(1);
     }
 
+    #[inline]
+    pub(crate) fn row_layout_version(&self) -> u64 {
+        self.row_layout_version
+    }
+
+    #[inline]
+    pub(crate) fn column_write_version(&self, cid: ComponentTypeId) -> u64 {
+        self.column_write_versions.get(&cid).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn bump_column_write_version(&mut self, cid: ComponentTypeId) {
+        let entry = self.column_write_versions.entry(cid).or_insert(0);
+        *entry = entry.wrapping_add(1);
+    }
+
+    /// 安全借用两个不同组件列（只读与可变），供零拷贝二元算子使用
+    #[inline]
+    pub(crate) fn get_two_columns_ro_mut<
+        R: ModelComponent + Serialize + DeserializeOwned + 'static,
+        W: ModelComponent + Serialize + DeserializeOwned + 'static,
+    >(
+        &mut self,
+    ) -> Option<(&TypedColumn<R>, &mut TypedColumn<W>)> {
+        let cid_r = ComponentTypeId::of::<R>();
+        let cid_w = ComponentTypeId::of::<W>();
+        if cid_r == cid_w {
+            return None;
+        }
+        let col_r_ptr = (self.get_column::<R>()?) as *const TypedColumn<R>;
+        let col_w = self.get_column_mut::<W>()?;
+        // SAFETY: cid_r != cid_w ensures col_r and col_w refer to distinct heap allocations inside self.columns.
+        let col_r = unsafe { &*col_r_ptr };
+        Some((col_r, col_w))
+    }
+
     /// 在 `entities.push` 后同步维护非迁移位平面容量与已展开的块纪元向量
     #[inline(always)]
     fn on_push_row(&mut self, row: usize) {
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.row_layout_version = self.row_layout_version.wrapping_add(1);
         let word_idx = row >> 6;
         let bit_mask = 1u64 << (row & 63);
         if !self.flag_planes.is_empty() {
@@ -459,6 +506,7 @@ impl Archetype {
     #[inline(always)]
     fn on_swap_remove_row(&mut self, row: usize, last_row: usize, phys_epoch: u64) {
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.row_layout_version = self.row_layout_version.wrapping_add(1);
         let new_len = last_row;
         let new_words = (new_len + 63) >> 6;
         if !self.flag_planes.is_empty() {
@@ -906,11 +954,12 @@ impl Archetype {
         target: EntityId,
     ) -> Option<RowBitMask> {
         let cid = ComponentTypeId::of::<crate::al::Pair<R>>();
-        let ver = self.columns_version;
+        let row_ver = self.row_layout_version;
+        let col_ver = self.column_write_version(cid);
         let row_len = self.entities.len();
         if let Ok(guard) = self.pair_target_index.read() {
-            if let Some((cached_ver, target_map)) = guard.by_relation.get(&cid) {
-                if *cached_ver == ver {
+            if let Some((cached_row_ver, cached_col_ver, target_map)) = guard.by_relation.get(&cid) {
+                if *cached_row_ver == row_ver && *cached_col_ver == col_ver {
                     return Some(
                         target_map
                             .get(&target)
@@ -935,7 +984,7 @@ impl Archetype {
             .cloned()
             .unwrap_or_else(|| RowBitMask::new_empty(row_len));
         if let Ok(mut guard) = self.pair_target_index.write() {
-            guard.by_relation.insert(cid, (ver, target_map));
+            guard.by_relation.insert(cid, (row_ver, col_ver, target_map));
         }
         Some(result)
     }
@@ -1025,11 +1074,13 @@ impl Archetype {
             let entry = unsafe { *self.flat_columns.get_unchecked(pos) };
             if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
                 self.columns_version = self.columns_version.wrapping_add(1);
+                self.bump_column_write_version(type_id);
                 let typed_ptr = entry.col_ptr as *mut () as *mut TypedColumn<T>;
                 return Some(unsafe { &mut *typed_ptr });
             }
         }
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.bump_column_write_version(type_id);
         self.columns
             .get_mut(&type_id)
             .and_then(|c| c.as_any_mut().downcast_mut::<TypedColumn<T>>())
@@ -1050,9 +1101,11 @@ impl Archetype {
                 .position(|&id| id == type_id)?;
             let entry = unsafe { *self.flat_columns.get_unchecked(pos) };
             self.columns_version = self.columns_version.wrapping_add(1);
+            self.bump_column_write_version(type_id);
             return Some(unsafe { &mut *entry.col_ptr });
         }
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.bump_column_write_version(type_id);
         self.columns.get_mut(&type_id).map(|c| c.as_mut())
     }
 
@@ -1064,6 +1117,7 @@ impl Archetype {
         entity: EntityId,
     ) -> Result<&mut TypedColumn<T>, StateError> {
         self.columns_version = self.columns_version.wrapping_add(1);
+        self.bump_column_write_version(cid);
         if !self.may_be_segmented_or_unaligned
             && self.flat_columns.len() == self.component_types_slice.len()
         {
@@ -1329,6 +1383,8 @@ impl Clone for Archetype {
             flat_columns: smallvec::SmallVec::new(),
             may_be_segmented_or_unaligned: true,
             columns_version: 1,
+            row_layout_version: 1,
+            column_write_versions: BTreeMap::new(),
             add_edges: self.add_edges.clone(),
             remove_edges: self.remove_edges.clone(),
             flag_planes: self.flag_planes.clone(),

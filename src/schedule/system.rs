@@ -190,11 +190,13 @@ where
 /// 2. 提取 `Q` 必选组件与 `With<T>` / `Without<T>` 过滤器谓词至 `with_components` / `without_components`，
 ///    启用互不相交原型并发剪枝；
 /// 3. 提取 `WithFlag<FLAG>` / `WithoutFlag<FLAG>` 读取的行级标志位掩码至 `reads_flags`。
-fn deduce_access<Q: QueryMutShape, F: QueryFilter>(filter: &F) -> AccessDescriptor {
+pub(crate) fn deduce_access<Q: QueryMutShape, F: QueryFilter>(filter: &F) -> AccessDescriptor {
     let mut access = AccessDescriptor::new();
-    for (cid, _, _) in Q::access_descriptors() {
-        access.with_components.insert(cid);
-    }
+    Q::for_each_param_descriptor(|cid, _name, _write, required| {
+        if required {
+            access.with_components.insert(cid);
+        }
+    });
     for (cid, _, is_write) in crate::storage::query::spec::merged_access_descriptors::<Q, F>(filter) {
         if is_write {
             access.writes.insert(cid);
@@ -722,5 +724,24 @@ mod tests {
     fn test_exclusive_function_system_always_exclusive() {
         let sys = exclusive_system("spawn", |_s: &mut Store| {});
         assert!(sys.access().exclusive);
+    }
+
+    #[test]
+    fn test_optional_query_system_access_deduction() {
+        let sys = simple_par_query_system::<(&mut Pos, Option<&mut Vel>), _>(
+            "optional_movement",
+            |(_e, (p, v)), _cmds| {
+                p.x += 1.0;
+                if let Some(vel) = v {
+                    vel.dx += 1.0;
+                }
+            },
+        );
+        assert!(!sys.access().exclusive);
+        assert!(sys.access().writes.contains(&ComponentTypeId::of::<Pos>()));
+        assert!(sys.access().writes.contains(&ComponentTypeId::of::<Vel>()));
+        // Pos is required, Vel is optional -> Vel must NOT be in with_components!
+        assert!(sys.access().with_components.contains(&ComponentTypeId::of::<Pos>()));
+        assert!(!sys.access().with_components.contains(&ComponentTypeId::of::<Vel>()));
     }
 }

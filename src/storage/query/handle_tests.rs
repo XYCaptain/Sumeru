@@ -745,5 +745,110 @@ fn test_query_conflicts_with_and_al_par_chunk_epoch_tracking() {
     assert_eq!(changed_pos_count, 200);
 }
 
+#[test]
+fn test_query_optional_components_ro_and_mut() {
+    let mut store = Store::new();
+    // Entity 1: has Pos and Vel
+    store
+        .create_entity(
+            EntityId::from_u128(1),
+            EntityBundle::new()
+                .with(Pos { x: 10, y: 20 })
+                .unwrap()
+                .with(Vel { dx: 1, dy: 2 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    // Entity 2: has only Pos
+    store
+        .create_entity(
+            EntityId::from_u128(2),
+            EntityBundle::new()
+                .with(Pos { x: 100, y: 200 })
+                .unwrap(),
+        )
+        .unwrap();
+
+    // Test Read-only Query with Option<&Vel>
+    let q_ro = QueryBuilder::<(&Pos, Option<&Vel>)>::new().build(&store).unwrap();
+    let mut results = Vec::new();
+    q_ro.for_each(&store, |(e, (p, v))| {
+        results.push((e.to_u128(), p.x, v.map(|vel| vel.dx)));
+    }).unwrap();
+    results.sort_by_key(|r| r.0);
+    assert_eq!(results, vec![(1, 10, Some(1)), (2, 100, None)]);
+
+    // Test Read-only Chunk Query with Option<&Vel>
+    let mut chunk_results = Vec::new();
+    q_ro.for_each_chunk(&store, |(ents, (pos_slice, vel_slice))| {
+        for (i, &e) in ents.iter().enumerate() {
+            let dx = vel_slice.as_ref().map(|v| v[i].dx);
+            chunk_results.push((e.to_u128(), pos_slice[i].x, dx));
+        }
+    }).unwrap();
+    chunk_results.sort_by_key(|r| r.0);
+    assert_eq!(chunk_results, vec![(1, 10, Some(1)), (2, 100, None)]);
+
+    // Test Mutable Query with Option<&mut Vel>
+    let q_mut = QueryBuilder::<(&mut Pos, Option<&mut Vel>)>::new().build(&store).unwrap();
+    q_mut.for_each_mut(&mut store, |(_e, (p, v))| {
+        p.x += 5;
+        if let Some(vel) = v {
+            vel.dx += 10;
+        }
+    }).unwrap();
+
+    // Verify mutations
+    let pos1 = store.get::<Pos>(EntityId::from_u128(1)).unwrap();
+    let vel1 = store.get::<Vel>(EntityId::from_u128(1)).unwrap();
+    assert_eq!(pos1.x, 15);
+    assert_eq!(vel1.dx, 11);
+
+    let pos2 = store.get::<Pos>(EntityId::from_u128(2)).unwrap();
+    assert_eq!(pos2.x, 105);
+
+    // Test Mutable Chunk Query with Option<&mut Vel>
+    q_mut.for_each_chunk_mut(&mut store, |(_ents, (pos_slice, vel_slice))| {
+        for p in pos_slice.iter_mut() {
+            p.x += 1;
+        }
+        if let Some(vels) = vel_slice {
+            for v in vels.iter_mut() {
+                v.dx += 1;
+            }
+        }
+    }).unwrap();
+
+    let pos1_after = store.get::<Pos>(EntityId::from_u128(1)).unwrap();
+    let vel1_after = store.get::<Vel>(EntityId::from_u128(1)).unwrap();
+    assert_eq!(pos1_after.x, 16);
+    assert_eq!(vel1_after.dx, 12);
+
+    let pos2_after = store.get::<Pos>(EntityId::from_u128(2)).unwrap();
+    assert_eq!(pos2_after.x, 106);
+}
+
+#[test]
+fn test_optional_query_access_and_conflict() {
+    let store = Store::new();
+    let q_opt = QueryBuilder::<(&Pos, Option<&mut Vel>)>::new().build(&store).unwrap();
+    let q_read_vel = QueryBuilder::<&Vel>::new().build(&store).unwrap();
+    let q_write_vel = QueryBuilder::<&mut Vel>::new().build(&store).unwrap();
+    let q_read_pos = QueryBuilder::<&Pos>::new().build(&store).unwrap();
+
+    // q_opt may write Vel, so it conflicts with q_read_vel and q_write_vel
+    assert!(q_opt.conflicts_with(&q_read_vel));
+    assert!(q_opt.conflicts_with(&q_write_vel));
+    // q_opt only reads Pos, so it is compatible with q_read_pos
+    assert!(q_opt.is_compatible_with(&q_read_pos));
+
+    let desc = q_opt.access_descriptor();
+    assert!(desc.with_components.contains(&ComponentTypeId::of::<Pos>()));
+    // Vel is optional, so it must not be in with_components
+    assert!(!desc.with_components.contains(&ComponentTypeId::of::<Vel>()));
+    assert!(desc.writes.contains(&ComponentTypeId::of::<Vel>()));
+}
+
 
 

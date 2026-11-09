@@ -7,13 +7,16 @@ pub(crate) fn match_archetypes_for_query<Q: QueryMutShape, F: QueryFilter, H: Ar
     filter: &F,
 ) -> Result<Vec<ArchetypeId>, StateError> {
     Q::validate_shape()?;
-    let descriptors = Q::access_descriptors();
+    let mut param_descs = Vec::with_capacity(Q::PARAM_COUNT);
+    Q::for_each_param_descriptor(|cid, name, write, required| {
+        param_descs.push((cid, name, write, required));
+    });
     let mut matched = Vec::new();
     for arch in archetypes {
         if filter.matches_archetype(arch)
-            && descriptors
+            && param_descs
                 .iter()
-                .all(|(cid, _, _)| arch.contains_component(*cid))
+                .all(|(cid, _, _, required)| !*required || arch.contains_component(*cid))
         {
             matched.push(arch.archetype_id());
         }
@@ -47,19 +50,24 @@ pub(crate) fn append_bindings_from_slice<
     bindings: &mut Vec<crate::storage::query::handle::MatchedTableBinding>,
 ) -> Result<(), StateError> {
     Q::validate_shape()?;
-    let descriptors = Q::access_descriptors();
+    let mut param_descs = Vec::with_capacity(Q::PARAM_COUNT);
+    Q::for_each_param_descriptor(|cid, name, write, required| {
+        param_descs.push((cid, name, write, required));
+    });
     for arch in archetypes {
         if !filter.matches_archetype(arch) {
             continue;
         }
-        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(descriptors.len());
+        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(param_descs.len());
         let mut all_present = true;
-        for &(cid, _, _) in &descriptors {
+        for &(cid, _, _, required) in &param_descs {
             if let Some(idx) = arch.component_column_index(cid) {
                 flat_col_indices.push(idx);
-            } else {
+            } else if required {
                 all_present = false;
                 break;
+            } else {
+                flat_col_indices.push(u16::MAX);
             }
         }
         if all_present {
@@ -99,10 +107,15 @@ pub(crate) fn match_bindings_for_store<Q: QueryMutShape, F: QueryFilter>(
     if store.archetypes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let descriptors = Q::access_descriptors();
-    let mut reqs = Vec::with_capacity(descriptors.len() + 4);
-    for &(cid, _, _) in &descriptors {
-        reqs.push((cid, true));
+    let mut param_descs = Vec::with_capacity(Q::PARAM_COUNT);
+    Q::for_each_param_descriptor(|cid, name, write, required| {
+        param_descs.push((cid, name, write, required));
+    });
+    let mut reqs = Vec::with_capacity(param_descs.len() + 4);
+    for &(cid, _, _, required) in &param_descs {
+        if required {
+            reqs.push((cid, true));
+        }
     }
     filter.archetype_requirements(&mut reqs);
 
@@ -155,12 +168,15 @@ pub(crate) fn match_bindings_for_store<Q: QueryMutShape, F: QueryFilter>(
         if !filter.matches_archetype(arch) {
             return;
         }
-        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(descriptors.len());
-        for &(cid, _, _) in &descriptors {
-            let Some(idx) = arch.component_column_index(cid) else {
+        let mut flat_col_indices = smallvec::SmallVec::<[u16; 8]>::with_capacity(param_descs.len());
+        for &(cid, _, _, required) in &param_descs {
+            if let Some(idx) = arch.component_column_index(cid) {
+                flat_col_indices.push(idx);
+            } else if required {
                 return;
-            };
-            flat_col_indices.push(idx);
+            } else {
+                flat_col_indices.push(u16::MAX);
+            }
         }
         let archetype_id = arch.archetype_id();
         matched.push(archetype_id);
@@ -231,6 +247,10 @@ pub trait QueryMutParamShape: sealed::QueryMutParamShapeInternal + Send + 'stati
     fn component_type_id() -> ComponentTypeId;
     fn type_name() -> &'static str;
     fn is_write() -> bool;
+    #[inline]
+    fn is_required() -> bool {
+        true
+    }
     #[inline]
     fn element_size() -> usize {
         0
@@ -390,6 +410,220 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> sealed::QueryMutParamShap
     }
 }
 
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutParamShape
+    for Option<&'static mut T>
+{
+    #[inline]
+    fn component_type_id() -> ComponentTypeId {
+        ComponentTypeId::of::<T>()
+    }
+    #[inline]
+    fn type_name() -> &'static str {
+        std::any::type_name::<T>()
+    }
+    #[inline]
+    fn is_write() -> bool {
+        true
+    }
+    #[inline]
+    fn is_required() -> bool {
+        false
+    }
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned> sealed::QueryMutParamShapeInternal
+    for Option<&'static mut T>
+{
+    type Param<'a> = Option<&'a mut T>;
+    type ColumnBuffer = Option<MutColumnPtr<T>>;
+    type IterState<'a> = Option<std::slice::IterMut<'a, T>>;
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ColumnBuffer, row: usize, cursor: &mut usize) -> usize {
+        match buffer {
+            Some(buf) => buf.0.locate_with_cursor(row, cursor).2,
+            None => usize::MAX,
+        }
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer(
+        desc: &ColumnDescriptor,
+        expected_len: usize,
+    ) -> Option<Option<MutColumnPtr<T>>> {
+        if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+            return None;
+        }
+        Some(Some(MutColumnPtr(desc.clone(), PhantomData)))
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer_from_desc(
+        desc: Option<&ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<Option<MutColumnPtr<T>>> {
+        match desc {
+            None => Some(None),
+            Some(desc) => {
+                if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+                    return None;
+                }
+                Some(Some(MutColumnPtr(desc.clone(), PhantomData)))
+            }
+        }
+    }
+    #[inline]
+    unsafe fn prepare_state<'view>(
+        buffer: &Option<MutColumnPtr<T>>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> Option<std::slice::IterMut<'view, T>> {
+        buffer.as_ref().map(|buf| {
+            let (base, offset, end) = buf.0.locate_with_cursor(range.start, cursor);
+            assert!(range.end <= end);
+            let ptr = unsafe { (base as *mut T).add(offset) };
+            unsafe { std::slice::from_raw_parts_mut(ptr, range.len()).iter_mut() }
+        })
+    }
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+    ) -> <Self::Param<'view> as QueryMutParam<'view>>::Item {
+        state.as_mut().map(|iter| unsafe { iter.next().unwrap_unchecked() })
+    }
+    #[inline]
+    unsafe fn skip_items<'view>(state: &mut Self::IterState<'view>, count: usize) {
+        if let Some(iter) = state.as_mut() {
+            if count > 0 {
+                let _ = iter.nth(count - 1);
+            }
+        }
+    }
+    #[inline]
+    unsafe fn chunk_state<'view>(
+        buffer: &Option<MutColumnPtr<T>>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> Option<&'view mut [T]> {
+        buffer.as_ref().map(|buf| {
+            let (base, offset, end) = buf.0.locate_with_cursor(range.start, cursor);
+            assert!(range.end <= end);
+            let ptr = unsafe { (base as *mut T).add(offset) };
+            unsafe { std::slice::from_raw_parts_mut(ptr, range.len()) }
+        })
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Sync> QueryMutParamShape
+    for Option<&'static T>
+{
+    #[inline]
+    fn component_type_id() -> ComponentTypeId {
+        ComponentTypeId::of::<T>()
+    }
+    #[inline]
+    fn type_name() -> &'static str {
+        std::any::type_name::<T>()
+    }
+    #[inline]
+    fn is_write() -> bool {
+        false
+    }
+    #[inline]
+    fn is_required() -> bool {
+        false
+    }
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned> sealed::QueryMutParamShapeInternal
+    for Option<&'static T>
+{
+    type Param<'a> = Option<&'a T>;
+    type ColumnBuffer = Option<ConstColumnPtr<T>>;
+    type IterState<'a> = Option<std::slice::Iter<'a, T>>;
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ColumnBuffer, row: usize, cursor: &mut usize) -> usize {
+        match buffer {
+            Some(buf) => buf.0.locate_with_cursor(row, cursor).2,
+            None => usize::MAX,
+        }
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer(
+        desc: &ColumnDescriptor,
+        expected_len: usize,
+    ) -> Option<Option<ConstColumnPtr<T>>> {
+        if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+            return None;
+        }
+        Some(Some(ConstColumnPtr(desc.clone(), PhantomData)))
+    }
+    #[inline]
+    #[allow(private_interfaces)]
+    unsafe fn resolve_buffer_from_desc(
+        desc: Option<&ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<Option<ConstColumnPtr<T>>> {
+        match desc {
+            None => Some(None),
+            Some(desc) => {
+                if desc.rust_type_id != Some(std::any::TypeId::of::<T>()) || desc.len != expected_len {
+                    return None;
+                }
+                Some(Some(ConstColumnPtr(desc.clone(), PhantomData)))
+            }
+        }
+    }
+    #[inline]
+    unsafe fn prepare_state<'view>(
+        buffer: &Option<ConstColumnPtr<T>>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> Option<std::slice::Iter<'view, T>> {
+        buffer.as_ref().map(|buf| {
+            let (base, offset, end) = buf.0.locate_with_cursor(range.start, cursor);
+            assert!(range.end <= end);
+            let ptr = unsafe { (base as *const T).add(offset) };
+            unsafe { std::slice::from_raw_parts(ptr, range.len()).iter() }
+        })
+    }
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+    ) -> <Self::Param<'view> as QueryMutParam<'view>>::Item {
+        state.as_mut().map(|iter| unsafe { iter.next().unwrap_unchecked() })
+    }
+    #[inline]
+    unsafe fn skip_items<'view>(state: &mut Self::IterState<'view>, count: usize) {
+        if let Some(iter) = state.as_mut() {
+            if count > 0 {
+                let _ = iter.nth(count - 1);
+            }
+        }
+    }
+    #[inline]
+    unsafe fn chunk_state<'view>(
+        buffer: &Option<ConstColumnPtr<T>>,
+        range: Range<usize>,
+        cursor: &mut usize,
+    ) -> Option<&'view [T]> {
+        buffer.as_ref().map(|buf| {
+            let (base, offset, end) = buf.0.locate_with_cursor(range.start, cursor);
+            assert!(range.end <= end);
+            let ptr = unsafe { (base as *const T).add(offset) };
+            unsafe { std::slice::from_raw_parts(ptr, range.len()) }
+        })
+    }
+}
+
 /// Represents the static shape of a mutable query, decoupled from any specific borrow lifetime.
 #[allow(private_bounds)]
 pub trait QueryMutShape:
@@ -404,6 +638,13 @@ pub trait QueryMutShape:
 
     const PARAM_COUNT: usize;
     fn for_each_access_descriptor(f: impl FnMut(ComponentTypeId, &'static str, bool));
+
+    #[inline]
+    fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        Self::for_each_access_descriptor(|cid, name, write| {
+            f(cid, name, write, true);
+        });
+    }
 
     #[inline]
     fn access_descriptors() -> Vec<(ComponentTypeId, &'static str, bool)> {
@@ -477,8 +718,8 @@ macro_rules! tuple_query_mut_shape {
                 Some((
                     $(
                         unsafe {
-                            let desc = get_desc($P::component_type_id())?;
-                            $P::resolve_buffer(&desc, expected_len)?
+                            let desc = get_desc($P::component_type_id());
+                            $P::resolve_buffer_from_desc(desc.as_ref(), expected_len)?
                         },
                     )+
                 ))
@@ -499,6 +740,13 @@ macro_rules! tuple_query_mut_shape {
             fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
                 $(
                     f($P::component_type_id(), $P::type_name(), $P::is_write());
+                )+
+            }
+
+            #[inline]
+            fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+                $(
+                    f($P::component_type_id(), $P::type_name(), $P::is_write(), $P::is_required());
                 )+
             }
 
@@ -631,6 +879,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutShape for 
     }
 
     #[inline]
+    fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), true, true);
+    }
+
+    #[inline]
     fn validate_shape() -> Result<(), StateError> {
         Ok(())
     }
@@ -714,6 +967,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> QueryMutShape for &'stati
         f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false);
     }
 
+    #[inline]
+    fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false, true);
+    }
+
     fn validate_shape() -> Result<(), StateError> {
         Ok(())
     }
@@ -765,6 +1023,196 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> QueryMutShape for &'stati
     }
 }
 
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send>
+    sealed::QueryMutShapeInternal<Option<MutColumnPtr<T>>> for Option<&'static mut T>
+{
+    #[inline]
+    unsafe fn resolve_archetype_buffers(
+        get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<Option<MutColumnPtr<T>>> {
+        let desc = get_desc(ComponentTypeId::of::<T>());
+        unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::resolve_buffer_from_desc(
+                desc.as_ref(),
+                expected_len,
+            )
+        }
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutShape for Option<&'static mut T> {
+    type View<'view> = Option<&'view mut T>;
+    type Item<'view> = (EntityId, Option<&'view mut T>);
+    type Chunk<'view> = (&'view [EntityId], Option<&'view mut [T]>);
+    type ArchetypeBuffers = Option<MutColumnPtr<T>>;
+    type IterState<'view> = Option<std::slice::IterMut<'view, T>>;
+    type Cursor = usize;
+
+    const PARAM_COUNT: usize = 1;
+
+    #[inline]
+    fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), true);
+    }
+
+    #[inline]
+    fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), true, false);
+    }
+
+    #[inline]
+    fn validate_shape() -> Result<(), StateError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+        <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
+    }
+
+    #[inline]
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view> {
+        unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::prepare_state(buffers, range, cursor)
+        }
+    }
+
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view> {
+        (entity, unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::next_item(state)
+        })
+    }
+
+    #[inline]
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    ) {
+        unsafe { <Self as sealed::QueryMutParamShapeInternal>::skip_items(state, count) }
+    }
+
+    #[inline]
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view> {
+        (entities, unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::chunk_state(buffers, range, cursor)
+        })
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Sync>
+    sealed::QueryMutShapeInternal<Option<ConstColumnPtr<T>>> for Option<&'static T>
+{
+    #[inline]
+    unsafe fn resolve_archetype_buffers(
+        get_desc: &dyn Fn(ComponentTypeId) -> Option<ColumnDescriptor>,
+        expected_len: usize,
+    ) -> Option<Option<ConstColumnPtr<T>>> {
+        let desc = get_desc(ComponentTypeId::of::<T>());
+        unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::resolve_buffer_from_desc(
+                desc.as_ref(),
+                expected_len,
+            )
+        }
+    }
+}
+
+impl<T: ModelComponent + Serialize + DeserializeOwned + Sync> QueryMutShape for Option<&'static T> {
+    type View<'view> = Option<&'view T>;
+    type Item<'view> = (EntityId, Option<&'view T>);
+    type Chunk<'view> = (&'view [EntityId], Option<&'view [T]>);
+    type ArchetypeBuffers = Option<ConstColumnPtr<T>>;
+    type IterState<'view> = Option<std::slice::Iter<'view, T>>;
+    type Cursor = usize;
+
+    const PARAM_COUNT: usize = 1;
+
+    #[inline]
+    fn for_each_access_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false);
+    }
+
+    #[inline]
+    fn for_each_param_descriptor(mut f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        f(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false, false);
+    }
+
+    #[inline]
+    fn validate_shape() -> Result<(), StateError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
+    fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
+        <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
+    }
+
+    #[inline]
+    unsafe fn prepare_iter<'view>(
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::IterState<'view> {
+        unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::prepare_state(buffers, range, cursor)
+        }
+    }
+
+    #[inline]
+    unsafe fn next_item<'view>(
+        state: &mut Self::IterState<'view>,
+        entity: EntityId,
+    ) -> Self::Item<'view> {
+        (entity, unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::next_item(state)
+        })
+    }
+
+    #[inline]
+    unsafe fn skip_items<'view>(
+        state: &mut Self::IterState<'view>,
+        count: usize,
+    ) {
+        unsafe { <Self as sealed::QueryMutParamShapeInternal>::skip_items(state, count) }
+    }
+
+    #[inline]
+    unsafe fn chunk<'view>(
+        entities: &'view [EntityId],
+        buffers: &Self::ArchetypeBuffers,
+        range: Range<usize>,
+        cursor: &mut Self::Cursor,
+    ) -> Self::Chunk<'view> {
+        (entities, unsafe {
+            <Self as sealed::QueryMutParamShapeInternal>::chunk_state(buffers, range, cursor)
+        })
+    }
+}
+
 impl<Q: QueryMutShape> sealed::QueryMutShapeInternal<Q::ArchetypeBuffers> for (EntityId, Q) {
     #[inline]
     unsafe fn resolve_archetype_buffers(
@@ -788,6 +1236,11 @@ impl<Q: QueryMutShape> QueryMutShape for (EntityId, Q) {
     #[inline]
     fn for_each_access_descriptor(f: impl FnMut(ComponentTypeId, &'static str, bool)) {
         Q::for_each_access_descriptor(f);
+    }
+
+    #[inline]
+    fn for_each_param_descriptor(f: impl FnMut(ComponentTypeId, &'static str, bool, bool)) {
+        Q::for_each_param_descriptor(f);
     }
 
     #[inline]
@@ -1008,12 +1461,16 @@ fn resolve_archetype_buffers_mut<Q: QueryMutShape>(
     arch: &mut Archetype,
 ) -> Option<Q::ArchetypeBuffers> {
     let len = arch.len();
-    let wanted = Q::access_descriptors();
+    let mut param_descs =
+        smallvec::SmallVec::<[(ComponentTypeId, &'static str, bool, bool); 8]>::new();
+    Q::for_each_param_descriptor(|cid, name, write, required| {
+        param_descs.push((cid, name, write, required));
+    });
     let mut has_write = false;
-    for &(_, _, is_write) in &wanted {
-        if is_write {
+    for &(cid, _, is_write, _) in &param_descs {
+        if is_write && arch.contains_component(cid) {
             has_write = true;
-            break;
+            arch.bump_column_write_version(cid);
         }
     }
     if !has_write {
@@ -1022,14 +1479,30 @@ fn resolve_archetype_buffers_mut<Q: QueryMutShape>(
     // split_for_query_mut 内部已推进 columns_version += 1（用于使 PairTargetIndex 等按需缓存失效）
     let (_, _, _, _, cols) = arch.split_for_query_mut();
     let mut descs =
-        smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(wanted.len());
-    for (cid, _, is_write) in wanted {
+        smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(param_descs.len());
+    for (cid, _, is_write, required) in param_descs {
         let desc = if is_write {
-            let col = cols.get_mut(&cid)?;
-            ColumnDescriptor::from_column(&mut **col)
+            match cols.get_mut(&cid) {
+                Some(col) => ColumnDescriptor::from_column(&mut **col),
+                None => {
+                    if required {
+                        return None;
+                    } else {
+                        continue;
+                    }
+                }
+            }
         } else {
-            let col = cols.get(&cid)?;
-            ColumnDescriptor::from_column_ref(&**col)
+            match cols.get(&cid) {
+                Some(col) => ColumnDescriptor::from_column_ref(&**col),
+                None => {
+                    if required {
+                        return None;
+                    } else {
+                        continue;
+                    }
+                }
+            }
         };
         if desc.len != len {
             return None;

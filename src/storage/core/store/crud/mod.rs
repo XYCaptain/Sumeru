@@ -338,6 +338,7 @@ impl Store {
                 let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
                 let old = std::mem::replace(val_mut, component);
                 arch.bump_columns_version_in_place();
+                arch.bump_column_write_version(type_id);
                 arch.mark_col_pos_row_epoch(pos, row, next_epoch);
                 self.epoch = next_epoch;
                 poison_guard.disarm();
@@ -390,6 +391,8 @@ impl Store {
 
         let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         let old = std::mem::replace(val_mut, component);
+        arch.bump_columns_version_in_place();
+        arch.bump_column_write_version(type_id);
         arch.mark_column_row_epoch(type_id, row, next_epoch);
         self.epoch = next_epoch;
         poison_guard.disarm();
@@ -689,6 +692,7 @@ impl Store {
                                 if let Some(val_mut) = typed.get_mut(src_row) {
                                     let old = std::mem::replace(val_mut, component);
                                     src_arch.bump_columns_version_in_place();
+                                    src_arch.bump_column_write_version(type_id);
                                     src_arch.mark_col_pos_row_epoch(pos, src_row, next_epoch);
                                     self.epoch = next_epoch;
                                     return Ok((Some(old), location));
@@ -787,6 +791,8 @@ impl Store {
 
                 let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
                 let old = std::mem::replace(val_mut, component);
+                src_arch.bump_columns_version_in_place();
+                src_arch.bump_column_write_version(type_id);
                 src_arch.mark_column_row_epoch(type_id, src_row, next_epoch);
                 self.epoch = next_epoch;
                 poison_guard.disarm();
@@ -1644,7 +1650,7 @@ impl Store {
         }
     }
 
-    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表（自动利用原型表内 `PairTargetIndex` 二级位图索引）
+    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表（自动利用 `component_archetypes` 倒排位图与表内 `PairTargetIndex` 二级位图索引）
     pub fn sources_with_pair<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
         &self,
         target: EntityId,
@@ -1654,21 +1660,36 @@ impl Store {
         }
         let cid = ComponentTypeId::of::<crate::al::Pair<R, EntityId>>();
         let mut out = Vec::new();
-        for arch in &self.archetypes {
-            let len = arch.len();
-            if len == 0 || !arch.component_types_slice().contains(&cid) {
-                continue;
-            }
-            if let Some(mask) = arch.pair_target_row_mask::<R>(target) {
-                let entities = arch.entities();
-                mask.for_each_set_row(|row| {
-                    if let Some(&e) = entities.get(row) {
-                        out.push(e);
+        if let Some(arch_bits) = self.component_archetypes.get(&cid) {
+            arch_bits.for_each_set_bit(|arch_idx| {
+                if let Some(arch) = self.archetypes.get(arch_idx as usize) {
+                    if arch.len() > 0 {
+                        if let Some(mask) = arch.pair_target_row_mask::<R>(target) {
+                            let entities = arch.entities();
+                            mask.for_each_set_row(|row| {
+                                if let Some(&e) = entities.get(row) {
+                                    out.push(e);
+                                }
+                            });
+                        }
                     }
-                });
-            }
+                }
+            });
         }
         out
+    }
+
+    /// 解除并移除所有通过关系 `R` 指向 `target` 的存活实体的该关系组件，返回解除的源实体数量
+    pub fn unlink_pair_target<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
+        &mut self,
+        target: EntityId,
+    ) -> Result<usize, StateError> {
+        let sources = self.sources_with_pair::<R>(target);
+        let count = sources.len();
+        for source in sources {
+            let _ = self.remove_component::<crate::al::Pair<R, EntityId>>(source)?;
+        }
+        Ok(count)
     }
 
     /// 按谓词扫描并返回第一个匹配的实体 ID

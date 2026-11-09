@@ -754,6 +754,14 @@ pub(crate) mod sealed {
             desc: &ColumnDescriptor,
             expected_len: usize,
         ) -> Option<Self::ColumnBuffer>;
+        #[inline]
+        unsafe fn resolve_buffer_from_desc(
+            desc: Option<&ColumnDescriptor>,
+            expected_len: usize,
+        ) -> Option<Self::ColumnBuffer> {
+            let desc = desc?;
+            unsafe { Self::resolve_buffer(desc, expected_len) }
+        }
         unsafe fn prepare_state<'view>(
             buffer: &Self::ColumnBuffer,
             range: Range<usize>,
@@ -1933,7 +1941,7 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for
             let end = start + avail;
             return Some(((&archetype.entities()[start..end], opt_slice), end));
         }
-        Self::chunk(archetype, start)
+        <Self as sealed::Fetch<'a>>::chunk(archetype, start)
     }
 }
 
@@ -2607,6 +2615,141 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
     }
 }
 
+impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutData<'a> for Option<&'a mut T> {
+    type Item = (EntityId, Option<&'a mut T>);
+    type Chunk = (&'a [EntityId], Option<&'a mut [T]>);
+}
+
+impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> for Option<&'a mut T> {
+    type State = Option<std::slice::IterMut<'a, T>>;
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
+    fn prepare(
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+        range: Range<usize>,
+    ) -> Option<Self::State> {
+        let cid = ComponentTypeId::of::<T>();
+        let desc = columns
+            .first()
+            .filter(|(id, _)| *id == cid)
+            .or_else(|| columns.iter().find(|(id, _)| *id == cid))
+            .map(|(_, d)| d);
+        unsafe { <Self as sealed::ParamFetch<'a>>::prepare(desc, range) }
+    }
+
+    #[inline(always)]
+    fn fast_prepare_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let state = unsafe { <Self as sealed::ParamFetch<'a>>::fast_prepare(comp_slice, flat_cols, len)? };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        if state.is_some() {
+            archetype.bump_columns_version_in_place();
+        }
+        Some((state, entities))
+    }
+
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let state = unsafe {
+            <Self as sealed::ParamFetch<'a>>::fast_prepare_slot(
+                comp_slice,
+                flat_cols,
+                col_slots.first().copied().unwrap_or(u16::MAX),
+                len,
+            )?
+        };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        if state.is_some() {
+            archetype.bump_columns_version_in_place();
+        }
+        Some((state, entities))
+    }
+
+    #[inline]
+    fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
+        (entity, <Self as sealed::ParamFetch<'a>>::next_item(state))
+    }
+
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <Self as sealed::ParamFetch<'a>>::skip_items(state, count);
+    }
+
+    #[inline]
+    fn chunk(
+        entities: &'a [EntityId],
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+        range: Range<usize>,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let cid = ComponentTypeId::of::<T>();
+        let desc = columns
+            .first()
+            .filter(|(id, _)| *id == cid)
+            .or_else(|| columns.iter().find(|(id, _)| *id == cid))
+            .map(|(_, d)| d);
+        let c = unsafe { <Self as sealed::ParamFetch<'a>>::chunk(desc, range)? };
+        Some((entities, c))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let chunk = unsafe { <Self as sealed::ParamFetch<'a>>::fast_chunk(comp_slice, flat_cols, len)? };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        if chunk.is_some() {
+            archetype.bump_columns_version_in_place();
+        }
+        Some((entities, chunk))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let chunk = unsafe {
+            <Self as sealed::ParamFetch<'a>>::fast_chunk_slot(
+                comp_slice,
+                flat_cols,
+                col_slots.first().copied().unwrap_or(u16::MAX),
+                len,
+            )?
+        };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        if chunk.is_some() {
+            archetype.bump_columns_version_in_place();
+        }
+        Some((entities, chunk))
+    }
+
+    #[inline]
+    fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]> {
+        smallvec::smallvec![(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), true)]
+    }
+}
+
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutData<'a> for &'a mut T {
     type Item = (EntityId, &'a mut T);
     type Chunk = (&'a [EntityId], &'a mut [T]);
@@ -2875,6 +3018,137 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
             return Some((entities, chunk));
         }
         Self::fast_chunk_archetype(archetype)
+    }
+
+    #[inline(always)]
+    fn mark_written_columns(
+        _archetype: &mut Archetype,
+        _masked: Option<&RowBitMask>,
+        _epoch: u64,
+    ) {
+    }
+
+    #[inline]
+    fn access_descriptors() -> smallvec::SmallVec<[(ComponentTypeId, &'static str, bool); 16]> {
+        smallvec::smallvec![(ComponentTypeId::of::<T>(), std::any::type_name::<T>(), false)]
+    }
+}
+
+impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutData<'a> for Option<&'a T> {
+    type Item = (EntityId, Option<&'a T>);
+    type Chunk = (&'a [EntityId], Option<&'a [T]>);
+}
+
+impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> for Option<&'a T> {
+    type State = Option<std::slice::Iter<'a, T>>;
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
+    fn prepare(
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+        range: Range<usize>,
+    ) -> Option<Self::State> {
+        let cid = ComponentTypeId::of::<T>();
+        let desc = columns
+            .first()
+            .filter(|(id, _)| *id == cid)
+            .or_else(|| columns.iter().find(|(id, _)| *id == cid))
+            .map(|(_, d)| d);
+        unsafe { <Self as sealed::ParamFetch<'a>>::prepare(desc, range) }
+    }
+
+    #[inline(always)]
+    fn fast_prepare_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let state = unsafe { <Self as sealed::ParamFetch<'a>>::fast_prepare(comp_slice, flat_cols, len)? };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        Some((state, entities))
+    }
+
+    #[inline(always)]
+    fn fast_prepare_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<(Self::State, &'a [EntityId])> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let state = unsafe {
+            <Self as sealed::ParamFetch<'a>>::fast_prepare_slot(
+                comp_slice,
+                flat_cols,
+                col_slots.first().copied().unwrap_or(u16::MAX),
+                len,
+            )?
+        };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        Some((state, entities))
+    }
+
+    #[inline]
+    fn next(state: &mut Self::State, entity: EntityId) -> <Self as QueryMutData<'a>>::Item {
+        (entity, <Self as sealed::ParamFetch<'a>>::next_item(state))
+    }
+
+    #[inline]
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <Self as sealed::ParamFetch<'a>>::skip_items(state, count);
+    }
+
+    #[inline]
+    fn chunk(
+        entities: &'a [EntityId],
+        columns: &[(ComponentTypeId, ColumnDescriptor)],
+        range: Range<usize>,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let cid = ComponentTypeId::of::<T>();
+        let desc = columns
+            .first()
+            .filter(|(id, _)| *id == cid)
+            .or_else(|| columns.iter().find(|(id, _)| *id == cid))
+            .map(|(_, d)| d);
+        let c = unsafe { <Self as sealed::ParamFetch<'a>>::chunk(desc, range)? };
+        Some((entities, c))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_archetype(
+        archetype: &'a mut Archetype,
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let chunk = unsafe { <Self as sealed::ParamFetch<'a>>::fast_chunk(comp_slice, flat_cols, len)? };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        Some((entities, chunk))
+    }
+
+    #[inline(always)]
+    fn fast_chunk_bound(
+        archetype: &'a mut Archetype,
+        col_slots: &[u16],
+    ) -> Option<<Self as QueryMutData<'a>>::Chunk> {
+        let len = archetype.len();
+        let comp_slice = archetype.component_types_slice();
+        let flat_cols = archetype.flat_columns();
+        let chunk = unsafe {
+            <Self as sealed::ParamFetch<'a>>::fast_chunk_slot(
+                comp_slice,
+                flat_cols,
+                col_slots.first().copied().unwrap_or(u16::MAX),
+                len,
+            )?
+        };
+        let entities = unsafe { std::slice::from_raw_parts(archetype.entities().as_ptr(), len) };
+        Some((entities, chunk))
     }
 
     #[inline(always)]
