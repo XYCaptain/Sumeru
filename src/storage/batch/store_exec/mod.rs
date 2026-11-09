@@ -124,6 +124,7 @@ impl Store {
                 target_arch.bump_columns_version_in_place();
                 let row = target_arch.push_entity_with_slot(id, local_slot) as u32;
                 debug_assert_eq!(row, row_usize as u32);
+                target_arch.mark_all_columns_row_epoch(row as usize, next_epoch);
                 self.epoch = next_epoch;
                 poison_guard.disarm();
                 return Ok(());
@@ -153,13 +154,12 @@ impl Store {
             let target_arch = &mut self.archetypes[target_arch_id as usize];
             for (type_id, value) in bundle.into_components() {
                 target_arch
-                    .columns_mut()
-                    .get_mut(&type_id)
+                    .get_erased_column_mut(type_id)
                     .expect("column exists in archetype")
                     .push_erased_infallible(value);
             }
             let row = target_arch.push_entity_with_slot(id, local_slot) as u32;
-            target_arch.rebuild_flat_columns();
+            target_arch.mark_all_columns_row_epoch(row as usize, next_epoch);
             self.allocator.set_location_by_slot_infallible(
                 local_slot,
                 EntityLocation::new(target_arch_id, row),

@@ -1,108 +1,172 @@
 # Sumeru
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust Edition](https://img.shields.io/badge/Rust-2024-orange.svg)](Cargo.toml)
-[![Status](https://img.shields.io/badge/Version-0.1.0-success.svg)](Cargo.toml)
+<p align="center">
+  <strong>In-Memory Columnar State &amp; Heterogeneous Compute Engine</strong>
+</p>
 
-English | [简体中文](README_zh-CN.md)
+<p align="center">
+  <a href="./README.md">English</a> · <a href="./README_zh-CN.md">简体中文</a>
+</p>
 
-**Sumeru is a high-performance contiguous columnar in-memory state engine written in Rust.** Built for large-scale simulations, digital twins, real-time games, and data-intensive stateful systems, it unifies expressive relational state modeling, deterministic transactional evolution, and a zero-copy columnar data foundation.
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust" alt="Rust 2024" />
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" />
+  <img src="https://img.shields.io/badge/Engine-Heterogeneous_Columnar_Compute-10B981" alt="Architecture" />
+</p>
 
----
+**Sumeru** is an in-memory **columnar state and heterogeneous compute engine** built for high-frequency state evolution, large-scale multi-agent simulations, and real-time digital twins. Your state lives in 16KB page-aligned contiguous columns, read/write conflicts are resolved statically at build time, and multi-core CPU SIMD, GPU compute kernels, and Apache Arrow analytical pipelines operate on the exact same physical memory with zero copy.
 
-## Philosophy
+## Why Sumeru?
 
-Traditional game frameworks (such as ECS) excel at fast frame-local loops but treat world state as ephemeral memory without strict storage contracts. Conversely, in-memory databases provide transactional rigor but lack the cache-coherent ergonomics and fine-grained throughput required by real-time simulations.
+Analytical columnar databases (like DuckDB) incur per-query SQL planning and operator tree overhead that cannot sustain microsecond-level ticks, while row-oriented object graphs suffer from pointer chasing and cannot feed SIMD or GPU pipelines directly. Sumeru bridges this gap:
 
-Rather than being just an ECS container, Sumeru elevates world state into a first-class **Columnar State Fabric**—combining entity-component cache locality and rich relational topology with transactional safety, deterministic time-travel snapshots, and zero-copy analytical interoperability.
+- **16KB page-aligned contiguous columns**: State is clustered by schema into dense typed columns and copy-on-write blocks, eliminating pointer chasing while aligning naturally to CPU cache lines and GPU page tables.
+- **Static lock-free scheduling**: Operators declare read/write sets up front; conflicts are proven statically into a deterministic dependency graph (DAG) with zero runtime lock overhead.
+- **Bitmask-jump & 64-row dirty tracking**: 64-bit hardware word bitmasks, 8-way in-place bit-planes, and 64-row dirty epochs skip untouched blocks in one step.
+- **First-class relational topology**: Model entity pairs, hierarchies, and zero-sized tags directly inside columnar tables with lazy target bitmaps.
+- **Arrow-native & time-travel ready**: Two-phase atomic batch commits with zero-copy Apache Arrow `RecordBatch` export, whole-column snapshots, and delta replay.
 
-## Highlights
+### When to use Sumeru?
 
-- **Contiguous Columnar Storage**: Dense, 4KB page-aligned typed columns and flat pointer caches (`flat_columns`) engineered for CPU cache locality, SIMD, and multi-core throughput.
-- **Relational State Topology**: Native entities, typed relationship pairs (`Pair<R, Target>` with lazy per-table `PairTargetIndex` bitmaps), hierarchies, zero-sized tags (`Tag<N>`), non-migrating row flag bit-planes (`RowFlags`), and global singletons.
-- **Adaptive Bound & Bitmask-Jump Queries**: Inverted `ArchetypeBitSet` routing, $O(\Delta A)$ incremental cache refresh, Level-2 pre-bound column slots (`MatchedTableBinding`), `RowBitMask` hardware bit-scan jumping, and 64-row chunk-epoch dirty tracking (`ChangedSince<T>`).
-- **Two-Phase State Evolution**: Deferred mutation recording with per-entity patch folding, two-phase atomic validation, and incremental commit receipts.
-- **Zero-Copy Snapshots & Open Fabric**: Whole-column `rkyv` archiving, table-pruned component delta replay, and zero-copy bridging to Apache Arrow arrays.
-- **Battle-Tested Suite**: Ships with 85 state and relational modeling examples and tests covering hierarchies, prefabs, queries, observers, and reflection.
-
----
+- Build high-frequency simulations, physics/agent steppers, or real-time digital twins requiring microsecond ticks over millions of state rows.
+- Run fine-grained state rules (CPU SIMD), batch compute kernels (GPU UMA / CUDA), and real-time columnar analytics (Apache Arrow) over a single zero-copy memory layout.
+- Embed a deterministic in-memory state layer with time-travel snapshots, delta replication, and two-phase transactional safety.
 
 ## Quick Start
 
-```toml
-[dependencies]
-sumeru = { git = "https://github.com/xumi-lab/Sumeru" }
-```
-
 ```rust
 use serde::{Deserialize, Serialize};
-use sumeru::{Pair, QueryBuilder, Store};
+use sumeru::{EntityId, Pair, Store};
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct Velocity { x: f32, y: f32 }
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Velocity { vx: f32, vy: f32 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Eats;
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Active;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Frozen;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct ChildOf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::new();
+    let root = EntityId::from_u128(1);
+    let entity = EntityId::from_u128(2);
 
-    // Create state entities, attach attributes, and define relational topology (Bob -> Eats -> Apples)
-    let apples = store.spawn_auto()?;
-    let bob = store.spawn_auto()?;
-    store.set(bob, Position { x: 0.0, y: 0.0 })?;
-    store.set(bob, Velocity { x: 1.0, y: 2.0 })?;
-    store.set_pair(bob, Eats, apples)?;
+    store.insert((
+        entity,
+        (
+            Position { x: 0.0, y: 0.0 },
+            Velocity { vx: 1.5, vy: 2.0 },
+            Active,
+            Pair::<ChildOf>::new(ChildOf, root),
+        ),
+    ))?;
 
-    // Mutate state in-place over contiguous columns
-    for (_, (pos, vel)) in store.query_mut::<(&mut Position, &Velocity)>()?.iter() {
-        pos.x += vel.x;
-        pos.y += vel.y;
+    let baseline_epoch = store.epoch();
+
+    // Set status flag
+    store.set_flag::<0>(entity, true)?;
+
+    // Filter and update in place
+    for (_id, (pos, vel)) in store
+        .query_mut::<(&mut Position, &Velocity)>()?
+        .with::<Active>()
+        .without::<Frozen>()
+        .with_pair::<ChildOf>(root)
+        .with_flag::<0>()
+        .iter()
+    {
+        pos.x += vel.vx;
+        pos.y += vel.vy;
     }
 
-    // Query state filtered by the (Eats, apples) pair (accelerated via per-table PairTargetIndex)
-    let query = QueryBuilder::<&Position>::new().with_pair::<Eats>(apples).build(&store)?;
-    query.for_each(&store, |pos| {
-        println!("({}, {})", pos.x, pos.y);
-    })?;
+    assert_eq!(store.get::<Position>(entity), Some(&Position { x: 1.5, y: 2.0 }));
 
+    // Query data modified since baseline_epoch
+    let dirty_pos = store
+        .query::<&Position>()
+        .changed_since::<Position>(baseline_epoch)
+        .iter()
+        .count();
+    let dirty_vel = store
+        .query::<&Velocity>()
+        .changed_since::<Velocity>(baseline_epoch)
+        .iter()
+        .count();
+
+    assert_eq!(dirty_pos, 1);
+    assert_eq!(dirty_vel, 0);
     Ok(())
 }
 ```
 
-### Running the Examples
+## Installation
 
-Explore 85 self-contained state and relational modeling examples under [`examples/flecs`](examples/flecs):
+Add `sumeru` to your `Cargo.toml`:
 
-```bash
-cargo run --example flecs
-cargo test --example flecs
+```toml
+[dependencies]
+sumeru = { git = "https://github.com/XYCaptain/Sumeru.git" }
 ```
 
----
+## Examples & Benchmarks
+
+Run the built-in example suites with `cargo run --example <name>`:
+
+- `flecs` (85 scenarios): Dynamic column bindings, relational pairs, multi-phase pipelines, observers, and reflection
+- `gpu` (13 scenarios): 16KB page-aligned zero-copy GPU compute, typed Shader IR, and three-tier parallel dispatch
+
+```bash
+cargo test                                    # Run unit, integration, and security gate tests
+cargo run --example flecs                     # Run state & relational modeling examples (85 scenarios)
+cargo run --example gpu --features gpu        # Run 16KB zero-copy GPU compute examples (13 scenarios)
+cargo bench --bench store_benchmark           # Run contiguous columnar throughput benchmarks
+```
 
 ## Architecture
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="Sumeru Architecture" width="100%" />
+  <img src="./assets/pipeline.svg" alt="Sumeru Architecture" width="840" />
 </p>
 
----
+Sumeru implements a unified-memory columnar pipeline: writes commit in two phases into 16KB page-aligned columns, and a 3-level cached scheduler dispatches work lock-free across heterogeneous targets:
 
-## Roadmap
+- **Page-aligned contiguous store**: State is clustered by schema in 16KB page-aligned columns with 8-way in-place bit-planes and 64-row dirty epochs—eliminating pointer chasing and table migration.
+- **3-level cached lock-free schedule**: Read/write bitsets statically resolve conflicts at build time (L1), while pre-bound column slots (L2) and 32–64KB cache slices (L3) dispatch work with zero runtime locks.
+- **Zero-copy heterogeneous dispatch**: The same contiguous column buffers feed multi-core CPU SIMD slices, map zero-copy into GPU unified memory (Metal UMA / wgpu), or export as Apache Arrow `RecordBatch`es.
 
-- [x] Contiguous archetype columnar storage, generational entity allocator & `ArchetypeBitSet` routing
-- [x] First-class relationship pairs (with `PairTargetIndex`), zero-sized tags, non-migrating row flag bit-planes & global singletons
-- [x] Streaming queries, $O(\Delta A)$ incremental Level-2 bound cached queries, `RowBitMask` jump filtering & 64-row chunk dirty tracking (`ChangedSince<T>`)
-- [x] Two-phase atomic command buffers, batch transactions, and commit receipts
-- [x] Whole-column `rkyv` snapshots, component delta replay, and Apache Arrow bridge
-- [x] 85 state & relational modeling verification examples
-- [ ] Zero-copy Arrow SQL / DataFusion table provider integration
-- [ ] Cross-language C ABI / FFI bindings
+## Features
+
+**Storage & Schema**
+- [x] 16KB page-aligned contiguous columns and copy-on-write blocks
+- [x] Generational row indexing and flat column pointer cache
+- [x] Relational pairs, zero-sized tags, and global singletons
+- [x] Two-phase atomic batch commits with per-row patch folding
+
+**Query & Filtering**
+- [x] Inverted column-to-table bitmaps and incremental query caching
+- [x] Level-2 pre-bound column slots and multi-column row cursors
+- [x] 64-bit hardware word bitmask jump filtering, contiguous run coalescing, and target bitmap indexing
+- [x] 8-way non-migrating row bit-planes and 64-row chunk dirty tracking
+- [x] Standalone stateless primitives and bitmap indexing library
+
+**Schedule & Heterogeneous Compute**
+- [x] Multi-core parallel chunk iteration and zero-copy slice borrowing
+- [x] L1/L2 cache-conscious adaptive subchunk planner
+- [x] Static dependency graph (DAG) scheduler, 3-level caching, and static ambiguity detection
+- [x] 16KB hardware page dirty bitmap folding, typed Shader IR, and GPU zero-copy compute pass
+
+**Snapshots & Ecosystem**
+- [x] Zero-copy Apache Arrow `RecordBatch` bridge
+- [x] Whole-column zero-copy snapshots and deterministic time-travel
+- [x] Frame commit receipts and column-pruned delta replay
 
 ## License
 
-Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Eventide.
+MIT License. See [LICENSE](./LICENSE) for details.

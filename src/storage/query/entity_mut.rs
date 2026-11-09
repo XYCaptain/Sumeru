@@ -302,9 +302,9 @@ impl<'a> EntityMut<'a> {
         if arch.entities().get(row) != Some(&self.id) {
             return None;
         }
-        arch.mark_column_row_epoch(type_id, row, next_epoch);
-        let typed = arch.get_typed_column_mut::<T>(type_id, self.id).ok()?;
-        let val_ref = typed.get_mut(row)?;
+        let val_ref = arch
+            .get_typed_column_row_mut_at_epoch::<T>(type_id, self.id, row, next_epoch)
+            .ok()??;
         self.store.epoch = next_epoch;
         Some(val_ref)
     }
@@ -326,14 +326,14 @@ impl<'a> EntityMut<'a> {
         if arch.entities().get(row) != Some(&self.id) {
             return Err(StateError::EntityNotFound(self.id));
         }
-        arch.mark_column_row_epoch(type_id, row, next_epoch);
-        let typed = arch.get_typed_column_mut::<T>(type_id, self.id)?;
-        let val_ref = typed.get_mut(row).ok_or_else(|| {
-            StateError::AccessDenied(format!(
-                "Entity {} row {} out of bounds in archetype {}",
-                self.id, row, self.location.archetype_id
-            ))
-        })?;
+        let val_ref = arch
+            .get_typed_column_row_mut_at_epoch::<T>(type_id, self.id, row, next_epoch)?
+            .ok_or_else(|| {
+                StateError::AccessDenied(format!(
+                    "Entity {} row {} out of bounds in archetype {}",
+                    self.id, row, self.location.archetype_id
+                ))
+            })?;
         self.store.epoch = next_epoch;
         Ok(val_ref)
     }

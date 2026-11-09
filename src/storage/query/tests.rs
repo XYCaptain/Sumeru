@@ -24,6 +24,9 @@ impl<'a> sealed::Fetch<'a> for Counted {
         FETCHES.with(|count| count.set(count.get() + 1));
         <&u64 as sealed::Fetch>::next(state, entity)
     }
+    fn skip_rows(state: &mut Self::State, count: usize) {
+        <&u64 as sealed::Fetch>::skip_rows(state, count);
+    }
     fn chunk(
         archetype: &'a Archetype,
         start: usize,

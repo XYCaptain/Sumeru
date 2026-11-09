@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 280" width="100%" height="100%" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0F172A" flood-opacity="0.05"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 1 2 L 8 5 L 1 8 z" fill="#64748B"/>
+    </marker>
+  </defs>
+
+  <!-- Clean Neutral Background -->
+  <rect x="1" y="1" width="858" height="278" rx="12" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.5"/>
+
+  <!-- Stage 1: Write Ingress -->
+  <rect x="24" y="28" width="160" height="224" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="104" y="54" text-anchor="middle" fill="#0F172A" font-size="13" font-weight="700">1. 状态写入</text>
+  <line x1="40" y1="68" x2="168" y2="68" stroke="#F1F5F9" stroke-width="1.5"/>
+
+  <rect x="38" y="84" width="132" height="60" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="104" y="110" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">命令缓冲</text>
+  <text x="104" y="128" text-anchor="middle" fill="#64748B" font-size="10.5">同行补丁自动折叠</text>
+
+  <line x1="104" y1="144" x2="104" y2="168" stroke="#64748B" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <rect x="38" y="174" width="132" height="60" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="104" y="200" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">两阶段批次提交</text>
+  <text x="104" y="218" text-anchor="middle" fill="#64748B" font-size="10.5">原子预校验与收据</text>
+
+  <line x1="184" y1="140" x2="214" y2="140" stroke="#64748B" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Stage 2: Contiguous Columnar Store -->
+  <rect x="220" y="28" width="212" height="224" rx="10" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="326" y="54" text-anchor="middle" fill="#0F172A" font-size="13" font-weight="700">2. 连续列存底座</text>
+  <line x1="238" y1="68" x2="414" y2="68" stroke="#F1F5F9" stroke-width="1.5"/>
+
+  <rect x="236" y="82" width="180" height="46" rx="7" fill="#F0FDF4" stroke="#BBF7D0"/>
+  <text x="326" y="102" text-anchor="middle" fill="#166534" font-size="12" font-weight="600">16KB 页对齐连续列</text>
+  <text x="326" y="119" text-anchor="middle" fill="#15803D" font-size="10.5">紧凑类型列 · 写时复制块</text>
+
+  <rect x="236" y="136" width="180" height="46" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="326" y="156" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">倒排与关系目标位图</text>
+  <text x="326" y="173" text-anchor="middle" fill="#64748B" font-size="10.5">按位与表路由 · 关系索引</text>
+
+  <rect x="236" y="190" width="180" height="46" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="326" y="210" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">原位位平面与 64 行脏纪元</text>
+  <text x="326" y="227" text-anchor="middle" fill="#64748B" font-size="10.5">零迁移状态翻转 · 整块跳脏</text>
+
+  <line x1="432" y1="140" x2="462" y2="140" stroke="#64748B" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Stage 3: 3-Level Cached Schedule -->
+  <rect x="468" y="28" width="184" height="224" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="560" y="54" text-anchor="middle" fill="#0F172A" font-size="13" font-weight="700">3. 三级缓存调度</text>
+  <line x1="484" y1="68" x2="636" y2="68" stroke="#F1F5F9" stroke-width="1.5"/>
+
+  <rect x="482" y="82" width="156" height="46" rx="7" fill="#EFF6FF" stroke="#BFDBFE"/>
+  <text x="560" y="102" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="600">L1 静态冲突图 DAG</text>
+  <text x="560" y="119" text-anchor="middle" fill="#2563EB" font-size="10.5">读写位集判冲 · 0 锁开销</text>
+
+  <rect x="482" y="136" width="156" height="46" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="560" y="156" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">L2 列槽位预绑定</text>
+  <text x="560" y="173" text-anchor="middle" fill="#64748B" font-size="10.5">增量唤醒 · 免运行期哈希</text>
+
+  <rect x="482" y="190" width="156" height="46" rx="7" fill="#F8FAFC" stroke="#E2E8F0"/>
+  <text x="560" y="210" text-anchor="middle" fill="#1E293B" font-size="12" font-weight="600">L3 缓存感知切片</text>
+  <text x="560" y="227" text-anchor="middle" fill="#64748B" font-size="10.5">32–64KB 分块 · 位图跑程</text>
+
+  <!-- Fan-out Arrows 3 -> 4 -->
+  <path d="M 652 105 L 682 66" fill="none" stroke="#64748B" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="652" y1="140" x2="682" y2="140" stroke="#64748B" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <path d="M 652 175 L 682 214" fill="none" stroke="#64748B" stroke-width="1.4" marker-end="url(#arrow)"/>
+
+  <!-- Stage 4: Zero-Copy Heterogeneous Targets -->
+  <rect x="688" y="28" width="148" height="66" rx="9" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="762" y="56" text-anchor="middle" fill="#0F172A" font-size="12.5" font-weight="700">多核 CPU SIMD</text>
+  <text x="762" y="76" text-anchor="middle" fill="#64748B" font-size="10.5">无锁连续切片并行</text>
+
+  <rect x="688" y="107" width="148" height="66" rx="9" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="762" y="135" text-anchor="middle" fill="#0F172A" font-size="12.5" font-weight="700">GPU 异构加速</text>
+  <text x="762" y="155" text-anchor="middle" fill="#64748B" font-size="10.5">16KB 页零拷贝直通</text>
+
+  <rect x="688" y="186" width="148" height="66" rx="9" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2" filter="url(#shadow)"/>
+  <text x="762" y="214" text-anchor="middle" fill="#0F172A" font-size="12.5" font-weight="700">Arrow 与快照</text>
+  <text x="762" y="234" text-anchor="middle" fill="#64748B" font-size="10.5">零拷贝导出 · 增量重放</text>
+</svg>

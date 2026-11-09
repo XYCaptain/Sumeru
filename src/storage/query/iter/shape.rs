@@ -231,6 +231,10 @@ pub trait QueryMutParamShape: sealed::QueryMutParamShapeInternal + Send + 'stati
     fn component_type_id() -> ComponentTypeId;
     fn type_name() -> &'static str;
     fn is_write() -> bool;
+    #[inline]
+    fn element_size() -> usize {
+        0
+    }
 }
 
 impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutParamShape
@@ -247,6 +251,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutParamShape
     #[inline]
     fn is_write() -> bool {
         true
+    }
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
     }
 }
 
@@ -320,6 +328,10 @@ impl<T: ModelComponent + Serialize + DeserializeOwned + Sync> QueryMutParamShape
     #[inline]
     fn is_write() -> bool {
         false
+    }
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
     }
 }
 
@@ -402,6 +414,12 @@ pub trait QueryMutShape:
 
     /// 校验查询形状内部是否存在别名/读写冲突（例如元组中对同一组件同时存在写操作）
     fn validate_shape() -> Result<(), StateError>;
+
+    /// 计算该查询形状中所有组件列的总行宽（字节）
+    #[inline]
+    fn total_row_width() -> usize {
+        0
+    }
 
     /// 计算当前游标所在分段边界
     fn segment_end_with_cursor(
@@ -510,6 +528,11 @@ macro_rules! tuple_query_mut_shape {
             }
 
             #[inline]
+            fn total_row_width() -> usize {
+                $($P::element_size() +)+ 0
+            }
+
+            #[inline]
             fn segment_end_with_cursor(buffers: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
                 usize::MAX $(.min($P::segment_end_with_cursor(&buffers.$idx, row, &mut cursor[$idx])))+
             }
@@ -613,6 +636,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned + Send> QueryMutShape for 
     }
 
     #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
         <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
     }
@@ -691,6 +719,11 @@ impl<T: ModelComponent + Serialize + DeserializeOwned> QueryMutShape for &'stati
     }
 
     #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn segment_end_with_cursor(buffer: &Self::ArchetypeBuffers, row: usize, cursor: &mut Self::Cursor) -> usize {
         <Self as sealed::QueryMutParamShapeInternal>::segment_end_with_cursor(buffer, row, cursor)
     }
@@ -760,6 +793,11 @@ impl<Q: QueryMutShape> QueryMutShape for (EntityId, Q) {
     #[inline]
     fn validate_shape() -> Result<(), StateError> {
         Q::validate_shape()
+    }
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<EntityId>() + Q::total_row_width()
     }
 
     #[inline]
@@ -932,18 +970,125 @@ impl<'a, Q: QueryData<'a>> sealed::Fetch<'a> for (EntityId, Q) {
     }
 }
 
-pub(crate) fn for_each_matched_chunk_ro<'store, Q>(
+/// 64 行掩码字对齐的默认 CPU 并行子块大小（向后兼容回退常量：4096 行）。
+pub const PAR_SUBCHUNK_ROWS: usize = 4096;
+
+pub use crate::storage::primitives::{
+    for_each_contiguous_mask_run, mask_has_any_in_range, SubchunkPlanner,
+};
+
+#[inline]
+fn resolve_archetype_buffers_ro<Q: QueryMutShape>(
+    arch: &Archetype,
+) -> Option<Q::ArchetypeBuffers> {
+    let len = arch.len();
+    unsafe {
+        Q::resolve_archetype_buffers(
+            &|cid| {
+                arch.columns()
+                    .get(&cid)
+                    .map(|col| ColumnDescriptor::from_column_ref(&**col))
+            },
+            len,
+        )
+    }
+}
+
+#[inline]
+fn resolve_archetype_buffers_mut<Q: QueryMutShape>(
+    arch: &mut Archetype,
+) -> Option<Q::ArchetypeBuffers> {
+    let len = arch.len();
+    let wanted = Q::access_descriptors();
+    let mut has_write = false;
+    for &(_, _, is_write) in &wanted {
+        if is_write {
+            has_write = true;
+            break;
+        }
+    }
+    if has_write {
+        arch.bump_columns_version_in_place();
+    }
+    let (_, _, _, _, cols) = arch.split_for_query_mut();
+    let mut descs =
+        smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(wanted.len());
+    for (cid, _, is_write) in wanted {
+        let col = cols.get_mut(&cid)?;
+        let desc = if is_write {
+            ColumnDescriptor::from_column(&mut **col)
+        } else {
+            ColumnDescriptor::from_column_ref(&**col)
+        };
+        if desc.len != len {
+            return None;
+        }
+        descs.push((cid, desc));
+    }
+    unsafe {
+        Q::resolve_archetype_buffers(
+            &|cid| {
+                descs
+                    .iter()
+                    .find(|(id, _)| *id == cid)
+                    .map(|(_, d)| d.clone())
+            },
+            len,
+        )
+    }
+}
+
+pub(crate) fn for_each_matched_chunk_ro<'store, Q, F>(
     store: &'store Store,
     matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
     mut f: impl FnMut(Q::Chunk<'store>),
 ) where
     Q: QueryMutShape,
+    F: QueryFilter,
     for<'a> Q::View<'a>: QueryData<'a, Chunk = Q::Chunk<'a>>,
 {
     for binding in matched_bindings {
         let Some(arch) = store.archetypes.get(binding.archetype_id.0 as usize) else {
             continue;
         };
+        if arch.is_empty() {
+            continue;
+        }
+        if F::IS_ROW_FILTERED {
+            let Some(mask) = filter.collect_matched_row_mask(arch) else {
+                continue;
+            };
+            if mask.is_all_zero() {
+                continue;
+            }
+            let Some(buffers) = resolve_archetype_buffers_ro::<Q>(arch) else {
+                continue;
+            };
+            let entities = arch.entities();
+            let mut cursor = Q::Cursor::default();
+            for_each_contiguous_mask_run(&mask, 0, arch.len(), |run| {
+                let mut row = run.start;
+                while row < run.end {
+                    let seg_end =
+                        Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(run.end);
+                    if seg_end <= row {
+                        break;
+                    }
+                    let chunk = unsafe {
+                        Q::chunk(
+                            &entities[row..seg_end],
+                            &buffers,
+                            row..seg_end,
+                            &mut cursor,
+                        )
+                    };
+                    f(chunk);
+                    row = seg_end;
+                }
+            });
+            continue;
+        }
         let mut row = 0;
         while row < arch.len() {
             let Some((chunk, end)) = <Q::View<'store> as sealed::Fetch<'store>>::fast_chunk_bound(
@@ -959,12 +1104,14 @@ pub(crate) fn for_each_matched_chunk_ro<'store, Q>(
     }
 }
 
-pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
+pub(crate) fn for_each_matched_chunk_mut<'store, Q, F>(
     store: &'store mut Store,
     matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
     mut f: impl FnMut(Q::Chunk<'store>),
 ) where
     Q: QueryMutShape,
+    F: QueryFilter,
 {
     let write_epoch = store.epoch();
     let archetypes_ptr = store.archetypes.as_mut_ptr();
@@ -980,11 +1127,48 @@ pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
         if arch.is_empty() {
             continue;
         }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter.collect_matched_row_mask(&*arch)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+            continue;
+        }
         <Q::View<'store> as sealed::FetchMut<'store>>::mark_written_columns(
             arch,
-            None,
+            filtered_mask.as_ref(),
             write_epoch,
         );
+        if let Some(mask) = &filtered_mask {
+            let arch_len = arch.len();
+            let entities = unsafe { std::slice::from_raw_parts(arch.entities().as_ptr(), arch_len) };
+            let Some(buffers) = resolve_archetype_buffers_mut::<Q>(arch) else {
+                continue;
+            };
+            let mut cursor = Q::Cursor::default();
+            for_each_contiguous_mask_run(mask, 0, arch_len, |run| {
+                let mut row = run.start;
+                while row < run.end {
+                    let seg_end =
+                        Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(run.end);
+                    if seg_end <= row {
+                        break;
+                    }
+                    let chunk = unsafe {
+                        Q::chunk(
+                            &entities[row..seg_end],
+                            &buffers,
+                            row..seg_end,
+                            &mut cursor,
+                        )
+                    };
+                    f(chunk);
+                    row = seg_end;
+                }
+            });
+            continue;
+        }
         if !arch.may_be_segmented_or_unaligned()
             && arch.flat_columns().len() == arch.component_types_slice().len()
         {
@@ -1004,10 +1188,14 @@ pub(crate) fn for_each_matched_chunk_mut<'store, Q>(
                 wanted.len(),
             );
         let mut ok = true;
-        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+        for (i, (id, _, is_write)) in wanted.into_iter().enumerate() {
             let is_req = (req_mask & (1u16 << i)) != 0;
             if let Some(col) = cols.get_mut(&id) {
-                let desc = ColumnDescriptor::from_column(&mut **col);
+                let desc = if is_write {
+                    ColumnDescriptor::from_column(&mut **col)
+                } else {
+                    ColumnDescriptor::from_column_ref(&**col)
+                };
                 if desc.len != entities.len() {
                     ok = false;
                     break;
@@ -1205,10 +1393,14 @@ pub(crate) fn for_each_matched_mut<'store, Q, F>(
                 wanted.len(),
             );
         let mut ok = true;
-        for (i, (id, _, _)) in wanted.into_iter().enumerate() {
+        for (i, (id, _, is_write)) in wanted.into_iter().enumerate() {
             let is_req = (req_mask & (1u16 << i)) != 0;
             if let Some(col) = cols.get_mut(&id) {
-                let desc = ColumnDescriptor::from_column(&mut **col);
+                let desc = if is_write {
+                    ColumnDescriptor::from_column(&mut **col)
+                } else {
+                    ColumnDescriptor::from_column_ref(&**col)
+                };
                 if desc.len != entities.len() {
                     ok = false;
                     break;
@@ -1279,5 +1471,491 @@ pub(crate) fn for_each_matched_mut<'store, Q, F>(
         }
     }
 }
+
+struct ParSubchunkTask<'store, B> {
+    entities: &'store [EntityId],
+    buffers: B,
+    range: Range<usize>,
+    filtered_mask: Option<std::sync::Arc<crate::storage::archetype::RowBitMask>>,
+}
+
+#[inline]
+fn exec_subchunk_row_task<'store, Q>(
+    task: ParSubchunkTask<'store, Q::ArchetypeBuffers>,
+    f: &impl Fn(Q::Item<'store>),
+) where
+    Q: QueryMutShape,
+{
+    let mut cursor = Q::Cursor::default();
+    let row = task.range.start;
+    let end = task.range.end;
+    let mut state: Q::IterState<'store> =
+        unsafe { Q::prepare_iter(&task.buffers, row..end, &mut cursor) };
+    if let Some(mask) = &task.filtered_mask {
+        let mut cursor_row = row;
+        let start_word = row >> 6;
+        let end_word = (end + 63) >> 6;
+        let words = mask.words();
+        for w_idx in start_word..end_word.min(words.len()) {
+            let mut w = words[w_idx];
+            if w_idx == start_word && (row & 63) != 0 {
+                w &= !((1u64 << (row & 63)) - 1);
+            }
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let target_row = w_idx * 64 + bit;
+                if target_row >= end {
+                    break;
+                }
+                if target_row > cursor_row {
+                    unsafe { Q::skip_items(&mut state, target_row - cursor_row) };
+                }
+                let item =
+                    unsafe { Q::next_item(&mut state, task.entities[target_row]) };
+                cursor_row = target_row + 1;
+                f(item);
+                w &= w - 1;
+            }
+        }
+    } else {
+        for &entity in &task.entities[row..end] {
+            let item = unsafe { Q::next_item(&mut state, entity) };
+            f(item);
+        }
+    }
+}
+
+#[inline]
+fn exec_subchunk_slice_task<'store, Q>(
+    task: ParSubchunkTask<'store, Q::ArchetypeBuffers>,
+    f: &(impl Fn(Q::Chunk<'store>) + Send + Sync),
+) where
+    Q: QueryMutShape,
+{
+    let mut cursor = Q::Cursor::default();
+    let chunk = unsafe {
+        Q::chunk(
+            &task.entities[task.range.clone()],
+            &task.buffers,
+            task.range,
+            &mut cursor,
+        )
+    };
+    f(chunk);
+}
+
+/// 基于 Rayon 的按 4096 行（64 个掩码字）子块并行只读行遍历。
+///
+/// - 在主线程预先计算每个匹配原型的 `RowBitMask` 并对全 0 子块执行 $O(1)$ 剪枝；
+/// - 若有效子块总数 $\le 1$，直接在当前线程内联执行，避免线程池唤醒开销；
+/// - 若有效子块数 $> 1$，通过 `rayon::into_par_iter` 在多核间无锁并行分发。
+pub(crate) fn par_for_each_matched_ro<'store, Q, F>(
+    store: &'store Store,
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
+    f: impl Fn(Q::Item<'store>) + Send + Sync,
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    use rayon::prelude::*;
+
+    let subchunk_rows = SubchunkPlanner::default().subchunk_rows(Q::total_row_width());
+    let mut tasks: Vec<ParSubchunkTask<'store, Q::ArchetypeBuffers>> = Vec::new();
+    for binding in matched_bindings {
+        let Some(arch) = store.archetypes.get(binding.archetype_id.0 as usize) else {
+            continue;
+        };
+        if arch.is_empty() {
+            continue;
+        }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter
+                .collect_matched_row_mask(arch)
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+            continue;
+        }
+        let Some(buffers) = resolve_archetype_buffers_ro::<Q>(arch) else {
+            continue;
+        };
+        let entities = arch.entities();
+        let len = arch.len();
+        let mut cursor = Q::Cursor::default();
+        let mut row = 0;
+        while row < len {
+            let seg_end = Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(len);
+            if seg_end <= row {
+                break;
+            }
+            let sub_end = (row + subchunk_rows).min(seg_end);
+            let has_match = filtered_mask
+                .as_ref()
+                .map_or(true, |m| mask_has_any_in_range(m, row, sub_end));
+            if has_match {
+                tasks.push(ParSubchunkTask {
+                    entities,
+                    buffers: buffers.clone(),
+                    range: row..sub_end,
+                    filtered_mask: filtered_mask.clone(),
+                });
+            }
+            row = sub_end;
+        }
+    }
+    match tasks.len() {
+        0 => {}
+        1 => {
+            if let Some(task) = tasks.pop() {
+                exec_subchunk_row_task::<Q>(task, &f);
+            }
+        }
+        _ => {
+            tasks
+                .into_par_iter()
+                .for_each(|task| exec_subchunk_row_task::<Q>(task, &f));
+        }
+    }
+}
+
+/// 基于 Rayon 的按 4096 行（64 个掩码字）子块并行可变行遍历。
+///
+/// - 在主线程独占完成 COW 解耦（仅针对写权限列触发，只读列保持零拷贝）、64 行块纪元标记（`mark_written_columns`）与 `RowBitMask` 求交；
+/// - 将每张原型表切分为互不重叠的 4096 行（64 字对齐）`Range<usize>` 子块并在多核间并行执行。
+pub(crate) fn par_for_each_matched_mut<'store, Q, F>(
+    store: &'store mut Store,
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
+    f: impl Fn(Q::Item<'store>) + Send + Sync,
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    let write_epoch = store.epoch();
+    prepare_par_matched_mut_tasks::<Q, F>(store, matched_bindings, filter, write_epoch).execute(&f);
+}
+
+/// 主线程预备完毕、可脱离 `Store` 独立执行的可变子块任务集合。
+///
+/// # 两阶段执行契约（调度器并行 Stage 的健全性基础）
+///
+/// - **准备阶段**（[`prepare_par_matched_mut_tasks`]，主线程独占 `&mut Store`）：完成写列 COW 解耦、
+///   64 行块纪元标记与行级过滤掩码求值，并把每张原型表切分为互不重叠的子块；
+/// - **执行阶段**（[`execute`](Self::execute) / [`execute_with_state`](Self::execute_with_state)）：
+///   任务仅持有列缓冲区与实体切片的物理指针，**不持有也不访问任何 `Store` / `Archetype` 引用**，
+///   因此多个读写集互不相交的系统可在同一 Stage 内安全并发执行。
+pub(crate) struct PreparedParTasks<'store, Q: QueryMutShape> {
+    tasks: Vec<ParSubchunkTask<'store, Q::ArchetypeBuffers>>,
+}
+
+impl<'store, Q: QueryMutShape> PreparedParTasks<'store, Q> {
+    /// 子块任务数
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// 并行执行全部子块（单任务时内联执行，避免线程池唤醒开销）
+    pub(crate) fn execute(self, f: &(impl Fn(Q::Item<'store>) + Send + Sync)) {
+        use rayon::prelude::*;
+        let mut tasks = self.tasks;
+        match tasks.len() {
+            0 => {}
+            1 => {
+                if let Some(task) = tasks.pop() {
+                    exec_subchunk_row_task::<Q>(task, f);
+                }
+            }
+            _ => {
+                tasks
+                    .into_par_iter()
+                    .for_each(|task| exec_subchunk_row_task::<Q>(task, f));
+            }
+        }
+    }
+
+    /// 并行执行全部子块，每个子块持有独立的 `S` 状态（如命令缓冲），按**任务序**返回。
+    ///
+    /// 任务序 = 匹配原型序 × 行序，与线程调度无关，从而保证下游合并结果确定。
+    pub(crate) fn execute_with_state<S: Default + Send>(
+        self,
+        f: &(impl Fn(Q::Item<'store>, &mut S) + Send + Sync),
+    ) -> Vec<S> {
+        use rayon::prelude::*;
+        let run_one = |task: ParSubchunkTask<'store, Q::ArchetypeBuffers>| -> S {
+            let state = std::cell::RefCell::new(S::default());
+            exec_subchunk_row_task::<Q>(task, &|item| f(item, &mut state.borrow_mut()));
+            state.into_inner()
+        };
+        let tasks = self.tasks;
+        if tasks.len() <= 1 {
+            tasks.into_iter().map(run_one).collect()
+        } else {
+            tasks.into_par_iter().map(run_one).collect()
+        }
+    }
+}
+
+/// 两阶段并行可变遍历的**准备阶段**（必须在持有 `&mut Store` 的主线程上调用）。
+///
+/// `write_epoch` 为本次写入要打上的 64 行块纪元；调用方负责事先推进 `Store` 纪元。
+pub(crate) fn prepare_par_matched_mut_tasks<'store, Q, F>(
+    store: &'store mut Store,
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
+    write_epoch: u64,
+) -> PreparedParTasks<'store, Q>
+where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    let subchunk_rows = SubchunkPlanner::default().subchunk_rows(Q::total_row_width());
+    let archetypes_ptr = store.archetypes.as_mut_ptr();
+    let archetypes_len = store.archetypes.len();
+    let mut tasks: Vec<ParSubchunkTask<'store, Q::ArchetypeBuffers>> = Vec::new();
+
+    for binding in matched_bindings {
+        let idx = binding.archetype_id.0 as usize;
+        if idx >= archetypes_len {
+            continue;
+        }
+        let arch = unsafe { &mut *archetypes_ptr.add(idx) };
+        if arch.is_empty() {
+            continue;
+        }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter
+                .collect_matched_row_mask(&*arch)
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+            continue;
+        }
+        <Q::View<'store> as sealed::FetchMut<'store>>::mark_written_columns(
+            arch,
+            filtered_mask.as_deref(),
+            write_epoch,
+        );
+        let len = arch.len();
+        let entities = unsafe { std::slice::from_raw_parts(arch.entities().as_ptr(), len) };
+        let Some(buffers) = resolve_archetype_buffers_mut::<Q>(arch) else {
+            continue;
+        };
+        let mut cursor = Q::Cursor::default();
+        let mut row = 0;
+        while row < len {
+            let seg_end = Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(len);
+            if seg_end <= row {
+                break;
+            }
+            let sub_end = (row + subchunk_rows).min(seg_end);
+            let has_match = filtered_mask
+                .as_ref()
+                .map_or(true, |m| mask_has_any_in_range(m, row, sub_end));
+            if has_match {
+                tasks.push(ParSubchunkTask {
+                    entities,
+                    buffers: buffers.clone(),
+                    range: row..sub_end,
+                    filtered_mask: filtered_mask.clone(),
+                });
+            }
+            row = sub_end;
+        }
+    }
+    PreparedParTasks { tasks }
+}
+
+/// 基于 Rayon 的按 4096 行子块并行只读连续切片遍历（支持 `ChangedSince` 与行级掩码连续段切分）。
+pub(crate) fn par_for_each_matched_chunk_ro<'store, Q, F>(
+    store: &'store Store,
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
+    f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    use rayon::prelude::*;
+
+    let subchunk_rows = SubchunkPlanner::default().subchunk_rows(Q::total_row_width());
+    let mut tasks: Vec<ParSubchunkTask<'store, Q::ArchetypeBuffers>> = Vec::new();
+    for binding in matched_bindings {
+        let Some(arch) = store.archetypes.get(binding.archetype_id.0 as usize) else {
+            continue;
+        };
+        if arch.is_empty() {
+            continue;
+        }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter.collect_matched_row_mask(arch)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+            continue;
+        }
+        let Some(buffers) = resolve_archetype_buffers_ro::<Q>(arch) else {
+            continue;
+        };
+        let entities = arch.entities();
+        let len = arch.len();
+        let mut cursor = Q::Cursor::default();
+        if let Some(mask) = &filtered_mask {
+            for_each_contiguous_mask_run(mask, 0, len, |run| {
+                let mut row = run.start;
+                while row < run.end {
+                    let seg_end =
+                        Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(run.end);
+                    if seg_end <= row {
+                        break;
+                    }
+                    let sub_end = (row + subchunk_rows).min(seg_end);
+                    tasks.push(ParSubchunkTask {
+                        entities,
+                        buffers: buffers.clone(),
+                        range: row..sub_end,
+                        filtered_mask: None,
+                    });
+                    row = sub_end;
+                }
+            });
+        } else {
+            let mut row = 0;
+            while row < len {
+                let seg_end = Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(len);
+                if seg_end <= row {
+                    break;
+                }
+                let sub_end = (row + subchunk_rows).min(seg_end);
+                tasks.push(ParSubchunkTask {
+                    entities,
+                    buffers: buffers.clone(),
+                    range: row..sub_end,
+                    filtered_mask: None,
+                });
+                row = sub_end;
+            }
+        }
+    }
+    match tasks.len() {
+        0 => {}
+        1 => {
+            if let Some(task) = tasks.pop() {
+                exec_subchunk_slice_task::<Q>(task, &f);
+            }
+        }
+        _ => {
+            tasks
+                .into_par_iter()
+                .for_each(|task| exec_subchunk_slice_task::<Q>(task, &f));
+        }
+    }
+}
+
+/// 基于 Rayon 的按 4096 行子块并行可变连续切片遍历（支持 `ChangedSince` 与行级掩码连续段切分）。
+pub(crate) fn par_for_each_matched_chunk_mut<'store, Q, F>(
+    store: &'store mut Store,
+    matched_bindings: &[crate::storage::query::handle::MatchedTableBinding],
+    filter: &F,
+    f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+) where
+    Q: QueryMutShape,
+    F: QueryFilter,
+{
+    use rayon::prelude::*;
+
+    let subchunk_rows = SubchunkPlanner::default().subchunk_rows(Q::total_row_width());
+    let write_epoch = store.epoch();
+    let archetypes_ptr = store.archetypes.as_mut_ptr();
+    let archetypes_len = store.archetypes.len();
+    let mut tasks: Vec<ParSubchunkTask<'store, Q::ArchetypeBuffers>> = Vec::new();
+
+    for binding in matched_bindings {
+        let idx = binding.archetype_id.0 as usize;
+        if idx >= archetypes_len {
+            continue;
+        }
+        let arch = unsafe { &mut *archetypes_ptr.add(idx) };
+        if arch.is_empty() {
+            continue;
+        }
+        let filtered_mask = if F::IS_ROW_FILTERED {
+            filter.collect_matched_row_mask(&*arch)
+        } else {
+            None
+        };
+        if filtered_mask.as_ref().is_some_and(|m| m.is_all_zero()) {
+            continue;
+        }
+        <Q::View<'store> as sealed::FetchMut<'store>>::mark_written_columns(
+            arch,
+            filtered_mask.as_ref(),
+            write_epoch,
+        );
+        let len = arch.len();
+        let entities = unsafe { std::slice::from_raw_parts(arch.entities().as_ptr(), len) };
+        let Some(buffers) = resolve_archetype_buffers_mut::<Q>(arch) else {
+            continue;
+        };
+        let mut cursor = Q::Cursor::default();
+        if let Some(mask) = &filtered_mask {
+            for_each_contiguous_mask_run(mask, 0, len, |run| {
+                let mut row = run.start;
+                while row < run.end {
+                    let seg_end =
+                        Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(run.end);
+                    if seg_end <= row {
+                        break;
+                    }
+                    let sub_end = (row + subchunk_rows).min(seg_end);
+                    tasks.push(ParSubchunkTask {
+                        entities,
+                        buffers: buffers.clone(),
+                        range: row..sub_end,
+                        filtered_mask: None,
+                    });
+                    row = sub_end;
+                }
+            });
+        } else {
+            let mut row = 0;
+            while row < len {
+                let seg_end = Q::segment_end_with_cursor(&buffers, row, &mut cursor).min(len);
+                if seg_end <= row {
+                    break;
+                }
+                let sub_end = (row + subchunk_rows).min(seg_end);
+                tasks.push(ParSubchunkTask {
+                    entities,
+                    buffers: buffers.clone(),
+                    range: row..sub_end,
+                    filtered_mask: None,
+                });
+                row = sub_end;
+            }
+        }
+    }
+    match tasks.len() {
+        0 => {}
+        1 => {
+            if let Some(task) = tasks.pop() {
+                exec_subchunk_slice_task::<Q>(task, &f);
+            }
+        }
+        _ => {
+            tasks
+                .into_par_iter()
+                .for_each(|task| exec_subchunk_slice_task::<Q>(task, &f));
+        }
+    }
+}
+
 
 

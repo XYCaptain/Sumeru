@@ -316,15 +316,16 @@ impl Store {
             ));
         }
 
-        self.next_epoch()?;
+        let next_epoch = self.next_epoch()?;
         self.check_archetype_set_generation_capacity()?;
 
         let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         self.allocator = snapshot.allocator.clone();
         self.archetypes = restored_archetypes;
         self.archetype_index = restored_index;
+        self.normalize_archetypes_to_registry(Some(next_epoch));
         self.rebuild_component_archetypes_on_topology_reset();
-        self.bump_epoch();
+        self.epoch = next_epoch;
         self.bump_archetype_set_generation()?;
         poison_guard.disarm();
         Ok(())
@@ -422,6 +423,11 @@ impl Store {
                 })?;
                 let mut col = proto.empty_clone();
                 col.restore_archived_column(archived_col)?;
+                if self.layout_optimization == crate::storage::LayoutOptimization::PageAlignedGpu
+                    && !col.is_page_aligned()
+                {
+                    col.promote_to_page_aligned();
+                }
                 if col.len() != entity_len || col.len() != archived_col.row_count as usize {
                     return Err(StateError::AccessDenied(format!(
                         "Restored column {type_id} length {} does not match header row_count {} or archetype entities {}",
@@ -441,15 +447,16 @@ impl Store {
             ));
         }
 
-        self.next_epoch()?;
+        let next_epoch = self.next_epoch()?;
         self.check_archetype_set_generation_capacity()?;
 
         let mut poison_guard = CorePoisonGuard::new(&self.poisoned);
         self.allocator = snapshot.allocator;
         self.archetypes = restored_archetypes;
         self.archetype_index = restored_index;
+        self.normalize_archetypes_to_registry(Some(next_epoch));
         self.rebuild_component_archetypes_on_topology_reset();
-        self.bump_epoch();
+        self.epoch = next_epoch;
         self.bump_archetype_set_generation()?;
         poison_guard.disarm();
         Ok(())

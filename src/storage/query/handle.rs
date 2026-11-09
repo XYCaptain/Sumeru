@@ -305,7 +305,7 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
 
     /// 独占刷新缓存：持有 &mut self 时直接通过 get_mut 绕过 RwLock，彻底消除原子锁争用。
     #[inline]
-    pub(crate) fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {
+    pub fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {
         self.check_session()?;
         if store.store_id() != self.store_id {
             return Err(StateError::StoreMismatch {
@@ -317,6 +317,12 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         let cache = self.cache.get_mut().map_err(|_| StateError::SessionPoisoned)?;
         cache.refresh_for_store::<Q, F>(store, &self.filter);
         Ok(())
+    }
+
+    /// 独占刷新缓存的同义方法。
+    #[inline]
+    pub fn ensure_cache_current(&mut self, store: &Store) -> Result<(), StateError> {
+        self.ensure_cache_current_mut(store)
     }
 
     /// Refresh/check the cache under its lock, then invoke the callback WITHOUT
@@ -472,6 +478,15 @@ impl<Q: QueryMutShape> Default for QueryBuilder<Q, All> {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> QueryBuilder<Q, F> {
+    /// 使用指定的过滤器创建查询构建器。
+    #[inline]
+    pub fn with_filter(filter: F) -> Self {
+        Self {
+            filter,
+            marker: PhantomData,
+        }
+    }
+
     /// 增加包含组件 T 的硬边界过滤条件（仅校验表级原型元数据）。
     #[inline]
     pub fn with<T: 'static>(self) -> QueryBuilder<Q, With<T, F>> {
@@ -608,6 +623,46 @@ impl Store {
 }
 
 impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
+    /// 检测当前查询计划与另一查询计划是否存在组件级读写冲突（Read-Write 或 Write-Write）。
+    ///
+    /// 基于预归并的有序访问描述符列表 `(ComponentTypeId, &'static str, is_write)`（包含查询形状与过滤器读取依赖）
+    /// 执行双指针线性归并扫描，供上层多系统 DAG 并行调度器判定能否在同一并行阶段并发执行。
+    #[inline]
+    pub fn conflicts_with<Q2: QueryMutShape, F2: QueryFilter + Clone>(
+        &self,
+        other: &Query<Q2, F2>,
+    ) -> bool {
+        let a = self.descriptors();
+        let b = other.descriptors();
+        let mut i = 0;
+        let mut j = 0;
+        while i < a.len() && j < b.len() {
+            let (cid_a, _, write_a) = a[i];
+            let (cid_b, _, write_b) = b[j];
+            if cid_a == cid_b {
+                if write_a || write_b {
+                    return true;
+                }
+                i += 1;
+                j += 1;
+            } else if cid_a < cid_b {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        false
+    }
+
+    /// 判定当前查询计划与另一查询计划是否兼容（可无冲突并发执行）。
+    #[inline]
+    pub fn is_compatible_with<Q2: QueryMutShape, F2: QueryFilter + Clone>(
+        &self,
+        other: &Query<Q2, F2>,
+    ) -> bool {
+        !self.conflicts_with(other)
+    }
+
     /// 基于预编译的匹配原型表与 Level-2 槽位绑定缓存遍历只读元素。
     pub fn for_each<'store>(
         &self,
@@ -647,7 +702,7 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
     {
         let bindings = self.resolved_bindings_arc(store)?;
-        super::spec::iter::for_each_matched_chunk_ro::<Q>(store, &bindings, f);
+        super::spec::iter::for_each_matched_chunk_ro::<Q, F>(store, &bindings, &self.filter, f);
         Ok(())
     }
 
@@ -662,8 +717,273 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         store.next_epoch()?;
         let bindings = self.resolved_bindings_arc(store)?;
         store.bump_epoch();
-        super::spec::iter::for_each_matched_chunk_mut::<Q>(store, &bindings, f);
+        super::spec::iter::for_each_matched_chunk_mut::<Q, F>(store, &bindings, &self.filter, f);
         Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行只读行遍历（按 4096 行 = 64 个掩码字对齐子块切分，支持 `RowBitMask` 字级跳跃过滤）。
+    pub fn par_for_each<'store>(
+        &self,
+        store: &'store Store,
+        f: impl Fn(Q::Item<'store>) + Send + Sync,
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Item = Q::Item<'a>>,
+    {
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::par_for_each_matched_ro::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行可变行遍历（主线程统一完成 COW 解耦与 64 行脏块纪元标记，工作线程无锁并行写互不重叠的 4096 行子块）。
+    pub fn par_for_each_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl Fn(Q::Item<'store>) + Send + Sync,
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let bindings = self.resolved_bindings_arc(store)?;
+        store.bump_epoch();
+        super::spec::iter::par_for_each_matched_mut::<Q, F>(store, &bindings, &self.filter, f);
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行只读连续切片块遍历（按 4096 行子块切分，支持 `ChangedSince` 与行级掩码连续段）。
+    pub fn par_for_each_chunk<'store>(
+        &self,
+        store: &'store Store,
+        f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+    ) -> Result<(), StateError>
+    where
+        for<'a> Q::View<'a>: super::spec::QueryData<'a, Chunk = Q::Chunk<'a>>,
+    {
+        let bindings = self.resolved_bindings_arc(store)?;
+        super::spec::iter::par_for_each_matched_chunk_ro::<Q, F>(
+            store,
+            &bindings,
+            &self.filter,
+            f,
+        );
+        Ok(())
+    }
+
+    /// 基于 Rayon 的多核并行可变连续切片块遍历（按 4096 行子块切分，支持 `ChangedSince` 与行级掩码连续段）。
+    pub fn par_for_each_chunk_mut<'store>(
+        &self,
+        store: &'store mut Store,
+        f: impl Fn(Q::Chunk<'store>) + Send + Sync,
+    ) -> Result<(), StateError> {
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        store.next_epoch()?;
+        let bindings = self.resolved_bindings_arc(store)?;
+        store.bump_epoch();
+        super::spec::iter::par_for_each_matched_chunk_mut::<Q, F>(
+            store,
+            &bindings,
+            &self.filter,
+            f,
+        );
+        Ok(())
+    }
+
+    /// 基于预编译的匹配原型缓存执行两阶段原子 16KB 页对齐零拷贝 GPU 内核派发（使用线程本地默认计算引擎）。
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_for_each<K>(&self, store: &mut Store, kernel: K) -> Result<crate::storage::gpu::GpuDispatchStats, StateError>
+    where
+        Q: super::spec::QueryMutData<'static>,
+        K: crate::storage::gpu::GpuKernel<'static, Query = Q>,
+    {
+        thread_local! {
+            static DEFAULT_QUERY_METAL_ENGINE: std::cell::RefCell<crate::storage::gpu::MetalComputeEngine> =
+                std::cell::RefCell::new(crate::storage::gpu::MetalComputeEngine::new());
+        }
+        DEFAULT_QUERY_METAL_ENGINE.with(|cell| {
+            let mut engine = cell.borrow_mut();
+            self.gpu_for_each_on(store, &mut engine, kernel)
+        })
+    }
+
+    /// 基于预编译的匹配原型缓存在指定 [`MetalComputeEngine`](crate::storage::gpu::MetalComputeEngine) 上执行两阶段原子 16KB 页对齐零拷贝 GPU 派发。
+    ///
+    /// - **阶段 0**：拦截行级 CPU 谓词过滤器，校验 `Store` 归属与内核管线编译；
+    /// - **阶段 1a**：对缓存命中的非空 Archetype 执行纯只读列完整性与容量溢出校验（失败时零副作用）；
+    /// - **阶段 1b**：对匹配 Archetype 按需提升为 16KB 页对齐、执行可变列 COW 独占分离并生成零拷贝描述符；
+    /// - **阶段 2**：统一提交硬件/回退计算派发并推进 Store 与写入列的 64 行块纪元。
+    #[cfg(feature = "gpu")]
+    pub fn gpu_for_each_on<K>(
+        &self,
+        store: &mut Store,
+        engine: &mut crate::storage::gpu::MetalComputeEngine,
+        kernel: K,
+    ) -> Result<crate::storage::gpu::GpuDispatchStats, StateError>
+    where
+        Q: super::spec::QueryMutData<'static>,
+        K: crate::storage::gpu::GpuKernel<'static, Query = Q>,
+    {
+        if F::IS_ROW_FILTERED {
+            return Err(StateError::AccessDenied(
+                "GPU whole-column dispatch does not support row-level CPU predicate filters; use archetype filters (.with / .without)".into(),
+            ));
+        }
+        store.check_poisoned()?;
+        Q::validate_shape()?;
+        <Q as super::spec::QueryMutData<'static>>::validate_query();
+        let write_epoch = store.next_epoch()?;
+        let matched = self.with_matched_slice(store, |_, _| Ok(self.matched_archetypes_arc()))?;
+
+        let desc = kernel.descriptor();
+        engine.ensure_pipeline_compiled(desc)?;
+
+        struct PreparedQueryArchDispatch {
+            arch_idx: usize,
+            arch_id: ArchetypeId,
+            active_rows: usize,
+            pages_16k: usize,
+            raw_bindings: Vec<(ComponentTypeId, crate::storage::gpu::MetalNoCopyBufferDescriptor)>,
+        }
+
+        // 阶段 1a：纯只读预校验（确保任意 Archetype 异常时绝不产生半途提升、COW 解冻或纪元推进副作用）
+        let mut valid_arch_indices = Vec::with_capacity(matched.len());
+        for &arch_id in matched.iter() {
+            let arch_idx = arch_id.0 as usize;
+            let Some(archetype) = store.archetypes.get(arch_idx) else {
+                continue;
+            };
+            let active_rows = archetype.len();
+            if active_rows == 0 || !self.filter.matches_archetype(archetype) {
+                continue;
+            }
+            let comp_slice = archetype.component_types_slice();
+            if !desc
+                .bindings()
+                .iter()
+                .all(|b| comp_slice.binary_search(&b.type_id).is_ok())
+            {
+                continue;
+            }
+            let cols = archetype.columns();
+            for b in desc.bindings() {
+                let col = cols.get(&b.type_id).ok_or_else(|| {
+                    StateError::ComponentNotFound(format!("{}", b.type_id))
+                })?;
+                if col.len() != active_rows {
+                    return Err(StateError::AccessDenied(format!(
+                        "Column {} length {} does not match archetype {} active_rows {}",
+                        b.struct_name,
+                        col.len(),
+                        arch_id.0,
+                        active_rows
+                    )));
+                }
+                let _active_bytes = active_rows.checked_mul(b.elem_size).ok_or_else(|| {
+                    StateError::CapacityExhausted("GPU column active byte size overflow".into())
+                })?;
+            }
+            valid_arch_indices.push(arch_idx);
+        }
+
+        // 阶段 1b：16KB 页对齐按需提升、COW 独占分离与零拷贝描述符构造
+        let mut prepared = Vec::with_capacity(valid_arch_indices.len());
+        for arch_idx in valid_arch_indices {
+            let archetype = &mut store.archetypes[arch_idx];
+            let active_rows = archetype.len();
+            let arch_id = archetype.id();
+            let mut changed_any = false;
+            for b in desc.bindings() {
+                let needs_promote = archetype
+                    .columns()
+                    .get(&b.type_id)
+                    .is_some_and(|col| !col.is_page_aligned());
+                if needs_promote || b.mutable {
+                    let col = archetype
+                        .get_erased_column_mut(b.type_id)
+                        .expect("verified in Phase 1a");
+                    if needs_promote {
+                        col.promote_to_page_aligned();
+                    }
+                    if b.mutable {
+                        col.ensure_contiguous()?;
+                    }
+                    changed_any = true;
+                }
+            }
+            if changed_any {
+                archetype.rebuild_flat_columns();
+            }
+
+            let mut raw_bindings = Vec::with_capacity(desc.bindings().len());
+            let mut arch_pages = 0usize;
+            {
+                let cols = archetype.columns();
+                for b in desc.bindings() {
+                    let col = cols.get(&b.type_id).expect("verified in Phase 1a");
+                    let (ptr, allocated_bytes) = col.metal_raw_parts().ok_or_else(|| {
+                        StateError::AccessDenied(format!(
+                            "Column {} in archetype {} is not backed by a 16KB PageAlignedBuffer",
+                            b.struct_name, arch_id.0
+                        ))
+                    })?;
+                    let generation = col.physical_version();
+                    let active_bytes = active_rows * b.elem_size;
+                    let buf_desc =
+                        crate::storage::gpu::MetalNoCopyBufferDescriptor::validate_raw(
+                            ptr,
+                            allocated_bytes,
+                            active_bytes,
+                            generation,
+                        )?;
+                    let geom = crate::storage::gpu::PageGeometry::compute(
+                        b.elem_size,
+                        active_rows,
+                        allocated_bytes,
+                    );
+                    arch_pages += geom.page_count;
+                    raw_bindings.push((b.type_id, buf_desc));
+                }
+            }
+
+            prepared.push(PreparedQueryArchDispatch {
+                arch_idx,
+                arch_id,
+                active_rows,
+                pages_16k: arch_pages,
+                raw_bindings,
+            });
+        }
+
+        // 阶段 2：推进 Store 全局纪元，执行派发并标记写入列的 64 行块纪元
+        store.bump_epoch();
+        let mut stats = crate::storage::gpu::GpuDispatchStats {
+            execution_mode: engine.execution_mode(),
+            ..Default::default()
+        };
+        for item in prepared {
+            let (_grid, hits, misses) = unsafe {
+                engine.dispatch_archetype_raw(
+                    item.arch_id,
+                    item.active_rows,
+                    desc,
+                    &item.raw_bindings,
+                )?
+            };
+            let archetype = &mut store.archetypes[item.arch_idx];
+            <Q as super::spec::sealed::FetchMut<'static>>::mark_written_columns(
+                archetype,
+                None,
+                write_epoch,
+            );
+            stats.dispatched_archetypes += 1;
+            stats.total_rows += item.active_rows;
+            stats.total_pages_16k += item.pages_16k;
+            stats.buffer_cache_hits += hits;
+            stats.buffer_cache_misses += misses;
+        }
+
+        Ok(stats)
     }
 }
 

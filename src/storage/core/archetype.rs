@@ -26,146 +26,7 @@ unsafe impl Send for FlatColumnEntry {}
 unsafe impl Sync for FlatColumnEntry {}
 
 /// 行级位图掩码（每 64 行 1 个 `u64` 字），用于查询过滤的 SIMD/字级位与交集与 `trailing_zeros` 跳跃迭代
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowBitMask {
-    words: smallvec::SmallVec<[u64; 4]>,
-    row_len: usize,
-}
-
-impl RowBitMask {
-    /// 创建长度为 `row_len`、所有位均置 0 的空位图
-    #[inline]
-    pub fn new_empty(row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        Self {
-            words: smallvec::smallvec![0u64; num_words],
-            row_len,
-        }
-    }
-
-    /// 创建长度为 `row_len`、所有有效行位均置 1 的满位图
-    #[inline]
-    pub fn new_all_set(row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        let mut words = smallvec::smallvec![!0u64; num_words];
-        let rem = row_len & 63;
-        if rem != 0 {
-            if let Some(last) = words.last_mut() {
-                *last = (1u64 << rem) - 1;
-            }
-        }
-        Self { words, row_len }
-    }
-
-    /// 从已有字切片构造位图，并自动裁剪超出 `row_len` 的尾部高位
-    #[inline]
-    pub fn from_words(words_slice: &[u64], row_len: usize) -> Self {
-        let num_words = (row_len + 63) >> 6;
-        let mut words = smallvec::SmallVec::<[u64; 4]>::with_capacity(num_words);
-        for i in 0..num_words {
-            words.push(words_slice.get(i).copied().unwrap_or(0));
-        }
-        let rem = row_len & 63;
-        if rem != 0 {
-            if let Some(last) = words.last_mut() {
-                *last &= (1u64 << rem) - 1;
-            }
-        }
-        Self { words, row_len }
-    }
-
-    #[inline(always)]
-    pub fn row_len(&self) -> usize {
-        self.row_len
-    }
-
-    #[inline(always)]
-    pub fn words(&self) -> &[u64] {
-        &self.words
-    }
-
-    #[inline(always)]
-    pub fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.words
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, row: usize) {
-        if row < self.row_len {
-            self.words[row >> 6] |= 1u64 << (row & 63);
-        }
-    }
-
-    #[inline(always)]
-    pub fn clear_bit(&mut self, row: usize) {
-        if row < self.row_len {
-            self.words[row >> 6] &= !(1u64 << (row & 63));
-        }
-    }
-
-    #[inline(always)]
-    pub fn test(&self, row: usize) -> bool {
-        if row >= self.row_len {
-            return false;
-        }
-        (self.words[row >> 6] & (1u64 << (row & 63))) != 0
-    }
-
-    #[inline]
-    pub fn is_all_zero(&self) -> bool {
-        self.words.iter().all(|&w| w == 0)
-    }
-
-    #[inline]
-    pub fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    /// 与另一位图或字切片按位求交（`self &= other`）
-    #[inline]
-    pub fn intersect_words(&mut self, other_words: &[u64]) {
-        for (i, w) in self.words.iter_mut().enumerate() {
-            *w &= other_words.get(i).copied().unwrap_or(0);
-        }
-    }
-
-    /// 与另一位图按位求交（`self &= other`）
-    #[inline]
-    pub fn intersect_with(&mut self, other: &RowBitMask) {
-        self.intersect_words(&other.words);
-    }
-
-    /// 与另一位图或字切片按位求差（`self &= !other`）
-    #[inline]
-    pub fn difference_words(&mut self, other_words: &[u64]) {
-        let rem = self.row_len & 63;
-        let num_words = self.words.len();
-        for (i, w) in self.words.iter_mut().enumerate() {
-            let ow = other_words.get(i).copied().unwrap_or(0);
-            *w &= !ow;
-            if i + 1 == num_words && rem != 0 {
-                *w &= (1u64 << rem) - 1;
-            }
-        }
-    }
-
-    /// 利用硬件 `trailing_zeros` 指令跳跃遍历所有置 1 的行索引
-    #[inline]
-    pub fn for_each_set_row<F: FnMut(usize)>(&self, mut f: F) {
-        for (word_idx, &word) in self.words.iter().enumerate() {
-            let mut w = word;
-            let base = word_idx << 6;
-            while w != 0 {
-                let bit = w.trailing_zeros() as usize;
-                let row = base + bit;
-                if row < self.row_len {
-                    f(row);
-                }
-                w &= w - 1;
-            }
-        }
-    }
-}
+pub use crate::storage::primitives::RowBitMask;
 
 /// 关系对目标实体的表内二级倒排位图缓存（按 `columns_version` 自动惰性同步）
 #[derive(Default)]
@@ -196,6 +57,8 @@ pub(crate) struct Archetype {
     flag_planes: BTreeMap<u8, smallvec::SmallVec<[u64; 4]>>,
     /// 与 `component_types_slice` 1:1 对齐的列级 64 行块变更纪元表（惰性展开：为空时全列块共享 `default_chunk_epoch`）
     col_chunk_epochs: smallvec::SmallVec<[smallvec::SmallVec<[u64; 4]>; 8]>,
+    /// 表级 64 行块物理搬移纪元表（包含 `swap_remove` 尾行回填造成的物理内存页变更）
+    phys_chunk_epochs: smallvec::SmallVec<[u64; 4]>,
     /// 尚未发生单行细粒度分化时的默认块变更纪元
     default_chunk_epoch: u64,
     /// 关系对 `Pair<R>` 目标实体二级位图索引缓存
@@ -223,6 +86,7 @@ impl Archetype {
             remove_edges: smallvec::SmallVec::new(),
             flag_planes: BTreeMap::new(),
             col_chunk_epochs: smallvec::smallvec![smallvec::SmallVec::new(); col_count],
+            phys_chunk_epochs: smallvec::SmallVec::new(),
             default_chunk_epoch: 1,
             pair_target_index: std::sync::RwLock::new(PairTargetIndexCache::default()),
         }
@@ -249,6 +113,7 @@ impl Archetype {
             remove_edges: self.remove_edges.clone(),
             flag_planes: BTreeMap::new(),
             col_chunk_epochs: smallvec::smallvec![smallvec::SmallVec::new(); col_count],
+            phys_chunk_epochs: smallvec::SmallVec::new(),
             default_chunk_epoch: 1,
             pair_target_index: std::sync::RwLock::new(PairTargetIndexCache::default()),
         };
@@ -512,6 +377,7 @@ impl Archetype {
         for chunks in &mut self.col_chunk_epochs {
             chunks.clear();
         }
+        self.phys_chunk_epochs.clear();
         for col in self.columns.values_mut() {
             col.clear_rows();
         }
@@ -580,11 +446,18 @@ impl Archetype {
                 }
             }
         }
+        if !self.phys_chunk_epochs.is_empty() {
+            if word_idx >= self.phys_chunk_epochs.len() {
+                self.phys_chunk_epochs.resize(word_idx + 1, epoch);
+            } else {
+                self.phys_chunk_epochs[word_idx] = self.phys_chunk_epochs[word_idx].max(epoch);
+            }
+        }
     }
 
-    /// 在 `swap_remove(row)` 时同步把 `last_row` 的状态位搬移至 `row`，并维护块变更纪元
+    /// 在 `swap_remove(row)` 时同步把 `last_row` 的状态位搬移至 `row`，并维护块变更纪元与物理搬移纪元
     #[inline(always)]
-    fn on_swap_remove_row(&mut self, row: usize, last_row: usize) {
+    fn on_swap_remove_row(&mut self, row: usize, last_row: usize, phys_epoch: u64) {
         self.columns_version = self.columns_version.wrapping_add(1);
         let new_len = last_row;
         let new_words = (new_len + 63) >> 6;
@@ -618,19 +491,35 @@ impl Archetype {
         }
         let row_chunk = row >> 6;
         let last_chunk = last_row >> 6;
+        let phys_ep = phys_epoch.max(self.default_chunk_epoch);
+        if row < last_row && self.col_chunk_epochs.len() < self.component_types_slice.len() {
+            self.col_chunk_epochs
+                .resize(self.component_types_slice.len(), smallvec::SmallVec::new());
+        }
         for chunks in &mut self.col_chunk_epochs {
-            if !chunks.is_empty() {
-                if row < last_row && row_chunk < chunks.len() {
-                    let last_ep = chunks
-                        .get(last_chunk)
-                        .copied()
-                        .unwrap_or(self.default_chunk_epoch);
-                    chunks[row_chunk] = chunks[row_chunk].max(last_ep).max(self.default_chunk_epoch);
+            if row < last_row {
+                let last_ep = chunks
+                    .get(last_chunk)
+                    .copied()
+                    .unwrap_or(self.default_chunk_epoch);
+                if chunks.len() <= row_chunk {
+                    chunks.resize(new_words.max(row_chunk + 1), self.default_chunk_epoch);
                 }
-                if chunks.len() > new_words {
-                    chunks.truncate(new_words);
-                }
+                chunks[row_chunk] = chunks[row_chunk].max(last_ep).max(phys_ep);
             }
+            if chunks.len() > new_words {
+                chunks.truncate(new_words);
+            }
+        }
+        if row < last_row {
+            if self.phys_chunk_epochs.len() <= row_chunk {
+                self.phys_chunk_epochs
+                    .resize(new_words.max(row_chunk + 1), self.default_chunk_epoch);
+            }
+            self.phys_chunk_epochs[row_chunk] = self.phys_chunk_epochs[row_chunk].max(phys_ep);
+        }
+        if self.phys_chunk_epochs.len() > new_words {
+            self.phys_chunk_epochs.truncate(new_words);
         }
     }
 
@@ -702,6 +591,38 @@ impl Archetype {
         }
     }
 
+    /// 提取当前原型的非迁移行级状态位平面（供 `merge_disjoint_from` 原样转移使用）
+    #[inline]
+    pub(crate) fn take_flag_planes(
+        &mut self,
+    ) -> BTreeMap<u8, smallvec::SmallVec<[u64; 4]>> {
+        std::mem::take(&mut self.flag_planes)
+    }
+
+    /// 设置当前原型的非迁移行级状态位平面（供 `merge_disjoint_from` 原样转移使用）
+    #[inline]
+    pub(crate) fn set_flag_planes(
+        &mut self,
+        planes: BTreeMap<u8, smallvec::SmallVec<[u64; 4]>>,
+    ) {
+        self.flag_planes = planes;
+    }
+
+    /// 替换已有列的底层容器并保留原型转移边缓存（供 `reorder_entities` 等不改变列模式的操作使用）
+    #[inline]
+    pub(crate) fn replace_column_preserving_edges(
+        &mut self,
+        cid: ComponentTypeId,
+        new_col: Box<dyn AnyColumn>,
+    ) {
+        self.columns_version = self.columns_version.wrapping_add(1);
+        self.flat_columns.clear();
+        self.may_be_segmented_or_unaligned = true;
+        if let Some(slot) = self.columns.get_mut(&cid) {
+            *slot = new_col;
+        }
+    }
+
     /// 在 `reorder_entities` 重排实体顺序后，按 `old_rows_in_new_order` 同步重排行级状态位并刷新块纪元
     pub(crate) fn reorder_row_metadata(&mut self, old_rows_in_new_order: &[usize], epoch: u64) {
         self.columns_version = self.columns_version.wrapping_add(1);
@@ -723,6 +644,7 @@ impl Archetype {
         for chunks in &mut self.col_chunk_epochs {
             chunks.clear();
         }
+        self.phys_chunk_epochs.clear();
     }
 
     /// 标记指定列位置 `col_pos` 在 `row` 所在 64 行块的变更纪元
@@ -757,6 +679,56 @@ impl Archetype {
     ) {
         if let Some(pos) = self.component_types_slice.iter().position(|&c| c == cid) {
             self.mark_col_pos_row_epoch(pos, row, epoch);
+        }
+    }
+
+    /// 预分配并获取指定 `ComponentTypeId` 的 64 行块变更纪元可变切片裸指针（容量覆盖当前 `entities.len()`）
+    #[inline]
+    pub(crate) fn prepare_column_chunk_epochs_mut_ptr(&mut self, cid: ComponentTypeId) -> *mut u64 {
+        let Some(pos) = self.component_types_slice.iter().position(|&c| c == cid) else {
+            return std::ptr::null_mut();
+        };
+        if pos >= self.col_chunk_epochs.len() {
+            self.col_chunk_epochs
+                .resize(self.component_types_slice.len(), smallvec::SmallVec::new());
+        }
+        let num_chunks = (self.entities.len() + 63) >> 6;
+        let def_ep = self.default_chunk_epoch;
+        let chunks = &mut self.col_chunk_epochs[pos];
+        if chunks.len() < num_chunks {
+            chunks.resize(num_chunks, def_ep);
+        }
+        chunks.as_mut_ptr()
+    }
+
+    /// 标记指定 `ComponentTypeId` 在给定行区间覆盖的所有 64 行块的变更纪元
+    #[inline]
+    pub(crate) fn mark_column_row_range_epoch(
+        &mut self,
+        cid: ComponentTypeId,
+        row_range: std::ops::Range<usize>,
+        epoch: u64,
+    ) {
+        if row_range.is_empty() {
+            return;
+        }
+        let Some(pos) = self.component_types_slice.iter().position(|&c| c == cid) else {
+            return;
+        };
+        if pos >= self.col_chunk_epochs.len() {
+            self.col_chunk_epochs
+                .resize(self.component_types_slice.len(), smallvec::SmallVec::new());
+        }
+        let num_chunks = (self.entities.len().max(row_range.end) + 63) >> 6;
+        let def_ep = self.default_chunk_epoch;
+        let chunks = &mut self.col_chunk_epochs[pos];
+        if chunks.len() < num_chunks {
+            chunks.resize(num_chunks, def_ep);
+        }
+        let first_chunk = row_range.start >> 6;
+        let last_chunk = (row_range.end - 1) >> 6;
+        for chunk_idx in first_chunk..=last_chunk.min(chunks.len().saturating_sub(1)) {
+            chunks[chunk_idx] = chunks[chunk_idx].max(epoch);
         }
     }
 
@@ -809,14 +781,29 @@ impl Archetype {
     /// 标记某一行所有组件列所在 64 行块的变更纪元（例如新实体插入或跨表迁入该行）
     #[inline(always)]
     pub(crate) fn mark_all_columns_row_epoch(&mut self, row: usize, epoch: u64) {
-        self.default_chunk_epoch = self.default_chunk_epoch.max(epoch);
         let chunk_idx = row >> 6;
         let num_chunks = (self.entities.len().max(row + 1) + 63) >> 6;
-        let def_ep = self.default_chunk_epoch;
-        for chunks in &mut self.col_chunk_epochs {
-            if !chunks.is_empty() {
-                if chunks.len() <= chunk_idx {
-                    chunks.resize(num_chunks.max(chunk_idx + 1), def_ep);
+        if num_chunks <= 1 {
+            self.default_chunk_epoch = self.default_chunk_epoch.max(epoch);
+            let def_ep = self.default_chunk_epoch;
+            for chunks in &mut self.col_chunk_epochs {
+                if !chunks.is_empty() {
+                    if chunks.len() <= chunk_idx {
+                        chunks.resize(num_chunks.max(chunk_idx + 1), def_ep);
+                    }
+                    chunks[chunk_idx] = epoch;
+                }
+            }
+        } else {
+            if self.col_chunk_epochs.len() < self.component_types_slice.len() {
+                self.col_chunk_epochs
+                    .resize(self.component_types_slice.len(), smallvec::SmallVec::new());
+            }
+            let def_ep = self.default_chunk_epoch;
+            let target_len = num_chunks.max(chunk_idx + 1);
+            for chunks in &mut self.col_chunk_epochs {
+                if chunks.len() < target_len {
+                    chunks.resize(target_len, def_ep);
                 }
                 chunks[chunk_idx] = epoch;
             }
@@ -833,6 +820,82 @@ impl Archetype {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         Some((slice, self.default_chunk_epoch))
+    }
+
+    /// 获取当前表级物理搬移 64 行块纪元切片
+    #[inline]
+    pub(crate) fn phys_chunk_epochs(&self) -> &[u64] {
+        self.phys_chunk_epochs.as_slice()
+    }
+
+    /// 获取指定组件列合并逻辑修改纪元 (`col_chunk_epochs`) 与物理搬移纪元 (`phys_chunk_epochs`) 后的 64 行块纪元表
+    pub(crate) fn effective_gpu_chunk_epochs(
+        &self,
+        cid: ComponentTypeId,
+    ) -> (smallvec::SmallVec<[u64; 4]>, u64) {
+        let def_ep = self.default_chunk_epoch;
+        let col_slice = self
+            .component_types_slice
+            .iter()
+            .position(|&c| c == cid)
+            .and_then(|pos| self.col_chunk_epochs.get(pos))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let phys_slice = self.phys_chunk_epochs.as_slice();
+        let max_len = col_slice.len().max(phys_slice.len());
+        let mut merged = smallvec::SmallVec::with_capacity(max_len);
+        for i in 0..max_len {
+            let c_ep = col_slice.get(i).copied().unwrap_or(def_ep);
+            let p_ep = phys_slice.get(i).copied().unwrap_or(def_ep);
+            merged.push(c_ep.max(p_ep));
+        }
+        (merged, def_ep)
+    }
+
+    /// 获取当前表的默认块变更纪元
+    #[inline]
+    pub(crate) fn default_chunk_epoch(&self) -> u64 {
+        self.default_chunk_epoch
+    }
+
+    /// 将当前表的所有块默认纪元及已分配列块纪元、物理块纪元保底提升至 `epoch`（供快照恢复与分区合并同步纪元空间使用）
+    pub(crate) fn stamp_all_rows_epoch(&mut self, epoch: u64) {
+        self.default_chunk_epoch = self.default_chunk_epoch.max(epoch);
+        for chunks in &mut self.col_chunk_epochs {
+            for ep in chunks.iter_mut() {
+                *ep = (*ep).max(epoch);
+            }
+        }
+        for ep in &mut self.phys_chunk_epochs {
+            *ep = (*ep).max(epoch);
+        }
+    }
+
+    /// 标记指定行范围 `[start, end)` 上所有组件列与物理页的变更纪元
+    pub(crate) fn mark_all_columns_row_range_epoch(
+        &mut self,
+        row_range: std::ops::Range<usize>,
+        epoch: u64,
+    ) {
+        if row_range.is_empty() {
+            return;
+        }
+        let cids: smallvec::SmallVec<[ComponentTypeId; 8]> =
+            self.component_types_slice.iter().copied().collect();
+        for cid in cids {
+            self.mark_column_row_range_epoch(cid, row_range.clone(), epoch);
+        }
+        let num_chunks = (self.entities.len().max(row_range.end) + 63) >> 6;
+        if self.phys_chunk_epochs.len() < num_chunks {
+            self.phys_chunk_epochs
+                .resize(num_chunks, self.default_chunk_epoch);
+        }
+        let first_chunk = row_range.start >> 6;
+        let last_chunk = (row_range.end - 1) >> 6;
+        for chunk_idx in first_chunk..=last_chunk.min(self.phys_chunk_epochs.len().saturating_sub(1))
+        {
+            self.phys_chunk_epochs[chunk_idx] = self.phys_chunk_epochs[chunk_idx].max(epoch);
+        }
     }
 
     /// 查询或惰性构建关系对 `Pair<R>` 指向 `target` 实体的行级位图掩码
@@ -859,23 +922,12 @@ impl Archetype {
         }
         let col = self.get_column::<crate::al::Pair<R>>()?;
         let mut target_map: BTreeMap<EntityId, RowBitMask> = BTreeMap::new();
-        if let Some(slice) = col.as_slice() {
-            for (row, pair) in slice.iter().enumerate() {
-                if row < row_len {
-                    target_map
-                        .entry(pair.target)
-                        .or_insert_with(|| RowBitMask::new_empty(row_len))
-                        .set(row);
-                }
-            }
-        } else {
-            for (row, pair) in col.iter().enumerate() {
-                if row < row_len {
-                    target_map
-                        .entry(pair.target)
-                        .or_insert_with(|| RowBitMask::new_empty(row_len))
-                        .set(row);
-                }
+        for (row, pair) in col.as_slice().iter().enumerate() {
+            if row < row_len {
+                target_map
+                    .entry(pair.target)
+                    .or_insert_with(|| RowBitMask::new_empty(row_len))
+                    .set(row);
             }
         }
         let result = target_map
@@ -912,17 +964,24 @@ impl Archetype {
         row
     }
 
-    /// 仅对实体与行槽位执行同步 swap_remove（由已完成全列同步迁移的受控路径调用）
+    /// 仅对实体与行槽位执行同步 swap_remove，并以给定的 `phys_epoch` 标记物理搬移纪元
     #[inline]
-    pub(crate) fn swap_remove_entity_only(&mut self, row: usize) {
+    pub(crate) fn swap_remove_entity_only_at_epoch(&mut self, row: usize, phys_epoch: u64) {
         let last_row = self.entities.len() - 1;
-        self.on_swap_remove_row(row, last_row);
+        self.on_swap_remove_row(row, last_row, phys_epoch);
         if self.entity_slots.len() == self.entities.len() {
             self.entity_slots.swap_remove(row);
         } else {
             self.entity_slots.clear();
         }
         self.entities.swap_remove(row);
+    }
+
+    /// 仅对实体与行槽位执行同步 swap_remove（由已完成全列同步迁移的受控路径调用）
+    #[inline]
+    pub(crate) fn swap_remove_entity_only(&mut self, row: usize) {
+        let fallback_ep = self.default_chunk_epoch.saturating_add(1);
+        self.swap_remove_entity_only_at_epoch(row, fallback_ep);
     }
 
     /// 获取强类型组件列不可变引用
@@ -976,6 +1035,27 @@ impl Archetype {
             .and_then(|c| c.as_any_mut().downcast_mut::<TypedColumn<T>>())
     }
 
+    /// 按 `ComponentTypeId` 获取擦除类型列的可变引用（仅原位修改已有列内容，保持 `flat_columns` 与转移边缓存有效）
+    #[inline]
+    pub(crate) fn get_erased_column_mut(
+        &mut self,
+        type_id: ComponentTypeId,
+    ) -> Option<&mut dyn AnyColumn> {
+        if !self.may_be_segmented_or_unaligned
+            && self.flat_columns.len() == self.component_types_slice.len()
+        {
+            let pos = self
+                .component_types_slice
+                .iter()
+                .position(|&id| id == type_id)?;
+            let entry = unsafe { *self.flat_columns.get_unchecked(pos) };
+            self.columns_version = self.columns_version.wrapping_add(1);
+            return Some(unsafe { &mut *entry.col_ptr });
+        }
+        self.columns_version = self.columns_version.wrapping_add(1);
+        self.columns.get_mut(&type_id).map(|c| c.as_mut())
+    }
+
     /// 按 ComponentTypeId 获取强类型组件列可变引用，并校验类型一致性
     #[inline]
     pub fn get_typed_column_mut<T: ModelComponent + Serialize + DeserializeOwned + 'static>(
@@ -1015,6 +1095,70 @@ impl Archetype {
                 expected: std::any::type_name::<T>().to_string(),
                 actual: type_name.to_string(),
             })
+    }
+
+    /// 按 `ComponentTypeId` 校验并获取单行强类型可变引用，仅在列类型与行边界均合法时推进 `columns_version` 与块纪元
+    #[inline]
+    pub(crate) fn get_typed_column_row_mut_at_epoch<
+        T: ModelComponent + Serialize + DeserializeOwned + 'static,
+    >(
+        &mut self,
+        cid: ComponentTypeId,
+        entity: EntityId,
+        row: usize,
+        epoch: u64,
+    ) -> Result<Option<&mut T>, StateError> {
+        if !self.may_be_segmented_or_unaligned
+            && self.flat_columns.len() == self.component_types_slice.len()
+        {
+            let pos = self
+                .component_types_slice
+                .iter()
+                .position(|&id| id == cid)
+                .ok_or_else(|| StateError::ComponentNotFoundInEntity {
+                    entity,
+                    type_name: std::any::type_name::<T>().to_string(),
+                })?;
+            let entry = unsafe { *self.flat_columns.get_unchecked(pos) };
+            if entry.rust_type == Some(std::any::TypeId::of::<T>()) {
+                let typed_ptr = entry.col_ptr as *mut () as *mut TypedColumn<T>;
+                let col_len = unsafe { (*typed_ptr).len() };
+                if row >= col_len {
+                    return Ok(None);
+                }
+                self.columns_version = self.columns_version.wrapping_add(1);
+                self.mark_col_pos_row_epoch(pos, row, epoch);
+                return Ok(unsafe { (*typed_ptr).get_mut(row) });
+            }
+        }
+        let col_len = {
+            let col = self.columns.get(&cid).ok_or_else(|| {
+                StateError::ComponentNotFoundInEntity {
+                    entity,
+                    type_name: std::any::type_name::<T>().to_string(),
+                }
+            })?;
+            let type_name = col.type_name();
+            let typed = col
+                .as_any()
+                .downcast_ref::<TypedColumn<T>>()
+                .ok_or_else(|| StateError::TypeMismatch {
+                    expected: std::any::type_name::<T>().to_string(),
+                    actual: type_name.to_string(),
+                })?;
+            typed.len()
+        };
+        if row >= col_len {
+            return Ok(None);
+        }
+        self.columns_version = self.columns_version.wrapping_add(1);
+        self.mark_column_row_epoch(cid, row, epoch);
+        let typed = self
+            .columns
+            .get_mut(&cid)
+            .and_then(|c| c.as_any_mut().downcast_mut::<TypedColumn<T>>())
+            .expect("validated typed column");
+        Ok(typed.get_mut(row))
     }
 
     /// 按 ComponentTypeId 获取强类型组件列裸指针（用于多列互斥借用，调用方必须保证 cid 互不相同）
@@ -1112,22 +1256,33 @@ impl Archetype {
             )));
         }
         self.co_materialize_segmented_columns()?;
-        Ok(self.swap_remove_materialized(row))
+        let fallback_ep = self.default_chunk_epoch.saturating_add(1);
+        Ok(self.swap_remove_materialized(row, fallback_ep))
     }
 
     /// 在前置校验保证行号有效的前提下，执行不可失败的 Swap-Remove
     pub fn swap_remove_infallible(&mut self, row: usize) -> Option<EntityId> {
+        let fallback_ep = self.default_chunk_epoch.saturating_add(1);
+        self.swap_remove_infallible_at_epoch(row, fallback_ep)
+    }
+
+    /// 在前置校验保证行号有效的前提下，执行不可失败的 Swap-Remove 并以 `phys_epoch` 标记物理脏页
+    pub(crate) fn swap_remove_infallible_at_epoch(
+        &mut self,
+        row: usize,
+        phys_epoch: u64,
+    ) -> Option<EntityId> {
         if self.may_be_segmented_or_unaligned {
             self.co_materialize_segmented_columns()
                 .expect("validated structural column materialization");
         }
-        self.swap_remove_materialized(row)
+        self.swap_remove_materialized(row, phys_epoch)
     }
 
-    fn swap_remove_materialized(&mut self, row: usize) -> Option<EntityId> {
+    fn swap_remove_materialized(&mut self, row: usize, phys_epoch: u64) -> Option<EntityId> {
         let last_row = self.entities.len() - 1;
         let is_last = row == last_row;
-        self.on_swap_remove_row(row, last_row);
+        self.on_swap_remove_row(row, last_row, phys_epoch);
         if self.entity_slots.len() == self.entities.len() {
             self.entity_slots.swap_remove(row);
         } else {
@@ -1163,6 +1318,7 @@ impl Clone for Archetype {
             .iter()
             .map(|(&type_id, col)| (type_id, col.clone_box()))
             .collect();
+        let col_count = self.component_types_slice.len();
         let mut arch = Self {
             id: self.id,
             component_types: self.component_types.clone(),
@@ -1176,8 +1332,9 @@ impl Clone for Archetype {
             add_edges: self.add_edges.clone(),
             remove_edges: self.remove_edges.clone(),
             flag_planes: self.flag_planes.clone(),
-            col_chunk_epochs: self.col_chunk_epochs.clone(),
-            default_chunk_epoch: self.default_chunk_epoch,
+            col_chunk_epochs: smallvec::smallvec![smallvec::SmallVec::new(); col_count],
+            phys_chunk_epochs: smallvec::SmallVec::new(),
+            default_chunk_epoch: 1,
             pair_target_index: std::sync::RwLock::new(PairTargetIndexCache::default()),
         };
         arch.rebuild_flat_columns();
