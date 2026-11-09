@@ -243,13 +243,11 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectBuilder<'a, Q, F> {
     }
 }
 
-/// CPU 多核只读并行查询执行器（由 [`SelectBuilder::par`] 创建，采用 1024 行 Morsel-Driven 连续切片并行，零行级堆分配）。
+/// CPU 多核只读并行查询执行器（由 [`SelectBuilder::par`] 创建，采用 [`SubchunkPlanner`](crate::storage::primitives::SubchunkPlanner) 自适应缓存驻留切块，零行级堆分配）。
 #[must_use = "a parallel query runner does no work until .for_each(...) or .run(...) is called"]
 pub struct SelectParRunner<'a, Q: QueryData<'a>, F: QueryFilter = All> {
     builder: SelectBuilder<'a, Q, F>,
 }
-
-const SELECT_PAR_MORSEL_ROWS: usize = 1024;
 
 struct ParReadTable<'a> {
     archetype: &'a Archetype,
@@ -263,6 +261,8 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectParRunner<'a, Q, F> {
         V: Fn(Q::Item) + Send + Sync,
     {
         use rayon::prelude::*;
+        let morsel_rows = crate::storage::primitives::SubchunkPlanner::default()
+            .subchunk_rows(Q::total_row_width());
         let mut tables = Vec::new();
         for archetype in self.builder.archetypes.iter() {
             let arch_len = archetype.len();
@@ -286,10 +286,10 @@ impl<'a, Q: QueryData<'a>, F: QueryFilter> SelectParRunner<'a, Q, F> {
 
         tables.par_iter().for_each(|table| {
             let arch_len = table.archetype.len();
-            let num_morsels = (arch_len + SELECT_PAR_MORSEL_ROWS - 1) / SELECT_PAR_MORSEL_ROWS;
+            let num_morsels = (arch_len + morsel_rows - 1) / morsel_rows;
             (0..num_morsels).into_par_iter().for_each(|morsel_idx| {
-                let morsel_start = morsel_idx * SELECT_PAR_MORSEL_ROWS;
-                let morsel_end = (morsel_start + SELECT_PAR_MORSEL_ROWS).min(arch_len);
+                let morsel_start = morsel_idx * morsel_rows;
+                let morsel_end = (morsel_start + morsel_rows).min(arch_len);
                 if morsel_start >= morsel_end {
                     return;
                 }

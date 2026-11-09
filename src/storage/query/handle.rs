@@ -303,6 +303,12 @@ impl<Q: QueryMutShape, F: QueryFilter + Clone> Query<Q, F> {
         &self.filter
     }
 
+    /// 动态更新过滤器链中所有 [`ChangedSince`](crate::storage::query::spec::ChangedSince) 节点的 `since_epoch` 游标（不改变原型拓扑匹配缓存）。
+    #[inline]
+    pub fn set_filter_since_epoch(&mut self, epoch: u64) {
+        self.filter.update_since_epoch(epoch);
+    }
+
     /// 独占刷新缓存：持有 &mut self 时直接通过 get_mut 绕过 RwLock，彻底消除原子锁争用。
     #[inline]
     pub fn ensure_cache_current_mut(&mut self, store: &Store) -> Result<(), StateError> {

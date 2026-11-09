@@ -927,6 +927,11 @@ impl<'a, Q: QueryMutData<'a>> sealed::FetchMut<'a> for (EntityId, Q) {
     fn required_mask() -> u16 {
         Q::required_mask()
     }
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<EntityId>() + Q::total_row_width()
+    }
 }
 
 impl<'a, Q: QueryData<'a>> QueryData<'a> for (EntityId, Q) {
@@ -968,6 +973,10 @@ impl<'a, Q: QueryData<'a>> sealed::Fetch<'a> for (EntityId, Q) {
     ) -> Option<(<Self as QueryData<'a>>::Chunk, usize)> {
         Q::fast_chunk_bound(archetype, col_slots, start)
     }
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<EntityId>() + Q::total_row_width()
+    }
 }
 
 /// 64 行掩码字对齐的默认 CPU 并行子块大小（向后兼容回退常量：4096 行）。
@@ -1007,17 +1016,19 @@ fn resolve_archetype_buffers_mut<Q: QueryMutShape>(
             break;
         }
     }
-    if has_write {
-        arch.bump_columns_version_in_place();
+    if !has_write {
+        return resolve_archetype_buffers_ro::<Q>(&*arch);
     }
+    // split_for_query_mut 内部已推进 columns_version += 1（用于使 PairTargetIndex 等按需缓存失效）
     let (_, _, _, _, cols) = arch.split_for_query_mut();
     let mut descs =
         smallvec::SmallVec::<[(ComponentTypeId, ColumnDescriptor); 8]>::with_capacity(wanted.len());
     for (cid, _, is_write) in wanted {
-        let col = cols.get_mut(&cid)?;
         let desc = if is_write {
+            let col = cols.get_mut(&cid)?;
             ColumnDescriptor::from_column(&mut **col)
         } else {
+            let col = cols.get(&cid)?;
             ColumnDescriptor::from_column_ref(&**col)
         };
         if desc.len != len {
@@ -1528,20 +1539,34 @@ fn exec_subchunk_row_task<'store, Q>(
 #[inline]
 fn exec_subchunk_slice_task<'store, Q>(
     task: ParSubchunkTask<'store, Q::ArchetypeBuffers>,
-    f: &(impl Fn(Q::Chunk<'store>) + Send + Sync),
+    f: &impl Fn(Q::Chunk<'store>),
 ) where
     Q: QueryMutShape,
 {
     let mut cursor = Q::Cursor::default();
-    let chunk = unsafe {
-        Q::chunk(
-            &task.entities[task.range.clone()],
-            &task.buffers,
-            task.range,
-            &mut cursor,
-        )
-    };
-    f(chunk);
+    if let Some(mask) = &task.filtered_mask {
+        for_each_contiguous_mask_run(mask, task.range.start, task.range.end, |run| {
+            let chunk = unsafe {
+                Q::chunk(
+                    &task.entities[run.clone()],
+                    &task.buffers,
+                    run,
+                    &mut cursor,
+                )
+            };
+            f(chunk);
+        });
+    } else {
+        let chunk = unsafe {
+            Q::chunk(
+                &task.entities[task.range.clone()],
+                &task.buffers,
+                task.range,
+                &mut cursor,
+            )
+        };
+        f(chunk);
+    }
 }
 
 /// 基于 Rayon 的按 4096 行（64 个掩码字）子块并行只读行遍历。
@@ -1689,6 +1714,28 @@ impl<'store, Q: QueryMutShape> PreparedParTasks<'store, Q> {
         let run_one = |task: ParSubchunkTask<'store, Q::ArchetypeBuffers>| -> S {
             let state = std::cell::RefCell::new(S::default());
             exec_subchunk_row_task::<Q>(task, &|item| f(item, &mut state.borrow_mut()));
+            state.into_inner()
+        };
+        let tasks = self.tasks;
+        if tasks.len() <= 1 {
+            tasks.into_iter().map(run_one).collect()
+        } else {
+            tasks.into_par_iter().map(run_one).collect()
+        }
+    }
+
+    /// 并行执行全部连续切片子块，每个子块持有独立的 `S` 状态（如命令缓冲），按**任务序**返回。
+    ///
+    /// 若存在行级过滤器，每个子块只把通过过滤的连续行区间（Contiguous Mask Runs）以切片形式喂给闭包，
+    /// 适合 SIMD / 向量化批处理系统（[`ParChunkQuerySystem`](crate::schedule::ParChunkQuerySystem)）。
+    pub(crate) fn execute_chunks_with_state<S: Default + Send>(
+        self,
+        f: &(impl Fn(Q::Chunk<'store>, &mut S) + Send + Sync),
+    ) -> Vec<S> {
+        use rayon::prelude::*;
+        let run_one = |task: ParSubchunkTask<'store, Q::ArchetypeBuffers>| -> S {
+            let state = std::cell::RefCell::new(S::default());
+            exec_subchunk_slice_task::<Q>(task, &|chunk| f(chunk, &mut state.borrow_mut()));
             state.into_inner()
         };
         let tasks = self.tasks;

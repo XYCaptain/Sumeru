@@ -19,6 +19,7 @@
 //! | [`ExclusiveFunctionSystem`] | `&mut Store` | 否（恒独占） | 直接修改 |
 //! | [`QuerySystem`] | `&mut Query` + `&mut Store` | 否（恒独占，读写集仅用于诊断） | 直接修改 |
 //! | [`ParQuerySystem`] | 仅 `Q::Item` 与 [`Commands`] | 是 | 经 `Commands` 在同步点应用 |
+//! | [`ParChunkQuerySystem`] | 仅 `Q::Chunk` 连续切片与 [`Commands`] | 是 | 经 `Commands` 在同步点应用 |
 //!
 //! 并行系统只能通过 [`System::prepare_parallel`] 进入并行 Stage：主线程用 [`PrepareContext`]
 //! 完成全部 `Store` 元数据访问（缓存刷新、COW 解耦、纪元标记），返回的 [`ParallelJob`]
@@ -42,7 +43,7 @@ pub type ParallelJob<'w> = Box<dyn FnOnce() -> Result<Commands, StateError> + Se
 
 /// 并行 Stage 准备阶段上下文（仅在主线程、Stage 内顺序构造）。
 ///
-/// 同一 Stage 的所有系统共享同一个 `stage_epoch`：Stage 开始前 `Store` 纪元只推进一次，
+/// 同一 Stage 的所有系统共享同一个 `stage_epoch`：Stage 开始前（若存在写入）`Store` 纪元只推进一次，
 /// 并行作业期间不再有任何线程写 `Store` 级元数据（消除 P0-3 共享元数据竞争）。
 pub struct PrepareContext<'w> {
     store: &'w mut Store,
@@ -168,8 +169,9 @@ where
 
 /// 单查询系统：闭包同时拿到 `&mut Query` 与 `&mut Store`，因此**恒为独占**。
 ///
-/// `access()` 仍携带由 `Q` 与过滤器推导出的读写集（`exclusive == true`），供诊断与歧义报告使用。
-/// 需要并行执行时请使用 [`ParQuerySystem`]。
+/// - `access()` 仍携带由 `Q` 与过滤器推导出的读写集、原型谓词与行标志位（`exclusive == true`），供诊断与歧义报告使用；
+/// - 自动维护 `last_run_epoch` 游标，使 [`ChangedSince`](crate::storage::query::spec::ChangedSince) 跨帧/跨 Tick 自动只匹配上次运行后的增量变更；
+/// - 需要并行执行时请使用 [`ParQuerySystem`] 或 [`ParChunkQuerySystem`]。
 pub struct QuerySystem<Q, F, Func>
 where
     Q: QueryMutShape,
@@ -180,11 +182,19 @@ where
     query: Option<Query<Q, F>>,
     func: Func,
     access: AccessDescriptor,
+    last_run_epoch: Option<u64>,
 }
 
-/// 由查询形态与过滤器推导访问描述符（含行级过滤器读取的列，修复 P0-4）
+/// 由查询形态与过滤器推导访问描述符：
+/// 1. 合并 `Q` 与行级过滤器的组件读写集（修复 P0-4）；
+/// 2. 提取 `Q` 必选组件与 `With<T>` / `Without<T>` 过滤器谓词至 `with_components` / `without_components`，
+///    启用互不相交原型并发剪枝；
+/// 3. 提取 `WithFlag<FLAG>` / `WithoutFlag<FLAG>` 读取的行级标志位掩码至 `reads_flags`。
 fn deduce_access<Q: QueryMutShape, F: QueryFilter>(filter: &F) -> AccessDescriptor {
     let mut access = AccessDescriptor::new();
+    for (cid, _, _) in Q::access_descriptors() {
+        access.with_components.insert(cid);
+    }
     for (cid, _, is_write) in crate::storage::query::spec::merged_access_descriptors::<Q, F>(filter) {
         if is_write {
             access.writes.insert(cid);
@@ -192,6 +202,16 @@ fn deduce_access<Q: QueryMutShape, F: QueryFilter>(filter: &F) -> AccessDescript
             access.reads.insert(cid);
         }
     }
+    let mut reqs = Vec::new();
+    filter.archetype_requirements(&mut reqs);
+    for (cid, must_have) in reqs {
+        if must_have {
+            access.with_components.insert(cid);
+        } else {
+            access.without_components.insert(cid);
+        }
+    }
+    access.reads_flags = filter.filter_read_flags();
     access
 }
 
@@ -228,7 +248,21 @@ where
             query: None,
             func,
             access,
+            last_run_epoch: None,
         }
+    }
+
+    /// 声明该系统写入的行级标志位掩码（用于 `WithFlag` 冲突与歧义检测）
+    #[inline]
+    pub fn with_write_flag(mut self, flag_mask: u8) -> Self {
+        self.access.writes_flags |= flag_mask;
+        self
+    }
+
+    /// 可变访问描述符
+    #[inline]
+    pub fn access_mut(&mut self) -> &mut AccessDescriptor {
+        &mut self.access
     }
 }
 
@@ -255,22 +289,30 @@ where
     #[inline]
     fn run(&mut self, store: &mut Store) -> Result<(), StateError> {
         store.check_poisoned()?;
+        if let Some(ep) = self.last_run_epoch {
+            self.filter.update_since_epoch(ep);
+            if let Some(q) = &mut self.query {
+                q.set_filter_since_epoch(ep);
+            }
+        }
         // 每次运行前按拓扑代号增量重验：前序 Stage 新建的原型在本 Stage 可见（P1-4）
         ensure_query(&mut self.query, &self.filter, store)?;
         if let Some(query) = &mut self.query {
             (self.func)(query, store);
         }
+        self.last_run_epoch = Some(store.epoch());
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// 3. 可进入并行 Stage 的逐行查询系统
+// 3. 可进入并行 Stage 的逐行查询系统 (`ParQuerySystem`)
 // ---------------------------------------------------------------------------
 
 /// 并行逐行查询系统：闭包只能看到 `Q::Item` 与本子块的 [`Commands`]，看不到 `Store`。
 ///
-/// - 读写集由 `Q` 与过滤器读集合并推导，受类型系统强制；
+/// - 读写集、原型 `With`/`Without` 谓词及行标志位由 `Q` 与过滤器自动推导，受类型系统强制；
+/// - 自动维护 `last_run_epoch` 游标，使 [`ChangedSince`](crate::storage::query::spec::ChangedSince) 跨帧自动推进；
 /// - 准备阶段（主线程）完成缓存刷新、写列 COW 解耦与 Stage 纪元标记；
 /// - 执行阶段按 `SubchunkPlanner` 子块并行，每个子块持有独立命令缓冲，按任务序拼接。
 pub struct ParQuerySystem<Q, F, Func>
@@ -283,6 +325,7 @@ where
     query: Option<Query<Q, F>>,
     func: Func,
     access: AccessDescriptor,
+    last_run_epoch: Option<u64>,
 }
 
 impl<Q, F, Func> ParQuerySystem<Q, F, Func>
@@ -299,7 +342,21 @@ where
             query: None,
             func,
             access,
+            last_run_epoch: None,
         }
+    }
+
+    /// 声明该系统（例如通过 `Commands::set_flag`）写入的行级标志位掩码
+    #[inline]
+    pub fn with_write_flag(mut self, flag_mask: u8) -> Self {
+        self.access.writes_flags |= flag_mask;
+        self
+    }
+
+    /// 可变访问描述符
+    #[inline]
+    pub fn access_mut(&mut self) -> &mut AccessDescriptor {
+        &mut self.access
     }
 }
 
@@ -330,7 +387,14 @@ where
         let stage_epoch = ctx.stage_epoch();
         let store = ctx.into_store();
         Q::validate_shape()?;
+        if let Some(ep) = self.last_run_epoch {
+            self.filter.update_since_epoch(ep);
+            if let Some(q) = &mut self.query {
+                q.set_filter_since_epoch(ep);
+            }
+        }
         ensure_query(&mut self.query, &self.filter, store)?;
+        self.last_run_epoch = Some(stage_epoch);
         let this: &'w Self = self;
         let Some(query) = this.query.as_ref() else {
             return Ok(Box::new(|| Ok(Commands::new())));
@@ -354,7 +418,120 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// 4. IntoSystem 自动实现
+// 4. 可进入并行 Stage 的连续切片查询系统 (`ParChunkQuerySystem`)
+// ---------------------------------------------------------------------------
+
+/// 并行连续切片查询系统：闭包接收 `Q::Chunk<'a>`（例如 `(&[EntityId], (&mut [Pos], &[Vel]))`）与本子块的 [`Commands`]。
+///
+/// - 专为 SIMD 向量化与批处理热循环设计，消除逐行函数调用开销；
+/// - 若配置了行级过滤器（如 `ChangedSince<T>`、`WithFlag<FLAG>`），底层自动将掩码连续 `1` 区间
+///   （Contiguous Mask Runs）切分为紧致连续切片喂给闭包，兼顾行级过滤与连续内存访问。
+pub struct ParChunkQuerySystem<Q, F, Func>
+where
+    Q: QueryMutShape,
+    F: QueryFilter + Clone,
+{
+    name: &'static str,
+    filter: F,
+    query: Option<Query<Q, F>>,
+    func: Func,
+    access: AccessDescriptor,
+    last_run_epoch: Option<u64>,
+}
+
+impl<Q, F, Func> ParChunkQuerySystem<Q, F, Func>
+where
+    Q: QueryMutShape,
+    F: QueryFilter + Clone + Send + Sync + 'static,
+    Func: for<'a> Fn(Q::Chunk<'a>, &mut Commands) + Send + Sync + 'static,
+{
+    pub fn new(name: &'static str, filter: F, func: Func) -> Self {
+        let access = deduce_access::<Q, F>(&filter);
+        Self {
+            name,
+            filter,
+            query: None,
+            func,
+            access,
+            last_run_epoch: None,
+        }
+    }
+
+    /// 声明该系统写入的行级标志位掩码
+    #[inline]
+    pub fn with_write_flag(mut self, flag_mask: u8) -> Self {
+        self.access.writes_flags |= flag_mask;
+        self
+    }
+
+    /// 可变访问描述符
+    #[inline]
+    pub fn access_mut(&mut self) -> &mut AccessDescriptor {
+        &mut self.access
+    }
+}
+
+impl<Q, F, Func> System for ParChunkQuerySystem<Q, F, Func>
+where
+    Q: QueryMutShape,
+    F: QueryFilter + Clone + Send + Sync + 'static,
+    Func: for<'a> Fn(Q::Chunk<'a>, &mut Commands) + Send + Sync + 'static,
+{
+    #[inline(always)]
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[inline(always)]
+    fn access(&self) -> &AccessDescriptor {
+        &self.access
+    }
+
+    fn initialize(&mut self, store: &Store) -> Result<(), StateError> {
+        ensure_query(&mut self.query, &self.filter, store)
+    }
+
+    fn prepare_parallel<'w>(
+        &'w mut self,
+        ctx: PrepareContext<'w>,
+    ) -> Result<ParallelJob<'w>, StateError> {
+        let stage_epoch = ctx.stage_epoch();
+        let store = ctx.into_store();
+        Q::validate_shape()?;
+        if let Some(ep) = self.last_run_epoch {
+            self.filter.update_since_epoch(ep);
+            if let Some(q) = &mut self.query {
+                q.set_filter_since_epoch(ep);
+            }
+        }
+        ensure_query(&mut self.query, &self.filter, store)?;
+        self.last_run_epoch = Some(stage_epoch);
+        let this: &'w Self = self;
+        let Some(query) = this.query.as_ref() else {
+            return Ok(Box::new(|| Ok(Commands::new())));
+        };
+        let bindings = query.resolved_bindings_arc(store)?;
+        let tasks = crate::storage::query::spec::iter::prepare_par_matched_mut_tasks::<Q, F>(
+            store,
+            &bindings,
+            &this.filter,
+            stage_epoch,
+        );
+        let func = &this.func;
+        Ok(Box::new(move || {
+            let mut merged = Commands::new();
+            for mut chunk in tasks.execute_chunks_with_state::<Commands>(&|slice_chunk, cmds| {
+                func(slice_chunk, cmds)
+            }) {
+                merged.append(&mut chunk);
+            }
+            Ok(merged)
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. IntoSystem 自动实现与构造函数
 // ---------------------------------------------------------------------------
 
 pub struct ExclusiveMarker;
@@ -381,7 +558,7 @@ where
     }
 }
 
-/// 辅助宏：快速创建具名独占系统
+/// 辅助函数：快速创建具名独占系统
 #[inline]
 pub fn exclusive_system(
     name: &'static str,
@@ -442,10 +619,37 @@ where
     ParQuerySystem::new(name, All, func)
 }
 
+/// 创建带过滤条件、可进入并行 Stage 的连续切片查询系统（SIMD / 向量化友好）
+pub fn par_chunk_query_system<Q, F, Func>(
+    name: &'static str,
+    filter: F,
+    func: Func,
+) -> ParChunkQuerySystem<Q, F, Func>
+where
+    Q: QueryMutShape,
+    F: QueryFilter + Clone + Send + Sync + 'static,
+    Func: for<'a> Fn(Q::Chunk<'a>, &mut Commands) + Send + Sync + 'static,
+{
+    ParChunkQuerySystem::new(name, filter, func)
+}
+
+/// 创建无过滤条件、可进入并行 Stage 的连续切片查询系统（SIMD / 向量化友好）
+pub fn simple_par_chunk_query_system<Q, Func>(
+    name: &'static str,
+    func: Func,
+) -> ParChunkQuerySystem<Q, All, Func>
+where
+    Q: QueryMutShape,
+    Func: for<'a> Fn(Q::Chunk<'a>, &mut Commands) + Send + Sync + 'static,
+{
+    ParChunkQuerySystem::new(name, All, func)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::id::ComponentTypeId;
+    use crate::storage::query::spec::{With, WithFlag, Without};
 
     #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Pos {
@@ -479,20 +683,39 @@ mod tests {
         assert_eq!(sys.access().reads.len(), 1);  // Vel
         assert!(sys.access().writes.contains(&ComponentTypeId::of::<Pos>()));
         assert!(sys.access().reads.contains(&ComponentTypeId::of::<Vel>()));
+        assert!(sys.access().with_components.contains(&ComponentTypeId::of::<Pos>()));
+        assert!(sys.access().with_components.contains(&ComponentTypeId::of::<Vel>()));
     }
 
     #[test]
-    fn test_par_query_system_access_includes_filter_reads() {
-        let filter = crate::storage::query::spec::ChangedSince::<Frozen>::new(All, 0);
-        let sys = par_query_system::<(&mut Pos, &Vel), _, _>("movement", filter, |(_e, (p, v)), _cmds| {
-            p.x += v.dx;
+    fn test_par_query_system_access_includes_filter_reads_and_predicates() {
+        let filter = (
+            crate::storage::query::spec::ChangedSince::<Frozen>::new(All, 0),
+            Without::<Vel>::new(All),
+            WithFlag::<2>::new(All),
+        );
+        let sys = par_query_system::<&mut Pos, _, _>("movement", filter, |(_e, p), _cmds| {
+            p.x += 1.0;
         });
 
         assert!(!sys.access().exclusive);
         assert!(sys.access().writes.contains(&ComponentTypeId::of::<Pos>()));
-        assert!(sys.access().reads.contains(&ComponentTypeId::of::<Vel>()));
         // P0-4：行级过滤器读取的列必须登记进读集
         assert!(sys.access().reads.contains(&ComponentTypeId::of::<Frozen>()));
+        // 原型必选/排除集合与行标志位掩码自动推导
+        assert!(sys.access().with_components.contains(&ComponentTypeId::of::<Pos>()));
+        assert!(sys.access().without_components.contains(&ComponentTypeId::of::<Vel>()));
+        assert_eq!(sys.access().reads_flags, 1u8 << 2);
+
+        let sys_with_vel = par_query_system::<&mut Pos, _, _>(
+            "vel_movement",
+            With::<Vel>::new(All),
+            |(_e, p), _cmds| {
+                p.x += 1.0;
+            },
+        );
+        assert!(sys.access().is_archetype_disjoint(sys_with_vel.access()));
+        assert!(!sys.access().conflicts_with(sys_with_vel.access()));
     }
 
     #[test]

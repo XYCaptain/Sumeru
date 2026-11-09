@@ -225,8 +225,13 @@ impl Schedule {
     ) -> Result<(), StateError> {
         // ---- 阶段 A：主线程顺序准备 ----
         store.check_poisoned()?;
-        store.next_epoch()?;
-        store.bump_epoch();
+        let stage_has_writes = entries.iter().enumerate().any(|(idx, e)| {
+            in_stage[idx] && (!e.access.writes.is_empty() || e.access.writes_flags != 0)
+        });
+        if stage_has_writes {
+            store.next_epoch()?;
+            store.bump_epoch();
+        }
         let stage_epoch = store.epoch();
 
         let store_ptr: *mut Store = store;
@@ -241,7 +246,8 @@ impl Schedule {
             // 2. 返回的 `ParallelJob` 不持有 `Store`/`Archetype` 引用（`PrepareContext` 的 Store
             //    访问器为 crate 私有，作业只持有列缓冲区与实体切片的物理指针）；
             // 3. 后续系统的准备阶段只解耦/标记**其自身写集**的列，Stage 内读写集经冲突矩阵
-            //    证明两两不相交，且不做任何结构修改，因此不会移动或改写先前作业持有的缓冲区；
+            //    证明两两不相交（或匹配原型集合严格互不相交），且不做任何结构修改，
+            //    因此不会移动或改写先前作业持有的缓冲区；
             // 4. 所有作业在本函数返回前执行完毕并被消费，之后才重新使用 `store`。
             let ctx = PrepareContext::new(unsafe { &mut *store_ptr }, stage_epoch);
             jobs.push(entry.system.prepare_parallel(ctx)?);
@@ -287,9 +293,10 @@ impl Schedule {
 mod tests {
     use super::*;
     use crate::schedule::system::{
-        exclusive_system, par_query_system, simple_par_query_system, simple_query_system,
+        exclusive_system, par_chunk_query_system, par_query_system, simple_par_chunk_query_system,
+        simple_par_query_system, simple_query_system,
     };
-    use crate::storage::query::spec::{All, ChangedSince};
+    use crate::storage::query::spec::{All, ChangedSince, With, WithFlag, Without};
     use crate::{EntityBundle, EntityId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -683,5 +690,188 @@ mod tests {
             cmds.push(|_s| Err(StateError::AccessDenied("boom".into())));
         }));
         assert!(schedule.run(&mut store).is_err());
+    }
+
+    #[test]
+    fn test_archetype_disjoint_systems_share_parallel_stage() {
+        let mut store = Store::new();
+        let n = scaled(200);
+        for i in 1..=n {
+            let e = EntityId::from_u128(i);
+            if i % 2 == 0 {
+                // 偶数实体带 Health
+                let b = EntityBundle::new()
+                    .with(Pos { x: 1 })
+                    .unwrap()
+                    .with(Health { hp: 50 })
+                    .unwrap();
+                store.create_entity(e, b).unwrap();
+            } else {
+                // 奇数实体不带 Health
+                let b = EntityBundle::new().with(Pos { x: 1 }).unwrap();
+                store.create_entity(e, b).unwrap();
+            }
+        }
+
+        let mut schedule = Schedule::new();
+        // 两个系统都可变写入 Pos，但一个限定 With<Health>，另一个限定 Without<Health>
+        // 静态证明匹配原型集合严格互不相交 → 合并进同一个并行 Stage 且无歧义！
+        let s_with = schedule
+            .add_system(par_query_system::<&mut Pos, _, _>(
+                "move_with_health",
+                With::<Health>::new(All),
+                |(_e, p), _c| p.x += 10,
+            ))
+            .id();
+        let s_without = schedule
+            .add_system(par_query_system::<&mut Pos, _, _>(
+                "move_without_health",
+                Without::<Health>::new(All),
+                |(_e, p), _c| p.x += 100,
+            ))
+            .id();
+
+        schedule.build(&store).unwrap();
+        assert_eq!(schedule.stages().len(), 1);
+        assert!(schedule.stages()[0].systems.contains(&s_with));
+        assert!(schedule.stages()[0].systems.contains(&s_without));
+        assert!(schedule.ambiguities().is_empty());
+
+        schedule.run(&mut store).unwrap();
+
+        for (e, p) in store.query::<&Pos>().iter() {
+            if e.to_u128() % 2 == 0 {
+                assert_eq!(p.x, 11);
+            } else {
+                assert_eq!(p.x, 101);
+            }
+        }
+    }
+
+    #[test]
+    fn test_changed_since_cursor_auto_advances_across_ticks() {
+        let mut store = Store::new();
+        let n = scaled(128);
+        spawn_tracks(&mut store, n);
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_in = Arc::clone(&seen);
+
+        let mut schedule = Schedule::new();
+        // 监听 TrackA 的增量变更（初始 since_epoch = 0）
+        schedule.add_system(par_query_system::<&mut TrackB, _, _>(
+            "react_to_a",
+            ChangedSince::<TrackA>::new(All, 0),
+            move |(_e, b), _c| {
+                b.0 += 1;
+                seen_in.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        schedule.build(&store).unwrap();
+
+        // Tick 1：所有初始创建的实体 epoch > 0，全部命中
+        schedule.run(&mut store).unwrap();
+        assert_eq!(seen.swap(0, Ordering::Relaxed), n as usize);
+
+        // Tick 2：TrackA 未发生任何写入，last_run_epoch 自动游标使本次命中数为 0！
+        schedule.run(&mut store).unwrap();
+        assert_eq!(seen.swap(0, Ordering::Relaxed), 0);
+
+        // 外部仅修改实体 1 的 TrackA（触发该 64 行块纪元更新）
+        store
+            .replace_component(EntityId::from_u128(1), TrackA(999))
+            .unwrap();
+
+        // Tick 3：只有实体 1 所在的 64 行块被 ChangedSince 命中（<= 64 行）
+        schedule.run(&mut store).unwrap();
+        let matched = seen.swap(0, Ordering::Relaxed);
+        assert!(matched >= 1 && matched <= 64, "matched={matched}");
+
+        // Tick 4：再次无修改，命中数归零
+        schedule.run(&mut store).unwrap();
+        assert_eq!(seen.swap(0, Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_par_chunk_query_system_and_entity_commands_integration() {
+        let mut store = Store::new();
+        let n = scaled(200);
+        spawn_tracks(&mut store, n);
+        // 标记前 5 个实体的 flag 0
+        for i in 1..=5 {
+            store.set_flag::<0>(EntityId::from_u128(i), true).unwrap();
+        }
+
+        let mut schedule = Schedule::new();
+        // 系统 1：无过滤的连续切片并行系统，批量把 TrackA += TrackB，并为实体 1..=3 挂载 Pos 组件
+        schedule.add_system(simple_par_chunk_query_system::<(&mut TrackA, &TrackB), _>(
+            "simd_chunk_ab",
+            |(entities, (a_slice, b_slice)), cmds| {
+                for ((&e, a), b) in entities.iter().zip(a_slice.iter_mut()).zip(b_slice.iter()) {
+                    a.0 += b.0;
+                    if e.to_u128() <= 3 {
+                        cmds.entity(e).insert(Pos { x: a.0 });
+                    }
+                }
+            },
+        ));
+        // 系统 2：带行级过滤器 WithFlag<0> 的连续切片并行系统，仅更新带 Flag 0 的实体的 TrackC
+        schedule.add_system(par_chunk_query_system::<&mut TrackC, _, _>(
+            "flagged_chunk_c",
+            WithFlag::<0>::new(All),
+            |(_entities, c_slice), _cmds| {
+                for c in c_slice {
+                    c.0 += 50;
+                }
+            },
+        ));
+
+        schedule.build(&store).unwrap();
+        // 两个切片系统读写集不相交（A/B vs C + Flag0），必须在同一并行 Stage 执行
+        assert_eq!(schedule.stages().len(), 1);
+
+        schedule.run(&mut store).unwrap();
+
+        for (e, (a, c)) in store.query::<(&TrackA, &TrackC)>().iter() {
+            assert_eq!(a.0, 10);
+            if e.to_u128() <= 5 {
+                assert_eq!(c.0, 150);
+            } else {
+                assert_eq!(c.0, 100);
+            }
+        }
+        // 验证通过 Commands::entity(e).insert(...) 结构化挂载的 Pos 组件已在同步点生效
+        let mut pos_count = 0;
+        for (e, p) in store.query::<&Pos>().iter() {
+            assert!(e.to_u128() <= 3);
+            assert_eq!(p.x, 10);
+            pos_count += 1;
+        }
+        assert_eq!(pos_count, 3);
+    }
+
+    #[test]
+    fn test_read_only_parallel_stage_does_not_bump_store_epoch() {
+        let mut store = Store::new();
+        spawn_tracks(&mut store, 16);
+        let epoch_before = store.epoch();
+
+        let mut schedule = Schedule::new();
+        let sum = Arc::new(AtomicUsize::new(0));
+        let sum1 = Arc::clone(&sum);
+        let sum2 = Arc::clone(&sum);
+        schedule.add_system(simple_par_query_system::<&TrackB, _>("ro1", move |(_e, b), _c| {
+            sum1.fetch_add(b.0 as usize, Ordering::Relaxed);
+        }));
+        schedule.add_system(simple_par_query_system::<&TrackC, _>("ro2", move |(_e, c), _c| {
+            sum2.fetch_add(c.0 as usize, Ordering::Relaxed);
+        }));
+        schedule.build(&store).unwrap();
+        assert_eq!(schedule.stages().len(), 1);
+
+        schedule.run(&mut store).unwrap();
+        assert_eq!(sum.load(Ordering::Relaxed), 16 * (10 + 100));
+        // 纯只读并行 Stage 不推进 Store 全局写纪元
+        assert_eq!(store.epoch(), epoch_before);
     }
 }

@@ -115,6 +115,19 @@ impl AmbiguityDetector {
                             }
                         }
 
+                        let flag_ww = desc_a.writes_flags & desc_b.writes_flags;
+                        if flag_ww != 0 {
+                            conflicts_detail.push(format!("Write-Write conflict on row flags 0x{flag_ww:02x}"));
+                        }
+                        let flag_wr = desc_a.writes_flags & desc_b.reads_flags;
+                        if flag_wr != 0 {
+                            conflicts_detail.push(format!("Write-Read conflict on row flags 0x{flag_wr:02x}"));
+                        }
+                        let flag_rw = desc_a.reads_flags & desc_b.writes_flags;
+                        if flag_rw != 0 {
+                            conflicts_detail.push(format!("Read-Write conflict on row flags 0x{flag_rw:02x}"));
+                        }
+
                         ambiguities.push(AmbiguityPair {
                             sys_a: SystemId(i as u32),
                             sys_a_name: names[i],

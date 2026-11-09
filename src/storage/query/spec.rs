@@ -303,6 +303,12 @@ pub trait QueryFilter: sealed::Filter + Send + Sync + 'static {
             f(cid, name);
         }
     }
+
+    /// 返回当前过滤器链中涉及读取的 `RowFlags` 位掩码（`bit i == 1` 表示读取 `FLAG = i`）
+    #[inline]
+    fn filter_read_flags(&self) -> u8 {
+        <Self as sealed::Filter>::collect_read_flags(self)
+    }
 }
 
 // Borrow-local predicate preparation, shared by grouped selection and native
@@ -410,7 +416,8 @@ pub struct With<T, F = All> {
 }
 
 impl<T: 'static, F> With<T, F> {
-    pub(crate) fn new(previous: F) -> Self {
+    #[inline]
+    pub fn new(previous: F) -> Self {
         Self {
             previous,
             type_id: ComponentTypeId::of::<T>(),
@@ -435,7 +442,8 @@ pub struct Without<T, F = All> {
 }
 
 impl<T: 'static, F> Without<T, F> {
-    pub(crate) fn new(previous: F) -> Self {
+    #[inline]
+    pub fn new(previous: F) -> Self {
         Self {
             previous,
             type_id: ComponentTypeId::of::<T>(),
@@ -522,6 +530,10 @@ pub(crate) mod sealed {
 
     pub(crate) trait Fetch<'a> {
         type State;
+        #[inline]
+        fn total_row_width() -> usize {
+            0
+        }
         fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)>;
         #[inline(always)]
         fn fast_prepare_bound(
@@ -555,6 +567,10 @@ pub(crate) mod sealed {
 
     pub(crate) trait FetchMut<'a> {
         type State;
+        #[inline]
+        fn total_row_width() -> usize {
+            0
+        }
         fn prepare(
             columns: &[(ComponentTypeId, ColumnDescriptor)],
             range: Range<usize>,
@@ -626,6 +642,10 @@ pub(crate) mod sealed {
 
     pub(crate) trait ReadParam<'a>: QueryMutParam<'a> {
         type ReadState: 'a;
+        #[inline]
+        fn element_size() -> usize {
+            0
+        }
         fn prepare_read(archetype: &'a Archetype, start: usize) -> Option<(Self::ReadState, usize)>;
         #[inline(always)]
         fn fast_prepare_read_slot(
@@ -660,6 +680,10 @@ pub(crate) mod sealed {
     pub(crate) trait ParamFetch<'a> {
         type State: 'a;
         const IS_REQUIRED: bool = true;
+        #[inline]
+        fn element_size() -> usize {
+            0
+        }
         fn component_type_id() -> ComponentTypeId;
         fn type_name() -> &'static str;
         #[allow(dead_code)]
@@ -771,6 +795,14 @@ pub(crate) mod sealed {
         fn matches_archetype_internal<H: ArchetypeHeader + ?Sized>(&self, archetype: &H) -> bool;
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>);
         fn collect_archetype_requirements(&self, out: &mut Vec<(ComponentTypeId, bool)>);
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            0
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, _epoch: u64) {}
 
         #[inline]
         fn matches_row_internal<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, row: usize) -> bool {
@@ -888,6 +920,16 @@ pub(crate) mod sealed {
         }
 
         #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
+        }
+
+        #[inline]
         fn matches_row_internal<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, row: usize) -> bool {
             self.previous.matches_row_internal(accessor, row)
         }
@@ -934,6 +976,16 @@ pub(crate) mod sealed {
         #[inline]
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
             self.previous.collect_read_components(out);
+        }
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
         }
 
         #[inline]
@@ -985,6 +1037,17 @@ pub(crate) mod sealed {
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
             self.0.collect_read_components(out);
             self.1.collect_read_components(out);
+        }
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.0.collect_read_flags() | self.1.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.0.update_since_epoch(epoch);
+            self.1.update_since_epoch(epoch);
         }
 
         #[inline]
@@ -1044,6 +1107,18 @@ pub(crate) mod sealed {
         }
 
         #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.0.collect_read_flags() | self.1.collect_read_flags() | self.2.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.0.update_since_epoch(epoch);
+            self.1.update_since_epoch(epoch);
+            self.2.update_since_epoch(epoch);
+        }
+
+        #[inline]
         fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
             self.0.apply_row_mask(accessor, mask)
                 && self.1.apply_row_mask(accessor, mask)
@@ -1096,6 +1171,16 @@ pub(crate) mod sealed {
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
             self.previous.collect_read_components(out);
             out.insert(ComponentTypeId::of::<C>(), std::any::type_name::<C>());
+        }
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
         }
 
         #[inline]
@@ -1178,6 +1263,16 @@ pub(crate) mod sealed {
         }
 
         #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
+        }
+
+        #[inline]
         fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
             if !self.previous.apply_row_mask(accessor, mask) {
                 return false;
@@ -1251,6 +1346,16 @@ pub(crate) mod sealed {
         }
 
         #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags() | (1u8 << FLAG)
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
+        }
+
+        #[inline]
         fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
             if !self.previous.apply_row_mask(accessor, mask) {
                 return false;
@@ -1304,6 +1409,16 @@ pub(crate) mod sealed {
         }
 
         #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags() | (1u8 << FLAG)
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
+        }
+
+        #[inline]
         fn apply_row_mask<A: RowColumnAccessor + ?Sized>(&self, accessor: &A, mask: &mut RowBitMask) -> bool {
             if !self.previous.apply_row_mask(accessor, mask) {
                 return false;
@@ -1351,6 +1466,17 @@ pub(crate) mod sealed {
         fn collect_read_components(&self, out: &mut std::collections::BTreeMap<ComponentTypeId, &'static str>) {
             self.previous.collect_read_components(out);
             out.insert(ComponentTypeId::of::<T>(), std::any::type_name::<T>());
+        }
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
+            self.since_epoch = epoch;
         }
 
         #[inline]
@@ -1428,6 +1554,16 @@ pub(crate) mod sealed {
                 ComponentTypeId::of::<crate::al::Pair<R>>(),
                 std::any::type_name::<crate::al::Pair<R>>(),
             );
+        }
+
+        #[inline]
+        fn collect_read_flags(&self) -> u8 {
+            self.previous.collect_read_flags()
+        }
+
+        #[inline]
+        fn update_since_epoch(&mut self, epoch: u64) {
+            self.previous.update_since_epoch(epoch);
         }
 
         #[inline]
@@ -1533,6 +1669,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
     type ReadState = ColumnIter<'a, T>;
 
     #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn prepare_read(archetype: &'a Archetype, start: usize) -> Option<(Self::ReadState, usize)> {
         let col = archetype.get_column::<T>()?;
         if col.len() != archetype.len() {
@@ -1599,6 +1740,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a>
 
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ReadParam<'a> for Option<&'a T> {
     type ReadState = Option<ColumnIter<'a, T>>;
+
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
 
     #[inline]
     fn prepare_read(archetype: &'a Archetype, start: usize) -> Option<(Self::ReadState, usize)> {
@@ -1689,6 +1835,10 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryData<'a> for &'a
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for &'a T {
     type State = ColumnIter<'a, T>;
     #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+    #[inline]
     fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
         <&'a T as sealed::ReadParam<'a>>::prepare_read(archetype, start)
     }
@@ -1739,6 +1889,10 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryData<'a> for Opt
 
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::Fetch<'a> for Option<&'a T> {
     type State = Option<ColumnIter<'a, T>>;
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
     #[inline]
     fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
         <Option<&'a T> as sealed::ReadParam<'a>>::prepare_read(archetype, start)
@@ -1791,6 +1945,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutParam<'a> for
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a> for &'a mut T {
     type State = std::slice::IterMut<'a, T>;
     const IS_REQUIRED: bool = true;
+
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
 
     #[inline]
     fn component_type_id() -> ComponentTypeId {
@@ -1940,6 +2099,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
     const IS_REQUIRED: bool = true;
 
     #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn component_type_id() -> ComponentTypeId {
         ComponentTypeId::of::<T>()
     }
@@ -2085,6 +2249,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutParam<'a> for
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a> for Option<&'a T> {
     type State = Option<std::slice::Iter<'a, T>>;
     const IS_REQUIRED: bool = false;
+
+    #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
 
     #[inline]
     fn component_type_id() -> ComponentTypeId {
@@ -2266,6 +2435,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::ParamFetch<'a
     const IS_REQUIRED: bool = false;
 
     #[inline]
+    fn element_size() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn component_type_id() -> ComponentTypeId {
         ComponentTypeId::of::<T>()
     }
@@ -2442,6 +2616,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> 
     type State = std::slice::IterMut<'a, T>;
 
     #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    #[inline]
     fn prepare(
         columns: &[(ComponentTypeId, ColumnDescriptor)],
         range: Range<usize>,
@@ -2576,6 +2755,11 @@ impl<'a, T: ModelComponent + Serialize + DeserializeOwned> QueryMutData<'a> for 
 
 impl<'a, T: ModelComponent + Serialize + DeserializeOwned> sealed::FetchMut<'a> for &'a T {
     type State = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn total_row_width() -> usize {
+        std::mem::size_of::<T>()
+    }
 
     #[inline]
     fn prepare(
@@ -2722,6 +2906,10 @@ macro_rules! tuple_query {
         {
             type State = ($(<$name as sealed::ReadParam<'a>>::ReadState,)+);
             #[inline]
+            fn total_row_width() -> usize {
+                $(<$name as sealed::ReadParam<'a>>::element_size() +)+ 0
+            }
+            #[inline]
             fn prepare(archetype: &'a Archetype, start: usize) -> Option<(Self::State, usize)> {
                 let cols = ($(
                     $name::prepare_read(archetype, start)?,
@@ -2820,6 +3008,11 @@ macro_rules! tuple_query_mut {
 
         impl<'a, $($P: QueryMutParam<'a>),+> sealed::FetchMut<'a> for ($($P,)+) {
             type State = ($($P::State,)+);
+
+            #[inline]
+            fn total_row_width() -> usize {
+                $(<$P as sealed::ParamFetch<'a>>::element_size() +)+ 0
+            }
 
             #[inline]
             #[allow(non_snake_case)]

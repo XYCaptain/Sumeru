@@ -135,6 +135,65 @@ impl CommandBuffer {
         Self::new_with_limits(store_id, epoch, CommandLimits::default())
     }
 
+    /// 创建未绑定存储实例的延迟命令缓冲（供并行调度子块在无 `&Store` 下录制，同步点重绑）
+    #[inline]
+    pub(crate) fn new_unbound() -> Self {
+        Self::new(0, 0)
+    }
+
+    /// 在同步点将缓冲重绑到目标 `Store` 的当前 `store_id` 与 `epoch`
+    #[inline]
+    pub(crate) fn rebind_to_store(&mut self, store: &Store) {
+        self.store_id = store.store_id();
+        self.epoch = store.epoch();
+    }
+
+    /// 缓冲是否包含待应用的实体命令或录制期挂起错误
+    #[inline]
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.entries.is_empty() || self.deferred_error.is_some()
+    }
+
+    /// 是否有挂起的录制期错误
+    #[inline]
+    pub(crate) fn has_deferred_error(&self) -> bool {
+        self.deferred_error.is_some()
+    }
+
+    /// 是否仅包含无池化引用的纯 `Create`/`Delete` 条目（支持跨子块缓冲零拷贝合并为单次事务提交）
+    #[inline]
+    pub(crate) fn can_merge_simple_entries(&self) -> bool {
+        self.deferred_error.is_none()
+            && self.pool.is_empty()
+            && self.in_place_patches == 0
+            && self.structural_patches == 0
+            && self.conditional_patches == 0
+            && self.empty_patches == 0
+            && self
+                .entries
+                .iter()
+                .all(|(_, e)| matches!(e, CommandEntry::Create(_) | CommandEntry::Delete))
+    }
+
+    /// 将另一个纯 `Create`/`Delete` 缓冲的条目按序合并入当前缓冲
+    pub(crate) fn merge_simple_from(&mut self, other: &mut CommandBuffer) {
+        for (id, entry) in other.entries.drain(..) {
+            match entry {
+                CommandEntry::Create(bundle) => {
+                    self.create_entity(id, bundle);
+                }
+                CommandEntry::Delete => {
+                    self.delete_entity(id);
+                }
+                _ => unreachable!("checked by can_merge_simple_entries"),
+            }
+        }
+        other.index.clear();
+        other.component_op_count = 0;
+        other.creates = 0;
+        other.deletes = 0;
+    }
+
     /// 创建带有限额配置的命令缓冲（包内受控构造）
     pub(crate) fn new_with_limits(store_id: u64, epoch: u64, limits: CommandLimits) -> Self {
         Self {

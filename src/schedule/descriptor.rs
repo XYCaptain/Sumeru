@@ -20,13 +20,21 @@ use crate::id::ComponentTypeId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SystemId(pub u32);
 
-/// 系统对组件与全局世界的访问权限描述符
+/// 系统对组件、原型谓词、行标志位与全局世界的访问权限描述符
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccessDescriptor {
     /// 只读组件集合
     pub reads: BTreeSet<ComponentTypeId>,
     /// 可变写入组件集合
     pub writes: BTreeSet<ComponentTypeId>,
+    /// 原型级必须包含的组件集合（来自查询必选列与 `With<T>` 过滤器，用于互不相交原型剪枝）
+    pub with_components: BTreeSet<ComponentTypeId>,
+    /// 原型级必须排除的组件集合（来自 `Without<T>` 过滤器，用于互不相交原型剪枝）
+    pub without_components: BTreeSet<ComponentTypeId>,
+    /// 读取的实体行级标志位掩码（`WithFlag<FLAG>` / `WithoutFlag<FLAG>`）
+    pub reads_flags: u8,
+    /// 写入的实体行级标志位掩码
+    pub writes_flags: u8,
     /// 是否需要对 Store 的独占结构访问（例如创建/销毁实体、添加/删除组件、全局清空）
     pub exclusive: bool,
 }
@@ -42,9 +50,8 @@ impl AccessDescriptor {
     #[inline]
     pub fn new_exclusive() -> Self {
         Self {
-            reads: BTreeSet::new(),
-            writes: BTreeSet::new(),
             exclusive: true,
+            ..Self::default()
         }
     }
 
@@ -62,6 +69,34 @@ impl AccessDescriptor {
         self
     }
 
+    /// 注册一个原型级必选组件谓词（`With<T>` 或查询必选列）
+    #[inline]
+    pub fn with_archetype_with(mut self, type_id: ComponentTypeId) -> Self {
+        self.with_components.insert(type_id);
+        self
+    }
+
+    /// 注册一个原型级排除组件谓词（`Without<T>`）
+    #[inline]
+    pub fn with_archetype_without(mut self, type_id: ComponentTypeId) -> Self {
+        self.without_components.insert(type_id);
+        self
+    }
+
+    /// 注册读取的行级标志位掩码（如 `WithFlag<FLAG>`）
+    #[inline]
+    pub fn with_read_flag(mut self, flag_mask: u8) -> Self {
+        self.reads_flags |= flag_mask;
+        self
+    }
+
+    /// 注册写入的行级标志位掩码
+    #[inline]
+    pub fn with_write_flag(mut self, flag_mask: u8) -> Self {
+        self.writes_flags |= flag_mask;
+        self
+    }
+
     /// 标记为需要独占访问
     #[inline]
     pub fn with_exclusive(mut self, exclusive: bool) -> Self {
@@ -74,57 +109,89 @@ impl AccessDescriptor {
         self.exclusive |= other.exclusive;
         self.reads.extend(other.reads.iter().copied());
         self.writes.extend(other.writes.iter().copied());
+        self.with_components.extend(other.with_components.iter().copied());
+        self.without_components.extend(other.without_components.iter().copied());
+        self.reads_flags |= other.reads_flags;
+        self.writes_flags |= other.writes_flags;
     }
 
-    /// 判定本描述符与另一个描述符是否存在读写或写写冲突
+    /// 静态判定两个系统的匹配原型集合是否严格互不相交（Archetype Disjointness）
     ///
-    /// 冲突条件（Zhao et al. 2026 定理 1）：
-    /// 1. 任一方需要全局独占访问（`exclusive`）；
-    /// 2. $Writes_1 \cap Writes_2 \neq \emptyset$（写写冲突）；
-    /// 3. $Writes_1 \cap Reads_2 \neq \emptyset$（写读冲突）；
-    /// 4. $Reads_1 \cap Writes_2 \neq \emptyset$（读写冲突）。
+    /// 当 $With_1 \cap Without_2 \neq \emptyset$ 或 $With_2 \cap Without_1 \neq \emptyset$ 时，
+    /// 两个查询在物理上不可能匹配同一张 `Archetype` 表（从而不可能触碰同一个列缓冲区或同一行实体）。
     #[inline]
-    pub fn conflicts_with(&self, other: &AccessDescriptor) -> bool {
-        if self.exclusive || other.exclusive {
+    pub fn is_archetype_disjoint(&self, other: &AccessDescriptor) -> bool {
+        self.with_components
+            .iter()
+            .any(|c| other.without_components.contains(c))
+            || other
+                .with_components
+                .iter()
+                .any(|c| self.without_components.contains(c))
+    }
+
+    #[inline]
+    fn has_component_or_flag_conflict(&self, other: &AccessDescriptor) -> bool {
+        // 1. 组件写写 / 写读 / 读写冲突
+        if self.writes.iter().any(|w| other.writes.contains(w) || other.reads.contains(w))
+            || self.reads.iter().any(|r| other.writes.contains(r))
+        {
             return true;
         }
 
-        // 1. 写写冲突
-        if self.writes.iter().any(|w| other.writes.contains(w)) {
-            return true;
-        }
-
-        // 2. 写读冲突 (self 写，other 读)
-        if self.writes.iter().any(|w| other.reads.contains(w)) {
-            return true;
-        }
-
-        // 3. 读写冲突 (self 读，other 写)
-        if self.reads.iter().any(|r| other.writes.contains(r)) {
+        // 2. 行级标志位写写 / 写读 / 读写冲突
+        if (self.writes_flags & (other.writes_flags | other.reads_flags)) != 0
+            || (other.writes_flags & self.reads_flags) != 0
+        {
             return true;
         }
 
         false
     }
 
-    /// 是否为不透明独占描述符（独占且未声明任何组件读写，例如 `ExclusiveFunctionSystem`）
+    /// 判定本描述符与另一个描述符是否存在读写或写写冲突
+    ///
+    /// 冲突条件（Zhao et al. 2026 定理 1 + 原型互不相交精化）：
+    /// 1. 任一方需要全局独占访问（`exclusive`）；
+    /// 2. 若双方匹配原型集合严格互不相交（[`is_archetype_disjoint`](Self::is_archetype_disjoint)，
+    ///    如 `With<Player>` vs `Without<Player>`），即使写同一组件 `Pos`，也访问完全不同的 `Archetype`
+    ///    物理表与列缓冲区，因此**不冲突**，可进入同一并行 Stage；
+    /// 3. 否则检验组件集合与行级标志位是否存在写写 / 写读 / 读写重叠。
+    #[inline]
+    pub fn conflicts_with(&self, other: &AccessDescriptor) -> bool {
+        if self.exclusive || other.exclusive {
+            return true;
+        }
+        if self.is_archetype_disjoint(other) {
+            return false;
+        }
+        self.has_component_or_flag_conflict(other)
+    }
+
+    /// 是否为不透明独占描述符（独占且未声明任何组件/标志位读写，例如 `ExclusiveFunctionSystem`）
     #[inline]
     pub fn is_opaque_exclusive(&self) -> bool {
-        self.exclusive && self.reads.is_empty() && self.writes.is_empty()
+        self.exclusive
+            && self.reads.is_empty()
+            && self.writes.is_empty()
+            && self.reads_flags == 0
+            && self.writes_flags == 0
     }
 
     /// 歧义报告用的冲突判定（与调度用的 [`conflicts_with`](Self::conflicts_with) 区分）。
     ///
     /// - 调度层面：任一方 `exclusive` 即冲突（独占系统必须独占一个 Stage）；
-    /// - 歧义层面：若独占系统声明了读写集（如 `QuerySystem`），只有真实的组件重叠才构成
-    ///   “执行顺序影响结果”的歧义；未声明读写集的不透明独占系统与任何系统都视为歧义。
+    /// - 歧义层面：若独占系统声明了读写集（如 `QuerySystem`），只有真实的组件/标志位重叠且原型非互不相交
+    ///   才构成“执行顺序影响结果”的歧义；未声明读写集的不透明独占系统与任何系统都视为歧义。
     #[inline]
     pub fn ambiguity_conflicts_with(&self, other: &AccessDescriptor) -> bool {
         if self.is_opaque_exclusive() || other.is_opaque_exclusive() {
             return true;
         }
-        self.writes.iter().any(|w| other.writes.contains(w) || other.reads.contains(w))
-            || self.reads.iter().any(|r| other.writes.contains(r))
+        if self.is_archetype_disjoint(other) {
+            return false;
+        }
+        self.has_component_or_flag_conflict(other)
     }
 }
 
@@ -159,6 +226,39 @@ mod tests {
         let sys5 = AccessDescriptor::new_exclusive();
         assert!(sys5.conflicts_with(&sys2));
         assert!(sys2.conflicts_with(&sys5));
+    }
+
+    #[test]
+    fn test_archetype_disjoint_eliminates_false_conflict() {
+        let cid_pos = ComponentTypeId::from_name("Pos");
+        let cid_player = ComponentTypeId::from_name("Player");
+
+        // 两个系统都写 Pos，但一个限制 With<Player>，另一个限制 Without<Player>
+        let player_move = AccessDescriptor::new()
+            .with_write(cid_pos)
+            .with_archetype_with(cid_pos)
+            .with_archetype_with(cid_player);
+        let npc_move = AccessDescriptor::new()
+            .with_write(cid_pos)
+            .with_archetype_with(cid_pos)
+            .with_archetype_without(cid_player);
+
+        assert!(player_move.is_archetype_disjoint(&npc_move));
+        assert!(!player_move.conflicts_with(&npc_move));
+        assert!(!player_move.ambiguity_conflicts_with(&npc_move));
+    }
+
+    #[test]
+    fn test_row_flag_conflict_detection() {
+        let reader = AccessDescriptor::new().with_read_flag(0b0001);
+        let reader2 = AccessDescriptor::new().with_read_flag(0b0001);
+        let writer_same = AccessDescriptor::new().with_write_flag(0b0001);
+        let writer_other = AccessDescriptor::new().with_write_flag(0b0010);
+
+        assert!(!reader.conflicts_with(&reader2));
+        assert!(reader.conflicts_with(&writer_same));
+        assert!(!reader.conflicts_with(&writer_other));
+        assert!(writer_same.conflicts_with(&writer_same));
     }
 
     #[test]

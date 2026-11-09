@@ -277,13 +277,11 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryMutBuilder<'a, Q, F> {
     }
 }
 
-/// CPU 多核并行查询执行器（由 [`QueryMutBuilder::par`] 创建，采用 1024 行 Morsel-Driven 连续列块并行，零行级堆分配）。
+/// CPU 多核并行查询执行器（由 [`QueryMutBuilder::par`] 创建，采用 [`SubchunkPlanner`](crate::storage::primitives::SubchunkPlanner) 自适应缓存驻留切块，零行级堆分配）。
 #[must_use = "a parallel query runner does no work until .for_each(...) or .run(...) is called"]
 pub struct QueryParMutRunner<'a, Q: QueryMutData<'a>, F: QueryFilter = All> {
     builder: QueryMutBuilder<'a, Q, F>,
 }
-
-const PAR_MORSEL_ROWS: usize = 1024;
 
 struct ParMutTableSegment<'a> {
     entities: &'a [EntityId],
@@ -300,6 +298,8 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryParMutRunner<'a, Q, F> {
     {
         use rayon::prelude::*;
         Q::validate_query();
+        let morsel_rows = crate::storage::primitives::SubchunkPlanner::default()
+            .subchunk_rows(Q::total_row_width());
         let mut segments = Vec::new();
 
         for archetype in self.builder.archetypes.iter_mut() {
@@ -335,10 +335,10 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> QueryParMutRunner<'a, Q, F> {
 
         segments.par_iter().for_each(|seg| {
             let seg_len = seg.seg_range.len();
-            let num_morsels = (seg_len + PAR_MORSEL_ROWS - 1) / PAR_MORSEL_ROWS;
+            let num_morsels = (seg_len + morsel_rows - 1) / morsel_rows;
             (0..num_morsels).into_par_iter().for_each(|morsel_idx| {
-                let start = seg.seg_range.start + morsel_idx * PAR_MORSEL_ROWS;
-                let end = (start + PAR_MORSEL_ROWS).min(seg.seg_range.end);
+                let start = seg.seg_range.start + morsel_idx * morsel_rows;
+                let end = (start + morsel_rows).min(seg.seg_range.end);
                 if start >= end {
                     return;
                 }
@@ -917,6 +917,7 @@ impl<'a, Q: QueryMutData<'a>, F: QueryFilter> Iterator for QueryMutChunksIter<'a
                         continue;
                     }
                 }
+                // M10-4：QueryMutChunksIter 向调用方暴露整张原型（或整段）的可变切片，因此必须标记全部块为已写
                 Q::mark_written_columns(archetype, None, self.write_epoch);
                 if !archetype.may_be_segmented_or_unaligned()
                     && archetype.flat_columns().len() == archetype.component_types_slice().len()
