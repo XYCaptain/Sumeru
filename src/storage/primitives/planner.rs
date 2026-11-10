@@ -22,8 +22,9 @@
 //!      彻底避免原硬编码 4096 行占用 2MB 导致 L1/L2 缓存抖动（Cache Thrashing）。
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
-/// 默认 CPU L1/L2 缓存驻留目标工作集容量：32KB（32768 字节）
+/// 回退默认 CPU L1/L2 缓存驻留目标工作集容量：32KB（32768 字节）
 pub const DEFAULT_TARGET_BYTES: usize = 32 * 1024;
 
 /// 子块最小行数：64 行（对应单个 64 位机器字与 64B/128B 缓存行整数倍）
@@ -31,6 +32,69 @@ pub const MIN_SUBCHUNK_ROWS: usize = 64;
 
 /// 子块最大行数：32768 行（防止过大造成任务粗粒度负载不均衡）
 pub const MAX_SUBCHUNK_ROWS: usize = 32768;
+
+static DETECTED_L1D_BYTES: OnceLock<usize> = OnceLock::new();
+
+/// 解析操作系统缓存容量字符串（如 `"32K"`、`"48K"`、`"128K"`、`"1M"` 或纯字节数）
+#[inline]
+pub(crate) fn parse_cache_size_str(raw: &str) -> Option<usize> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(num) = s.strip_suffix(['K', 'k']) {
+        num.trim().parse::<usize>().ok()?.checked_mul(1024)
+    } else if let Some(num) = s.strip_suffix(['M', 'm']) {
+        num.trim().parse::<usize>().ok()?.checked_mul(1024 * 1024)
+    } else if let Some(num) = s.strip_suffix(['B', 'b']) {
+        num.trim().parse::<usize>().ok()
+    } else {
+        s.parse::<usize>().ok()
+    }
+}
+
+fn probe_hardware_l1d_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        for idx in 0..4 {
+            let base = format!("/sys/devices/system/cpu/cpu0/cache/index{idx}");
+            let level = std::fs::read_to_string(format!("{base}/level")).ok()?;
+            if level.trim() != "1" {
+                continue;
+            }
+            let kind = std::fs::read_to_string(format!("{base}/type")).unwrap_or_default();
+            let kind_trimmed = kind.trim();
+            if kind_trimmed.eq_ignore_ascii_case("Data")
+                || kind_trimmed.eq_ignore_ascii_case("Unified")
+            {
+                if let Ok(size_str) = std::fs::read_to_string(format!("{base}/size")) {
+                    if let Some(bytes) = parse_cache_size_str(&size_str) {
+                        if bytes >= 4096 {
+                            return Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        // Apple Silicon 统一内存架构：P 核 L1D 为 128KB，E 核 L1D 为 64KB，取 64KB 保守下界
+        return Some(64 * 1024);
+    }
+    None
+}
+
+/// 探测当前主机 CPU 的 L1 数据缓存容量（字节），结果通过 `OnceLock` 进程级缓存（首次探测后 0 系统调用开销）。
+/// 若当前平台不支持探测或处于受限沙箱环境，自动回退至 [`DEFAULT_TARGET_BYTES`]（32KB）。
+#[inline]
+pub fn detect_l1d_cache_bytes() -> usize {
+    *DETECTED_L1D_BYTES.get_or_init(|| {
+        probe_hardware_l1d_bytes()
+            .map(|b| b.clamp(16 * 1024, 256 * 1024))
+            .unwrap_or(DEFAULT_TARGET_BYTES)
+    })
+}
 
 /// 缓存感知自适应子块规划器
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,13 +105,19 @@ pub struct SubchunkPlanner {
 impl Default for SubchunkPlanner {
     #[inline]
     fn default() -> Self {
-        Self {
-            target_bytes: DEFAULT_TARGET_BYTES,
-        }
+        Self::hardware_detected()
     }
 }
 
 impl SubchunkPlanner {
+    /// 使用硬件自动探测的 L1D 缓存容量（[`detect_l1d_cache_bytes`]）创建规划器
+    #[inline]
+    pub fn hardware_detected() -> Self {
+        Self {
+            target_bytes: detect_l1d_cache_bytes(),
+        }
+    }
+
     /// 使用指定的单核目标缓存字节容量（例如 16KB、32KB 或 64KB）创建规划器
     #[inline]
     pub fn new(target_bytes: usize) -> Self {
@@ -135,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_planner_subchunk_rows_formula() {
-        let planner = SubchunkPlanner::default(); // 32KB
+        let planner = SubchunkPlanner::new(DEFAULT_TARGET_BYTES); // 32KB 基准验证
 
         // 1. ZST (0 字节)
         assert_eq!(planner.subchunk_rows(0), 16384);
@@ -159,11 +229,19 @@ mod tests {
         // 6. 极宽表: 1024 字节
         // 单个 64 行块需要 64KB，已超过 32KB -> 钳位至最小 64 行
         assert_eq!(planner.subchunk_rows(1024), 64);
+
+        // 7. 硬件探测与解析验证
+        assert_eq!(parse_cache_size_str("32K\n"), Some(32 * 1024));
+        assert_eq!(parse_cache_size_str("48K"), Some(48 * 1024));
+        assert_eq!(parse_cache_size_str("128K"), Some(128 * 1024));
+        let hw = SubchunkPlanner::default();
+        assert!(hw.target_bytes() >= 16 * 1024 && hw.target_bytes() <= 256 * 1024);
+        assert_eq!(hw.subchunk_rows(32) % 64, 0);
     }
 
     #[test]
     fn test_planner_range_iter() {
-        let planner = SubchunkPlanner::default();
+        let planner = SubchunkPlanner::new(DEFAULT_TARGET_BYTES);
         // 64 字节/行 -> chunk_size = 512
         let iter = planner.plan_subchunks(64, 1200);
         let ranges: Vec<Range<usize>> = iter.collect();

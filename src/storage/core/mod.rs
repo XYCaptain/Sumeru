@@ -31,7 +31,7 @@ pub use modify::ModifyTarget;
 #[allow(unused_imports)]
 pub(crate) use registry::ComponentRegistry;
 pub use store::{
-    ColumnarStoreSnapshot, LayoutOptimization, Singleton, Store, TypedBatch,
+    ColumnarStoreSnapshot, LayoutOptimization, OnDeleteTarget, Singleton, Store, TypedBatch,
     TypedDirectBatchUpdate, TypedReceipt, CURRENT_SNAPSHOT_VERSION,
 };
 

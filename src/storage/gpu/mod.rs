@@ -26,8 +26,8 @@ pub use ir::*;
 pub use kernel::*;
 pub use metal::*;
 pub use pass::{
-    ArchetypeDispatchStats, GpuComputePass, GpuDispatchReceipt, GpuPredicationMaskBuffer,
-    IndirectDispatchArgs, PairTargetGpuLut,
+    ArchetypeDispatchStats, GpuBinaryPassSystem, GpuComputePass, GpuDispatchReceipt,
+    GpuPredicationMaskBuffer, IndirectDispatchArgs, PairTargetGpuLut,
 };
 
 use crate::context::ModelComponent;

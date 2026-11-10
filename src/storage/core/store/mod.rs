@@ -36,6 +36,35 @@ pub enum LayoutOptimization {
     PageAlignedGpu,
 }
 
+/// 实体作为关系对 `Pair<R, Target>` 的目标被销毁时的级联与清理策略 (`OnDeleteTarget`)。
+///
+/// 对齐 Flecs 关系生命周期语义（`(OnDeleteTarget, Remove / Delete / Throw)`）：
+/// - `Keep`（默认）：不主动扫描或迁移源实体（源实体后续读取 `pair_target::<R>()` 时因目标已销毁安全返回 `None`）；
+/// - `Unlink`：销毁目标实体前，自动从所有存活源实体上移除 `Pair<R, target>` 组件；
+/// - `Cascade`：销毁目标实体时，沿关系 `R` 递归级联销毁所有指向它的源实体（适用于 `ChildOf` 等从属层级树）；
+/// - `Reject`：引用完整性保护——若仍有任何存活且不在本次级联删除集内的源实体通过 `R` 指向该目标，拒绝销毁并返回 `StateError::BatchConflict`（零副作用回滚）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OnDeleteTarget {
+    /// 保持源实体原位不迁移（默认零开销）
+    #[default]
+    Keep,
+    /// 自动从所有指向该目标的源实体上剥离 `Pair<R, EntityId>` 组件
+    Unlink,
+    /// 沿关系 `R` 递归级联销毁所有源实体（如销毁父节点时级联销毁整棵子树）
+    Cascade,
+    /// 引用完整性保护：若存在外部存活源实体指向该目标，拒绝销毁并返回错误
+    Reject,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RelationDeleteRule {
+    pub(crate) relation_name: &'static str,
+    pub(crate) policy: OnDeleteTarget,
+    pub(crate) find_sources: fn(&Store, EntityId) -> Vec<EntityId>,
+    pub(crate) unlink_source: fn(&mut Store, EntityId) -> Result<(), StateError>,
+    pub(crate) record_unlink: fn(&mut crate::storage::stage::commands::CommandBuffer, EntityId),
+}
+
 static NEXT_STORE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn next_store_instance_id() -> u64 {
     NEXT_STORE_INSTANCE_ID
@@ -60,6 +89,7 @@ pub struct Store {
     pub(crate) component_archetypes: BTreeMap<ComponentTypeId, ArchetypeBitSet>,
     pub(crate) last_created_archetype: Option<u32>,
     pub(crate) component_registry: crate::storage::registry::ComponentRegistry,
+    pub(crate) relation_delete_rules: BTreeMap<ComponentTypeId, RelationDeleteRule>,
     pub(crate) poisoned: Arc<AtomicBool>,
     pub(crate) layout_optimization: LayoutOptimization,
     pub(crate) structural_validation_cache: std::sync::RwLock<StructuralValidationCache>,
@@ -468,6 +498,7 @@ impl Store {
             component_archetypes: BTreeMap::new(),
             last_created_archetype: None,
             component_registry: crate::storage::registry::ComponentRegistry::new(),
+            relation_delete_rules: BTreeMap::new(),
             poisoned: Arc::new(AtomicBool::new(false)),
             layout_optimization: LayoutOptimization::default(),
             structural_validation_cache: std::sync::RwLock::new(StructuralValidationCache {
@@ -703,6 +734,7 @@ impl Store {
             component_archetypes: self.component_archetypes.clone(),
             last_created_archetype: None,
             component_registry: self.component_registry.clone(),
+            relation_delete_rules: self.relation_delete_rules.clone(),
             poisoned: Arc::new(AtomicBool::new(false)),
             layout_optimization: self.layout_optimization,
             structural_validation_cache: std::sync::RwLock::new(StructuralValidationCache::default()),
@@ -964,6 +996,7 @@ impl Clone for Store {
             archetype_index: self.archetype_index.clone(),
             component_archetypes: self.component_archetypes.clone(),
             component_registry: self.component_registry.clone(),
+            relation_delete_rules: self.relation_delete_rules.clone(),
             last_created_archetype: None,
             poisoned: Arc::new(AtomicBool::new(self.poisoned.load(Ordering::Relaxed))),
             layout_optimization: self.layout_optimization,

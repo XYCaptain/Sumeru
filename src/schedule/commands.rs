@@ -14,23 +14,29 @@
 //! - 子块缓冲按**任务序**（原型序 × 行序）拼接，系统缓冲按**系统注册序**应用；
 //! - 因此最终应用顺序与线程调度无关（调度无关确定性，Redmond & Kuper, OOPSLA '25）。
 
+use crate::context::ModelComponent;
 use crate::error::StateError;
 use crate::storage::batch::EntityBundle;
-use crate::storage::core::store::Store;
-use crate::storage::entity::IntoEntity;
+use crate::storage::core::store::{OnDeleteTarget, Store};
+use crate::storage::entity::{IntoEntity, SpawnBundle};
 use crate::storage::stage::commands::{CommandBuffer, EntityCommands};
 use crate::EntityId;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 type DeferredCommand = Box<dyn FnOnce(&mut Store) -> Result<(), StateError> + Send>;
 
-/// 延迟结构变更命令缓冲（内嵌两阶段零分配 [`CommandBuffer`] + 扩展闭包通道）
+enum DeferredStep {
+    Buffer(CommandBuffer),
+    Op(DeferredCommand),
+}
+
+/// 延迟结构变更命令缓冲（内嵌两阶段零分配 [`CommandBuffer`] + 因果保序扩展通道）
 pub struct Commands {
     /// 当前活跃的尾部 `CommandBuffer`
     buffer: CommandBuffer,
-    /// 跨子块合并时不可简单折叠的前序 `CommandBuffer` 片段（按任务序排列）
-    segments: Vec<CommandBuffer>,
-    /// 自定义延迟 Store 操作（如 `set_flag` 或自定义闭包）
-    ops: Vec<DeferredCommand>,
+    /// 按录制序/任务序严格排列的前序步骤（`CommandBuffer` 片段与自定义延迟闭包交织保序）
+    steps: Vec<DeferredStep>,
 }
 
 impl Default for Commands {
@@ -38,8 +44,7 @@ impl Default for Commands {
     fn default() -> Self {
         Self {
             buffer: CommandBuffer::new_unbound(),
-            segments: Vec::new(),
-            ops: Vec::new(),
+            steps: Vec::new(),
         }
     }
 }
@@ -48,8 +53,7 @@ impl std::fmt::Debug for Commands {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Commands")
             .field("len", &self.len())
-            .field("segments", &self.segments.len())
-            .field("ops", &self.ops.len())
+            .field("steps", &self.steps.len())
             .finish()
     }
 }
@@ -108,6 +112,53 @@ impl Commands {
         self
     }
 
+    /// 延迟自动分配代际实体 ID 并一步生成实体（无需调用方预先计算或持有 `EntityId`）
+    ///
+    /// 支持 `()`（空实体）、`(T1, ..., Tn)`（1..=16 组件元组）、`EntityBundle`、`Entity` 等全部 [`SpawnBundle`] 形态。
+    #[inline]
+    pub fn spawn<B>(&mut self, bundle: B) -> &mut Self
+    where
+        B: SpawnBundle + Send + 'static,
+    {
+        self.push(move |store| bundle.spawn_in_store(store).map(|_| ()));
+        self
+    }
+
+    /// 批量延迟自动分配代际实体 ID 并生成一组实体（同步点自动预留分配器容量）
+    #[inline]
+    pub fn spawn_batch<I, B>(&mut self, batch: I) -> &mut Self
+    where
+        I: IntoIterator<Item = B>,
+        B: SpawnBundle + Send + 'static,
+    {
+        let items: Vec<B> = batch.into_iter().collect();
+        if !items.is_empty() {
+            self.push(move |store| {
+                store.reserve_entities(items.len())?;
+                for item in items {
+                    item.spawn_in_store(store)?;
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
+    /// 延迟自动分配实体 ID 生成实体，并在同步点将新生成的 `EntityId` 传给后续回调 `f`
+    ///（用于在同一命令流中构建父子层级关系、相互引用或设置新实体的行级标志位）
+    #[inline]
+    pub fn spawn_with<B, F>(&mut self, bundle: B, f: F) -> &mut Self
+    where
+        B: SpawnBundle + Send + 'static,
+        F: FnOnce(EntityId, &mut Store) -> Result<(), StateError> + Send + 'static,
+    {
+        self.push(move |store| {
+            let id = bundle.spawn_in_store(store)?;
+            f(id, store)
+        });
+        self
+    }
+
     /// 延迟销毁实体（直接写入内嵌 `CommandBuffer`，零 `Box<dyn FnOnce>` 堆分配）
     #[inline]
     pub fn despawn(&mut self, entity: EntityId) -> &mut Self {
@@ -119,6 +170,36 @@ impl Commands {
     #[inline]
     pub fn delete_entity(&mut self, entity: EntityId) -> &mut Self {
         self.buffer.delete_entity(entity);
+        self
+    }
+
+    /// 延迟按指定的关系清理策略 [`OnDeleteTarget`] 销毁目标实体
+    #[inline]
+    pub fn despawn_with_relation<R>(&mut self, target: EntityId, policy: OnDeleteTarget) -> &mut Self
+    where
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    {
+        self.push(move |store| store.despawn_with_relation::<R>(target, policy).map(|_| ()));
+        self
+    }
+
+    /// 延迟沿关系 `R` 递归级联销毁目标实体及其所有后代源实体（如销毁整棵 `ChildOf` 子树）
+    #[inline]
+    pub fn despawn_cascade<R>(&mut self, target: EntityId) -> &mut Self
+    where
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    {
+        self.push(move |store| store.despawn_cascade::<R>(target).map(|_| ()));
+        self
+    }
+
+    /// 延迟解除并移除所有通过关系 `R` 指向 `target` 的存活源实体的该关系组件
+    #[inline]
+    pub fn unlink_pair_target<R>(&mut self, target: EntityId) -> &mut Self
+    where
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    {
+        self.push(move |store| store.unlink_pair_target::<R>(target).map(|_| ()));
         self
     }
 
@@ -136,35 +217,48 @@ impl Commands {
         self.set_flag::<FLAG>(entity, enabled)
     }
 
-    /// 追加任意延迟执行的 Store 变更闭包（在 Stage 同步点由主线程独占执行）
+    #[inline]
+    fn flush_active_buffer(&mut self) {
+        if self.buffer.has_recorded_work() {
+            let prev = std::mem::replace(&mut self.buffer, CommandBuffer::new_unbound());
+            self.steps.push(DeferredStep::Buffer(prev));
+        }
+    }
+
+    /// 追加任意延迟执行的 Store 变更闭包（在 Stage 同步点由主线程按因果录制序独占执行）
     #[inline]
     pub fn push(
         &mut self,
         op: impl FnOnce(&mut Store) -> Result<(), StateError> + Send + 'static,
     ) {
-        self.ops.push(Box::new(op));
+        self.flush_active_buffer();
+        self.steps.push(DeferredStep::Op(Box::new(op)));
     }
 
     /// 已缓冲的命令与实体变更数量
     #[inline]
     pub fn len(&self) -> usize {
-        let seg_len: usize = self
-            .segments
+        let steps_len: usize = self
+            .steps
             .iter()
-            .map(|s| s.len() + usize::from(s.has_deferred_error()))
+            .map(|step| match step {
+                DeferredStep::Buffer(s) => s.len() + usize::from(s.has_deferred_error()),
+                DeferredStep::Op(_) => 1,
+            })
             .sum();
-        seg_len
+        steps_len
             + self.buffer.len()
             + usize::from(self.buffer.has_deferred_error())
-            + self.ops.len()
     }
 
     /// 是否为空
     #[inline]
     pub fn is_empty(&self) -> bool {
         !self.buffer.has_recorded_work()
-            && self.segments.iter().all(|s| !s.has_recorded_work())
-            && self.ops.is_empty()
+            && self.steps.iter().all(|step| match step {
+                DeferredStep::Buffer(s) => !s.has_recorded_work(),
+                DeferredStep::Op(_) => false,
+            })
     }
 
     #[inline]
@@ -178,38 +272,47 @@ impl Commands {
             self.buffer.merge_simple_from(&mut buf);
         } else {
             let prev = std::mem::replace(&mut self.buffer, buf);
-            self.segments.push(prev);
+            self.steps.push(DeferredStep::Buffer(prev));
         }
     }
 
     /// 将另一缓冲的命令按任务序追加到末尾
     pub fn append(&mut self, other: &mut Commands) {
-        for seg in other.segments.drain(..) {
-            self.append_command_buffer(seg);
+        for step in other.steps.drain(..) {
+            match step {
+                DeferredStep::Buffer(seg) => self.append_command_buffer(seg),
+                DeferredStep::Op(op) => {
+                    self.flush_active_buffer();
+                    self.steps.push(DeferredStep::Op(op));
+                }
+            }
         }
         if other.buffer.has_recorded_work() {
             let tail = std::mem::replace(&mut other.buffer, CommandBuffer::new_unbound());
             self.append_command_buffer(tail);
         }
-        self.ops.append(&mut other.ops);
     }
 
     /// 在同步点按追加顺序独占应用全部命令；遇到首个错误立即返回（其余命令被丢弃）
     pub fn apply(self, store: &mut Store) -> Result<usize, StateError> {
         let total = self.len();
-        for mut seg in self.segments {
-            if seg.has_recorded_work() {
-                seg.rebind_to_store(store);
-                seg.apply_discard(store)?;
+        for step in self.steps {
+            match step {
+                DeferredStep::Buffer(mut seg) => {
+                    if seg.has_recorded_work() {
+                        seg.rebind_to_store(store);
+                        seg.apply_discard(store)?;
+                    }
+                }
+                DeferredStep::Op(op) => {
+                    op(store)?;
+                }
             }
         }
         if self.buffer.has_recorded_work() {
             let mut tail = self.buffer;
             tail.rebind_to_store(store);
             tail.apply_discard(store)?;
-        }
-        for op in self.ops {
-            op(store)?;
         }
         Ok(total)
     }

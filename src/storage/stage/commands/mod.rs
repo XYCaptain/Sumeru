@@ -623,6 +623,9 @@ impl CommandBuffer {
         if let Some(err) = self.deferred_error.take() {
             return Err(err);
         }
+        if self.deletes > 0 && !store.relation_delete_rules.is_empty() {
+            self.expand_relation_delete_rules(store)?;
+        }
         let entries = std::mem::take(&mut self.entries);
         let pool = std::mem::take(&mut self.pool);
         let native_values = std::mem::take(&mut self.native_values);
@@ -641,6 +644,78 @@ impl CommandBuffer {
             },
         })?;
         Ok(prepared)
+    }
+
+    fn expand_relation_delete_rules(&mut self, store: &Store) -> Result<(), StateError> {
+        use crate::storage::store::{OnDeleteTarget, RelationDeleteRule};
+        use std::collections::{BTreeSet, VecDeque};
+
+        let rules: Vec<RelationDeleteRule> =
+            store.relation_delete_rules.values().copied().collect();
+        let initial_deletes: Vec<EntityId> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| matches!(entry, CommandEntry::Delete).then_some(*id))
+            .collect();
+
+        let mut to_delete = initial_deletes.clone();
+        let mut in_delete_set: BTreeSet<EntityId> = initial_deletes.iter().copied().collect();
+        let mut queue: VecDeque<EntityId> = initial_deletes.iter().copied().collect();
+
+        while let Some(curr) = queue.pop_front() {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Cascade {
+                    for src in (rule.find_sources)(store, curr) {
+                        if store.contains_entity(src) && in_delete_set.insert(src) {
+                            to_delete.push(src);
+                            queue.push_back(src);
+                        }
+                    }
+                }
+            }
+        }
+
+        for &del_id in &to_delete {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Reject {
+                    for src in (rule.find_sources)(store, del_id) {
+                        if store.contains_entity(src) && !in_delete_set.contains(&src) {
+                            return Err(StateError::BatchConflict(format!(
+                                "Cannot delete entity {del_id}: still referenced by {src} via relation `{}` (OnDeleteTarget::Reject)",
+                                rule.relation_name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let initial_set: BTreeSet<EntityId> = initial_deletes.into_iter().collect();
+        for &del_id in &to_delete {
+            if !initial_set.contains(&del_id) {
+                self.delete_entity(del_id);
+                if let Some(err) = self.deferred_error.take() {
+                    return Err(err);
+                }
+            }
+        }
+
+        for &del_id in &to_delete {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Unlink {
+                    for src in (rule.find_sources)(store, del_id) {
+                        if store.contains_entity(src) && !in_delete_set.contains(&src) {
+                            (rule.record_unlink)(self, src);
+                            if let Some(err) = self.deferred_error.take() {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// 获取命令缓冲中各类操作统计（供容量规划与测试断言白盒验证）

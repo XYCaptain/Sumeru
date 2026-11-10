@@ -224,6 +224,7 @@ pub struct GpuComputePass {
     required_flags: Vec<u8>,
     excluded_flags: Vec<u8>,
     required_components: Vec<ComponentTypeId>,
+    excluded_components: Vec<ComponentTypeId>,
     custom_mask_filters: Vec<ArchetypeRowMaskFilter>,
 }
 
@@ -242,6 +243,7 @@ impl GpuComputePass {
             required_flags: Vec::new(),
             excluded_flags: Vec::new(),
             required_components: Vec::new(),
+            excluded_components: Vec::new(),
             custom_mask_filters: Vec::new(),
         }
     }
@@ -259,6 +261,18 @@ impl GpuComputePass {
             "Hardware page size must be a power of two >= 4096"
         );
         self.page_size = page_size;
+        self
+    }
+
+    /// 仅对包含组件 `T` 的原型表执行 GPU 计算（参与调度器 `With<T>` 原型互不相交并发剪枝）
+    pub fn with_component<T: ModelComponent + 'static>(mut self) -> Self {
+        self.required_components.push(ComponentTypeId::of::<T>());
+        self
+    }
+
+    /// 排除包含组件 `T` 的原型表（参与调度器 `Without<T>` 原型互不相交并发剪枝）
+    pub fn without_component<T: ModelComponent + 'static>(mut self) -> Self {
+        self.excluded_components.push(ComponentTypeId::of::<T>());
         self
     }
 
@@ -326,6 +340,11 @@ impl GpuComputePass {
         }
         for &cid in &self.required_components {
             if !arch.contains_component(cid) {
+                return None;
+            }
+        }
+        for &cid in &self.excluded_components {
+            if arch.contains_component(cid) {
                 return None;
             }
         }
@@ -775,6 +794,210 @@ impl GpuComputePass {
 
         (total_sum, receipt)
     }
+
+    /// 推导双组件原位 GPU Pass (`&mut Dst, &Src`) 的调度器静态访问权限描述符 [`AccessDescriptor`](crate::schedule::AccessDescriptor)
+    ///
+    /// - 写集包含 `Dst`，读集包含 `Src` 与所有过滤依赖组件（如 `Pair<R>`、`changed_since`）；
+    /// - `with_components` 与 `without_components` 自动捕获原型谓词，支持 `With<A>` vs `Without<A>` 原型互不相交并发剪枝；
+    /// - `reads_flags` 自动捕获 `with_flag` / `without_flag` 行标志位掩码；
+    /// - `exclusive == false`，允许进入并行 `SystemStage` 与不相交的 CPU/GPU 系统并发重叠执行。
+    pub fn binary_access_descriptor<Dst, Src>(&self) -> crate::schedule::AccessDescriptor
+    where
+        Dst: ModelComponent + 'static,
+        Src: ModelComponent + 'static,
+    {
+        let dst_cid = ComponentTypeId::of::<Dst>();
+        let src_cid = ComponentTypeId::of::<Src>();
+        let mut access = crate::schedule::AccessDescriptor::new()
+            .with_write(dst_cid)
+            .with_read(src_cid)
+            .with_archetype_with(dst_cid)
+            .with_archetype_with(src_cid);
+        for &cid in &self.required_components {
+            access.reads.insert(cid);
+            access.with_components.insert(cid);
+        }
+        for &cid in &self.excluded_components {
+            access.without_components.insert(cid);
+        }
+        for &flag in self.required_flags.iter().chain(self.excluded_flags.iter()) {
+            if flag < 8 {
+                access.reads_flags |= 1u8 << flag;
+            }
+        }
+        access
+    }
+
+    /// 将当前 `GpuComputePass` 封装为可进入调度器并行 `SystemStage` 的 [`GpuBinaryPassSystem`]
+    pub fn into_binary_system<Dst, Src, K>(
+        self,
+        name: &'static str,
+        kernel: K,
+    ) -> GpuBinaryPassSystem<Dst, Src, K>
+    where
+        Dst: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        Src: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        K: Fn(usize, &mut Dst, &Src) + Send + Sync + 'static,
+    {
+        GpuBinaryPassSystem::new(name, self, kernel)
+    }
+}
+
+/// 可进入并行调度 Stage 的异构双组件原位计算系统 (`GpuBinaryPassSystem`)
+///
+/// - **阶段 A（主线程 `prepare_parallel`）**：
+///   按 [`GpuComputePass`] 的位平面、关系索引与块纪元过滤求得每张匹配原型表的 `RowBitMask`，
+///   独占解耦 `Dst` 写列并提取不相交的 `(&'w mut [Dst], &'w [Src])` 物理切片，
+///   同时按掩码标记 64 行物理块纪元并折叠硬件脏页生成 [`GpuDispatchReceipt`]；
+/// - **阶段 B（并行 `ParallelJob`）**：
+///   完全脱离 `Store` 与 `Archetype` 引用，仅在预提取的物理切片上执行异构核函数，
+///   可与同一 Stage 内读写集互不相交（或原型谓词互不相交）的 CPU `ParQuerySystem` / `ParChunkQuerySystem`
+///   及其他 `GpuBinaryPassSystem` 真正并发重叠执行。
+pub struct GpuBinaryPassSystem<Dst, Src, K> {
+    name: &'static str,
+    pass: GpuComputePass,
+    kernel: K,
+    access: crate::schedule::AccessDescriptor,
+    last_receipt: Option<GpuDispatchReceipt>,
+    _marker: std::marker::PhantomData<fn(&mut Dst, &Src)>,
+}
+
+impl<Dst, Src, K> GpuBinaryPassSystem<Dst, Src, K>
+where
+    Dst: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    Src: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    K: Fn(usize, &mut Dst, &Src) + Send + Sync + 'static,
+{
+    pub fn new(name: &'static str, pass: GpuComputePass, kernel: K) -> Self {
+        let access = pass.binary_access_descriptor::<Dst, Src>();
+        Self {
+            name,
+            pass,
+            kernel,
+            access,
+            last_receipt: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 获取最近一次执行生成的 GPU 派发收据（包含扫描行数、64 行块跳跃数与 16KB 硬件脏页段统计）
+    #[inline]
+    pub fn last_receipt(&self) -> Option<&GpuDispatchReceipt> {
+        self.last_receipt.as_ref()
+    }
+}
+
+impl<Dst, Src, K> crate::schedule::System for GpuBinaryPassSystem<Dst, Src, K>
+where
+    Dst: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    Src: ModelComponent + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    K: Fn(usize, &mut Dst, &Src) + Send + Sync + 'static,
+{
+    #[inline(always)]
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[inline(always)]
+    fn access(&self) -> &crate::schedule::AccessDescriptor {
+        &self.access
+    }
+
+    fn run(&mut self, store: &mut Store) -> Result<(), StateError> {
+        let kernel = &self.kernel;
+        let receipt = self
+            .pass
+            .dispatch_binary_in_place::<Dst, Src, _>(store, |row, d, s| kernel(row, d, s))?;
+        self.last_receipt = Some(receipt);
+        Ok(())
+    }
+
+    fn prepare_parallel<'w>(
+        &'w mut self,
+        ctx: crate::schedule::PrepareContext<'w>,
+    ) -> Result<crate::schedule::ParallelJob<'w>, StateError> {
+        let stage_epoch = ctx.stage_epoch();
+        let store = ctx.into_store();
+        store.check_poisoned()?;
+
+        let dst_cid = ComponentTypeId::of::<Dst>();
+        let src_cid = ComponentTypeId::of::<Src>();
+        if dst_cid == src_cid {
+            return Err(StateError::BatchConflict(
+                "Destination and source component types must be distinct in binary pass".into(),
+            ));
+        }
+
+        let prev_epoch = stage_epoch.saturating_sub(1);
+        let mut receipt = GpuDispatchReceipt {
+            store_epoch: stage_epoch,
+            ..Default::default()
+        };
+        let mut prepared_slices: Vec<(&'w mut [Dst], &'w [Src], RowBitMask)> = Vec::new();
+
+        for arch in &mut store.archetypes {
+            if !arch.contains_component(dst_cid) || !arch.contains_component(src_cid) {
+                continue;
+            }
+            let Some(mask) = self.pass.evaluate_archetype_mask(arch) else {
+                continue;
+            };
+
+            let row_len = arch.len();
+            let active_rows = mask.count_ones();
+            let skipped_chunks = mask.words().iter().filter(|&&w| w == 0).count();
+            let indirect_dispatch =
+                IndirectDispatchArgs::from_active_mask(&mask, self.pass.workgroup_size);
+
+            arch.mark_column_masked_chunks_epoch(dst_cid, &mask, stage_epoch);
+
+            let (epochs, def_ep) = arch.effective_gpu_chunk_epochs(dst_cid);
+            let dirty_bitmap = PageDirtyBitmap::from_phys_chunk_epochs_with_page_size(
+                &epochs,
+                def_ep,
+                prev_epoch,
+                row_len,
+                std::mem::size_of::<Dst>(),
+                self.pass.page_size,
+            );
+            let dirty_bytes = dirty_bitmap.total_dirty_bytes();
+            let total_page_bytes = dirty_bitmap.total_pages() * self.pass.page_size;
+
+            receipt.matched_archetypes += 1;
+            receipt.total_rows_scanned += row_len;
+            receipt.total_active_rows += active_rows;
+            receipt.total_skipped_64row_chunks += skipped_chunks;
+            receipt.total_dirty_bytes += dirty_bytes;
+            receipt.total_column_page_bytes += total_page_bytes;
+            receipt.archetype_stats.push(ArchetypeDispatchStats {
+                archetype_id: arch.id().0,
+                total_rows: row_len,
+                active_rows,
+                skipped_64row_chunks: skipped_chunks,
+                indirect_dispatch,
+                dirty_page_runs: dirty_bitmap.dirty_runs().to_vec(),
+                dirty_bytes,
+                total_column_page_bytes: total_page_bytes,
+            });
+
+            if let Some((src_col, dst_col)) = arch.get_two_columns_ro_mut::<Src, Dst>() {
+                prepared_slices.push((dst_col.as_mut_slice(), src_col.as_slice(), mask));
+            }
+        }
+
+        self.last_receipt = Some(receipt);
+        let kernel = &self.kernel;
+        Ok(Box::new(move || {
+            for (dst_slice, src_slice, mask) in prepared_slices {
+                mask.for_each_set_row(|row| {
+                    if let (Some(d), Some(s)) = (dst_slice.get_mut(row), src_slice.get(row)) {
+                        kernel(row, d, s);
+                    }
+                });
+            }
+            Ok(crate::schedule::Commands::new())
+        }))
+    }
 }
 
 impl Store {
@@ -1031,5 +1254,70 @@ mod tests {
         assert_eq!((args.workgroups_x, args.workgroups_y, args.workgroups_z), (5, 1, 1));
         let empty = IndirectDispatchArgs::from_active_mask(&RowBitMask::new_empty(300), 64);
         assert_eq!(empty.workgroups_x, 0);
+    }
+
+    #[test]
+    fn test_gpu_binary_pass_system_parallel_stage_overlap_with_cpu_and_disjoint_archetypes() {
+        use crate::schedule::{simple_par_query_system, Schedule};
+
+        let mut store = Store::new();
+        for i in 1..=8u128 {
+            store
+                .insert((
+                    EntityId::from_u128(i),
+                    (
+                        Pos3D {
+                            x: i as f64,
+                            y: 0.0,
+                            z: 0.0,
+                            w: 1.0,
+                        },
+                        Vel3D {
+                            vx: 10.0,
+                            vy: 5.0,
+                            vz: 0.0,
+                            vw: 0.0,
+                        },
+                        ForceAccum { fx: 1.0, fy: 2.0 },
+                    ),
+                ))
+                .unwrap();
+        }
+
+        let mut schedule = Schedule::new();
+        // GPU Pass 系统：写 Pos3D，读 Vel3D（非独占，可进入并行 Stage）
+        schedule.add_system(
+            GpuComputePass::new().into_binary_system::<Pos3D, Vel3D, _>(
+                "gpu_integrate_pos",
+                |_row, pos, vel| {
+                    pos.x += vel.vx;
+                    pos.y += vel.vy;
+                },
+            ),
+        );
+        // CPU 并行查询系统：写 ForceAccum（与 Pos3D / Vel3D 完全不相交）
+        schedule.add_system(simple_par_query_system::<&mut ForceAccum, _>(
+            "cpu_damp_force",
+            |(_e, f), _cmds| {
+                f.fx *= 2.0;
+                f.fy *= 3.0;
+            },
+        ));
+
+        schedule.build(&store).unwrap();
+        // GPU 系统与 CPU 系统读写集互不相交，必须被规划进同一个并行 Stage 重叠执行！
+        assert_eq!(schedule.stages().len(), 1);
+
+        schedule.run(&mut store).unwrap();
+
+        for i in 1..=8u128 {
+            let e = EntityId::from_u128(i);
+            let p = store.get::<Pos3D>(e).unwrap();
+            let f = store.get::<ForceAccum>(e).unwrap();
+            assert_eq!(p.x, i as f64 + 10.0);
+            assert_eq!(p.y, 5.0);
+            assert_eq!(f.fx, 2.0);
+            assert_eq!(f.fy, 6.0);
+        }
     }
 }

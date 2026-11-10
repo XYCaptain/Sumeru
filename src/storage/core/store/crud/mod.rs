@@ -11,6 +11,7 @@ use crate::error::StateError;
 use crate::id::{ComponentTypeId, LocalSlotId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 /// 全局单例组件包装器 (`Singleton<T>`)。
 ///
@@ -203,8 +204,16 @@ impl Store {
         self.allocator.active_count() == 0
     }
 
-    /// 彻底删除实体及其全部组件。若实体不存在报错 `EntityNotFound(id)`。
+    /// 彻底删除实体及其全部组件（若已注册 `OnDeleteTarget` 关系策略则自动执行级联删除、解绑或引用完整性拦截）。
+    /// 若实体不存在报错 `EntityNotFound(id)`。
     pub fn delete_entity(&mut self, id: EntityId) -> Result<(), StateError> {
+        if self.relation_delete_rules.is_empty() {
+            return self.delete_single_entity(id);
+        }
+        self.delete_entity_with_registered_rules(id)
+    }
+
+    pub(crate) fn delete_single_entity(&mut self, id: EntityId) -> Result<(), StateError> {
         self.check_poisoned()?;
         let (local_slot, location) = self
             .allocator
@@ -266,6 +275,76 @@ impl Store {
         self.allocator.finish_deallocate_slot_infallible(local_slot);
         self.epoch = next_epoch;
         poison_guard.disarm();
+        Ok(())
+    }
+
+    fn delete_entity_with_registered_rules(&mut self, id: EntityId) -> Result<(), StateError> {
+        use super::{OnDeleteTarget, RelationDeleteRule};
+        use std::collections::VecDeque;
+
+        self.check_poisoned()?;
+        if !self.contains_entity(id) {
+            return Err(StateError::EntityNotFound(id));
+        }
+
+        let rules: Vec<RelationDeleteRule> =
+            self.relation_delete_rules.values().copied().collect();
+
+        // 1. 解析级联删除闭包（BFS，通过 in_delete_set 防环）
+        let mut to_delete = vec![id];
+        let mut in_delete_set = BTreeSet::new();
+        in_delete_set.insert(id);
+        let mut queue = VecDeque::from([id]);
+
+        while let Some(curr) = queue.pop_front() {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Cascade {
+                    for src in (rule.find_sources)(self, curr) {
+                        if self.contains_entity(src) && in_delete_set.insert(src) {
+                            to_delete.push(src);
+                            queue.push_back(src);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 零副作用预检：校验所有 Reject 策略（外部存活实体仍引用待删集内实体则立即拒绝）
+        for &del_id in &to_delete {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Reject {
+                    for src in (rule.find_sources)(self, del_id) {
+                        if self.contains_entity(src) && !in_delete_set.contains(&src) {
+                            return Err(StateError::BatchConflict(format!(
+                                "Cannot delete entity {del_id}: still referenced by {src} via relation `{}` (OnDeleteTarget::Reject)",
+                                rule.relation_name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 对外部存活源实体执行 Unlink 解绑（待删集内部实体即将销毁，跳过无意义的迁移）
+        for &del_id in &to_delete {
+            for rule in &rules {
+                if rule.policy == OnDeleteTarget::Unlink {
+                    for src in (rule.find_sources)(self, del_id) {
+                        if self.contains_entity(src) && !in_delete_set.contains(&src) {
+                            (rule.unlink_source)(self, src)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. 自底向上（叶子优先）销毁待删集内的全部实体
+        for &del_id in to_delete.iter().rev() {
+            if self.contains_entity(del_id) {
+                self.delete_single_entity(del_id)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1650,14 +1729,13 @@ impl Store {
         }
     }
 
-    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表（自动利用 `component_archetypes` 倒排位图与表内 `PairTargetIndex` 二级位图索引）
-    pub fn sources_with_pair<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
+    /// 内部物理扫描：反查所有通过关系 `R` 指向 `target` 的源实体（不要求 `target` 仍在分配器中存活）
+    pub(crate) fn sources_with_pair_raw<
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    >(
         &self,
         target: EntityId,
     ) -> Vec<EntityId> {
-        if !self.contains_entity(target) {
-            return Vec::new();
-        }
         let cid = ComponentTypeId::of::<crate::al::Pair<R, EntityId>>();
         let mut out = Vec::new();
         if let Some(arch_bits) = self.component_archetypes.get(&cid) {
@@ -1679,17 +1757,148 @@ impl Store {
         out
     }
 
-    /// 解除并移除所有通过关系 `R` 指向 `target` 的存活实体的该关系组件，返回解除的源实体数量
+    /// 反查所有通过关系 `R` 指向 `target` 的存活源实体列表（自动利用 `component_archetypes` 倒排位图与表内 `PairTargetIndex` 二级位图索引）
+    pub fn sources_with_pair<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
+        &self,
+        target: EntityId,
+    ) -> Vec<EntityId> {
+        if !self.contains_entity(target) {
+            return Vec::new();
+        }
+        self.sources_with_pair_raw::<R>(target)
+    }
+
+    /// 解除并移除所有通过关系 `R` 指向 `target` 的存活实体的该关系组件（即使 `target` 已提前销毁仍可清理悬挂关系），返回解除的源实体数量
     pub fn unlink_pair_target<R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static>(
         &mut self,
         target: EntityId,
     ) -> Result<usize, StateError> {
-        let sources = self.sources_with_pair::<R>(target);
+        self.check_poisoned()?;
+        let sources = self.sources_with_pair_raw::<R>(target);
         let count = sources.len();
         for source in sources {
             let _ = self.remove_component::<crate::al::Pair<R, EntityId>>(source)?;
         }
         Ok(count)
+    }
+
+    /// 为关系类型 `R` 注册当目标实体被销毁（`despawn` / `delete_entity` / `CommandBuffer`）时的自动生命周期策略 [`OnDeleteTarget`](super::OnDeleteTarget)
+    pub fn set_relation_delete_policy<
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    >(
+        &mut self,
+        policy: super::OnDeleteTarget,
+    ) -> &mut Self {
+        let pair_cid = ComponentTypeId::of::<crate::al::Pair<R, EntityId>>();
+        if policy == super::OnDeleteTarget::Keep {
+            self.relation_delete_rules.remove(&pair_cid);
+        } else {
+            self.relation_delete_rules.insert(
+                pair_cid,
+                super::RelationDeleteRule {
+                    relation_name: std::any::type_name::<R>(),
+                    policy,
+                    find_sources: |store, target| store.sources_with_pair_raw::<R>(target),
+                    unlink_source: |store, source| {
+                        store
+                            .remove_component::<crate::al::Pair<R, EntityId>>(source)
+                            .map(|_| ())
+                    },
+                    record_unlink: |buf, source| {
+                        buf.entity(source).remove::<crate::al::Pair<R, EntityId>>();
+                    },
+                },
+            );
+        }
+        self
+    }
+
+    /// 查询关系类型 `R` 当前配置的目标销毁策略（默认为 [`OnDeleteTarget::Keep`](super::OnDeleteTarget::Keep)）
+    #[inline]
+    pub fn relation_delete_policy<
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    >(
+        &self,
+    ) -> super::OnDeleteTarget {
+        let pair_cid = ComponentTypeId::of::<crate::al::Pair<R, EntityId>>();
+        self.relation_delete_rules
+            .get(&pair_cid)
+            .map_or(super::OnDeleteTarget::Keep, |rule| rule.policy)
+    }
+
+    /// 按指定的关系策略 `policy` 销毁 `target` 实体，返回本次实际销毁的实体总数（`Cascade` 模式下包含级联销毁的全部后代实体）
+    pub fn despawn_with_relation<
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    >(
+        &mut self,
+        target: EntityId,
+        policy: super::OnDeleteTarget,
+    ) -> Result<usize, StateError> {
+        use super::OnDeleteTarget;
+        use std::collections::VecDeque;
+
+        self.check_poisoned()?;
+        if !self.contains_entity(target) {
+            return Err(StateError::EntityNotFound(target));
+        }
+
+        match policy {
+            OnDeleteTarget::Keep => {
+                self.delete_entity(target)?;
+                Ok(1)
+            }
+            OnDeleteTarget::Reject => {
+                let sources = self.sources_with_pair_raw::<R>(target);
+                if let Some(&src) = sources.iter().find(|&&s| s != target && self.contains_entity(s)) {
+                    return Err(StateError::BatchConflict(format!(
+                        "Cannot delete entity {target}: still referenced by {src} via relation `{}` (OnDeleteTarget::Reject)",
+                        std::any::type_name::<R>()
+                    )));
+                }
+                self.delete_entity(target)?;
+                Ok(1)
+            }
+            OnDeleteTarget::Unlink => {
+                self.unlink_pair_target::<R>(target)?;
+                self.delete_entity(target)?;
+                Ok(1)
+            }
+            OnDeleteTarget::Cascade => {
+                let mut to_delete = vec![target];
+                let mut visited = BTreeSet::new();
+                visited.insert(target);
+                let mut queue = VecDeque::from([target]);
+
+                while let Some(curr) = queue.pop_front() {
+                    for src in self.sources_with_pair_raw::<R>(curr) {
+                        if self.contains_entity(src) && visited.insert(src) {
+                            to_delete.push(src);
+                            queue.push_back(src);
+                        }
+                    }
+                }
+
+                let mut deleted = 0usize;
+                for &del_id in to_delete.iter().rev() {
+                    if self.contains_entity(del_id) {
+                        self.delete_entity(del_id)?;
+                        deleted += 1;
+                    }
+                }
+                Ok(deleted)
+            }
+        }
+    }
+
+    /// 沿关系 `R` 递归级联销毁 `target` 及其所有后代源实体（例如 `store.despawn_cascade::<ChildOf>(root)`），返回实际销毁的实体总数
+    #[inline]
+    pub fn despawn_cascade<
+        R: ModelComponent + Serialize + DeserializeOwned + Clone + 'static,
+    >(
+        &mut self,
+        target: EntityId,
+    ) -> Result<usize, StateError> {
+        self.despawn_with_relation::<R>(target, super::OnDeleteTarget::Cascade)
     }
 
     /// 按谓词扫描并返回第一个匹配的实体 ID

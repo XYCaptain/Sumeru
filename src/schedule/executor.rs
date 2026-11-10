@@ -874,4 +874,92 @@ mod tests {
         // 纯只读并行 Stage 不推进 Store 全局写纪元
         assert_eq!(store.epoch(), epoch_before);
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+    struct ChildOfRel;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+    struct TargetedByRel;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+    struct LockedByRel;
+
+    #[test]
+    fn test_commands_deferred_spawn_and_causal_ordering() {
+        let mut store = Store::new();
+        spawn_tracks(&mut store, 4);
+
+        let mut schedule = Schedule::new();
+        schedule.add_system(simple_par_query_system::<&TrackB, _>(
+            "spawner",
+            |(e, b), cmds| {
+                // 1. 先对原实体设置行标志位 Flag 1，随后在同缓冲中修改其组件（验证因果交织保序）
+                cmds.set_flag::<1>(e, true);
+                cmds.entity(e).set(Pos { x: b.0 });
+                // 2. 无需预分配 ID 直接延迟生成携带 TrackC 的新实体
+                cmds.spawn((TrackC(b.0 + 1000),));
+                // 3. 通过 spawn_with 生成父子对
+                let val = b.0;
+                cmds.spawn_with((Pos { x: val * 2 },), move |parent_id, st| {
+                    st.spawn((Pos { x: val * 3 }, crate::al::Pair::new(ChildOfRel, parent_id)))?;
+                    Ok(())
+                });
+            },
+        ));
+        schedule.run(&mut store).unwrap();
+
+        // 原有 4 个 + spawn 4 个 + spawn_with (4 父 + 4 子) = 16 个实体
+        assert_eq!(store.len(), 16);
+        for i in 1..=4u128 {
+            let e = EntityId::from_u128(i);
+            assert!(store.has_flag::<1>(e));
+            assert_eq!(store.get::<Pos>(e), Some(&Pos { x: 10 }));
+        }
+    }
+
+    #[test]
+    fn test_relation_delete_policies_cascade_unlink_reject() {
+        use crate::storage::OnDeleteTarget;
+
+        let mut store = Store::new();
+        store
+            .set_relation_delete_policy::<ChildOfRel>(OnDeleteTarget::Cascade)
+            .set_relation_delete_policy::<TargetedByRel>(OnDeleteTarget::Unlink)
+            .set_relation_delete_policy::<LockedByRel>(OnDeleteTarget::Reject);
+
+        let root = store.spawn((Pos { x: 1 },)).unwrap();
+        let child1 = store
+            .spawn((Pos { x: 2 }, crate::al::Pair::new(ChildOfRel, root)))
+            .unwrap();
+        let grandchild = store
+            .spawn((Pos { x: 3 }, crate::al::Pair::new(ChildOfRel, child1)))
+            .unwrap();
+        let watcher = store
+            .spawn((Pos { x: 4 }, crate::al::Pair::new(TargetedByRel, grandchild)))
+            .unwrap();
+        let locker = store
+            .spawn((Pos { x: 5 }, crate::al::Pair::new(LockedByRel, child1)))
+            .unwrap();
+
+        // 1. 当 locker 仍通过 LockedByRel (Reject) 指向级联子树内的 child1 时，销毁 root 必须被拒绝且零副作用
+        assert!(store.despawn(root).is_err());
+        assert!(store.is_alive(root));
+        assert!(store.is_alive(child1));
+        assert!(store.is_alive(grandchild));
+        assert_eq!(store.pair_target::<TargetedByRel>(watcher), Some(grandchild));
+
+        // 2. 移除锁定关系后再次销毁 root：
+        //    - root, child1, grandchild 级联销毁；
+        //    - watcher 上的 Pair<TargetedByRel, grandchild> 自动物理剥离（Unlink）；
+        //    - watcher 与 locker 保持存活。
+        store.unlink_pair_target::<LockedByRel>(child1).unwrap();
+        store.despawn(root).unwrap();
+
+        assert!(!store.is_alive(root));
+        assert!(!store.is_alive(child1));
+        assert!(!store.is_alive(grandchild));
+        assert!(store.is_alive(watcher));
+        assert!(store.is_alive(locker));
+        assert!(!store.has::<crate::al::Pair<TargetedByRel, EntityId>>(watcher));
+    }
 }

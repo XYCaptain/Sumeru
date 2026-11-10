@@ -20,5 +20,6 @@ pub use self::dirty::{
 };
 pub use self::epochs::{AtomicChunkEpochs, ChunkEpochs, CHUNK_ROWS};
 pub use self::planner::{
-    SubchunkPlanner, SubchunkRangeIter, DEFAULT_TARGET_BYTES, MAX_SUBCHUNK_ROWS, MIN_SUBCHUNK_ROWS,
+    detect_l1d_cache_bytes, SubchunkPlanner, SubchunkRangeIter, DEFAULT_TARGET_BYTES,
+    MAX_SUBCHUNK_ROWS, MIN_SUBCHUNK_ROWS,
 };
